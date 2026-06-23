@@ -10,6 +10,7 @@
 | 項目 | 内容 |
 |------|------|
 | パス | `C:\Users\user\JpoProducer\jpo\` |
+| GitHub | **https://github.com/OptimalNotes/JpoProducer** （公開・main ブランチ） |
 | ソース | **単一ファイル** `src/main.rs`（約 2900 行） |
 | 仕様の参考 | `C:\Users\user\OneDrive\Desktop\# JpoProducer.txt`（2026-06-15 改訂） |
 | 製品 README | `jpo/README.md`（ロードマップ・操作説明） |
@@ -23,9 +24,12 @@ Ch1 = コードブロックが真実。Ch2–16 = ピアノロール。無限タ
 ## 2. 開発フロー（合意済み）
 
 ```text
-AI  → cargo check / cargo build --release / pack.ps1
+AI  → cargo check / cargo build --release / pack.ps1 / git commit & push
 人間 → cargo run（GUI の見た目・操作感の確認）
 ```
+
+**Git:** `origin` = `https://github.com/OptimalNotes/JpoProducer.git`  
+SF2 は `.gitignore` 済み（各自ローカル配置）。`target/` `dist/` も除外。
 
 - **`cargo run` を AI に任せる専用ツールは不要**（GUI 確認は人間の目が必要）
 - 別 PC 配布: `pwsh -File pack.ps1 -Zip` → `dist/JpoProducer-portable-YYYY-MM-DD.zip`
