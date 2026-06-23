@@ -1,0 +1,16 @@
+/target/
+/dist/
+**/*.exe
+**/*.pdb
+
+# SoundFont is large (~140MB) — place next to exe locally (see README)
+FluidR3 GM.SF2
+*.sf2
+*.SF2
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini

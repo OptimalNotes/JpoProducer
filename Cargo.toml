@@ -1,0 +1,29 @@
+[package]
+name = "jpo"
+version = "0.2.0"
+edition = "2021"
+description = "JpoProducer - Lightweight J-Pop/J-Rock MIDI sketch tool (Rust + egui version)"
+authors = ["Grok + user"]
+
+[dependencies]
+eframe = "0.30"
+egui = "0.30"
+midly = "0.5"
+midir = "0.9"
+rfd = "0.15"   # native file dialogs for save MIDI
+chrono = "0.4" # for timestamps in MIDI meta
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Integrated SoundFont playback (pure Rust, no FluidSynth DLLs ever).
+# These are required per the revised # JpoProducer.txt instruction (2026-06-15).
+rustysynth = "0.1"
+cpal = "0.15"
+# hound = "3" # only if you later want to record the output to wav
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
