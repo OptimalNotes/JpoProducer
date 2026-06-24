@@ -2688,6 +2688,9 @@ impl eframe::App for JpoApp {
                 .max_width(180.0)
                 .show_inside(ui, |ui| {
                 ui.label("TRACKS  (M=mute S=solo Vol%)");
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                 for ch in 1..=16 {
                     let t_idx = (ch - 1) as usize;
                     let mut mix_changed = false;
@@ -2758,6 +2761,7 @@ impl eframe::App for JpoApp {
                         });
                     }
                 }
+                });
                 ui.separator();
                 ui.label("Synth: MIDI Out (port or softsynth) + rustysynth ready");
                 if let Some(ref p) = self.soundfont_path {
@@ -2966,6 +2970,7 @@ impl JpoApp {
                                 {
                                     self.show_chord_palette = true;
                                     self.palette_block_idx = Some(i);
+                                    self.selected_block = Some(i);
                                     let preview = blk.clone();
                                     self.preview_chord_block(&preview);
                                 }
@@ -3491,12 +3496,17 @@ impl JpoApp {
 
         // Snapshot the current block so we can edit locals inside the closure.
         let current = self.proj.chord_blocks[idx].clone();
+        let block_label = format!(
+            "beat {:.1} — {}",
+            current.start,
+            self.proj.chord_name(&current)
+        );
         let mut chosen_degree = current.degree;
         let mut chosen_quality = current.quality.clone();
 
         let mut open = self.show_chord_palette;
         let mut close_requested = false;
-        let mut preview_requested = false;
+        let mut apply_requested = false;
 
         let screen = ctx.screen_rect();
         let default_pos = egui::pos2(
@@ -3510,7 +3520,12 @@ impl JpoApp {
             .default_pos(default_pos)
             .default_size(egui::vec2(300.0, 255.0))
             .show(ctx, |ui| {
-                ui.label("Choose chord for the selected block");
+                ui.label(egui::RichText::new(format!("Editing block: {block_label}")).strong());
+                ui.label(
+                    egui::RichText::new("Click another block in the timeline to switch target")
+                        .small()
+                        .weak(),
+                );
                 ui.separator();
 
                 let qualities = ["", "m", "7", "maj7", "m7", "dim", "sus4"];
@@ -3523,7 +3538,7 @@ impl JpoApp {
                         if ui.button(rom).clicked() {
                             chosen_degree = deg;
                             chosen_quality = self.proj.default_quality(deg).to_string();
-                            preview_requested = true;
+                            apply_requested = true;
                         }
                     }
                 });
@@ -3534,7 +3549,7 @@ impl JpoApp {
                         let label = if q.is_empty() { "maj" } else { q };
                         if ui.button(label).clicked() {
                             chosen_quality = q.to_string();
-                            preview_requested = true;
+                            apply_requested = true;
                         }
                     }
                 });
@@ -3546,7 +3561,7 @@ impl JpoApp {
                         if ui.button(label).clicked() {
                             chosen_degree = deg;
                             chosen_quality = q.to_string();
-                            preview_requested = true;
+                            apply_requested = true;
                         }
                     }
                 });
@@ -3561,21 +3576,21 @@ impl JpoApp {
             open = false;
         }
 
-        // Apply changes back (outside the window closure, no overlapping borrow with `open`).
-        if preview_requested {
+        // Apply only when the user pressed a palette button (never every frame — stale idx bug).
+        if apply_requested {
             self.begin_gesture_undo();
-        }
-        if let Some(b) = self.proj.chord_blocks.get_mut(idx) {
-            b.degree = chosen_degree;
-            b.quality = chosen_quality;
-        }
-        if preview_requested {
+            if let Some(b) = self.proj.chord_blocks.get_mut(idx) {
+                b.degree = chosen_degree;
+                b.quality = chosen_quality;
+            }
             self.end_gesture_undo();
+            self.sync_active_bank_from_proj();
             let preview = self.proj.chord_blocks[idx].clone();
             self.preview_chord_block(&preview);
         }
 
         self.show_chord_palette = open;
+        self.selected_block = if open { Some(idx) } else { self.selected_block };
         if !open {
             self.palette_block_idx = None;
         }
