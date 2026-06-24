@@ -644,16 +644,24 @@ impl PatternLibrary {
             ("DrumHipHopbeat_01", PatternCategory::Drum, 0),
             ("Drum_syncopation", PatternCategory::Drum, 0),
         ];
+        let Some(dir) = find_patterns_dir() else {
+            eprintln!(
+                "[Pattern] directory not found — place patterns in jpo/assets/patterns/ or next to jpo.exe"
+            );
+            return lib;
+        };
+        eprintln!("[Pattern] loading from {}", dir.display());
         for &(id, category, root) in specs {
-            if let Some(bytes) = find_pattern_bytes(id) {
-                match parse_pattern_midi(&bytes, id, category, root) {
+            let path = dir.join(format!("{id}.mid"));
+            match std::fs::read(&path) {
+                Ok(bytes) => match parse_pattern_midi(&bytes, id, category, root) {
                     Ok(p) => lib.patterns.push(p),
                     Err(e) => eprintln!("[Pattern] {e}"),
-                }
-            } else {
-                eprintln!("[Pattern] missing: {id}.mid");
+                },
+                Err(_) => eprintln!("[Pattern] missing: {}", path.display()),
             }
         }
+        eprintln!("[Pattern] loaded {} pattern(s)", lib.patterns.len());
         lib
     }
 
@@ -673,20 +681,24 @@ impl PatternLibrary {
     }
 }
 
-fn find_pattern_bytes(id: &str) -> Option<Vec<u8>> {
-    let filename = format!("{id}.mid");
+/// Locate the patterns folder (mirrors SF2 search — works under `cargo run` → target/debug).
+fn find_patterns_dir() -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = vec![
-        std::path::PathBuf::from("assets/patterns").join(&filename),
-        std::path::PathBuf::from("patterns").join(&filename),
+        std::path::PathBuf::from("assets/patterns"),
+        std::path::PathBuf::from("patterns"),
     ];
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("patterns").join(&filename));
+            candidates.push(parent.join("patterns"));
+            candidates.push(parent.join("assets/patterns"));
+            candidates.push(parent.join("../assets/patterns"));
+            candidates.push(parent.join("../../assets/patterns"));
+            candidates.push(parent.join("../../../assets/patterns"));
         }
     }
     for path in candidates {
-        if path.exists() {
-            return std::fs::read(path).ok();
+        if path.is_dir() {
+            return path.canonicalize().ok().or(Some(path));
         }
     }
     None
@@ -982,7 +994,7 @@ fn default_arrange_repeats() -> u8 {
 enum NoteDragKind { None, Create, Move, Resize }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ChordDragKind { None, Create, Move, Resize }
+enum ChordDragKind { None, Create, Move, Resize, AdjacentCreate }
 
 #[derive(Clone, Debug)]
 struct ClipboardNotes {
@@ -1236,13 +1248,25 @@ impl JpoApp {
         }
     }
 
-    fn chord_hit_at(beat: f64, blk: &ChordBlock, px_per_beat: f64) -> ChordDragKind {
+    /// Top-half right edge → adjacent paint; bottom half → resize; top-half center → move / palette.
+    fn chord_hit_at(
+        beat: f64,
+        ptr_y: f32,
+        blk: &ChordBlock,
+        block_y0: f32,
+        block_y1: f32,
+        px_per_beat: f64,
+    ) -> ChordDragKind {
         if beat < blk.start || beat > blk.end() {
             return ChordDragKind::None;
         }
+        let mid_y = (block_y0 + block_y1) * 0.5;
+        if ptr_y >= mid_y {
+            return ChordDragKind::Resize;
+        }
         let resize_beats = (14.0 / px_per_beat).clamp(0.06, 0.2);
         if beat >= blk.end() - resize_beats {
-            ChordDragKind::Resize
+            ChordDragKind::AdjacentCreate
         } else {
             ChordDragKind::Move
         }
@@ -2584,6 +2608,9 @@ impl eframe::App for JpoApp {
                     self.gen_start = 0.0;
                     self.gen_end = self.loop_beats();
                 }
+            });
+
+            ui.horizontal(|ui| {
                 ui.label("Piano");
                 egui::ComboBox::from_id_salt("gen_piano_pat")
                     .selected_text(&self.piano_pattern_id)
@@ -2618,7 +2645,7 @@ impl eframe::App for JpoApp {
                         }
                     });
                 ui.checkbox(&mut self.syncopation_fill, "Syncopation fill");
-                if ui.button("Generate All (Piano+Bass+Drum)").clicked() {
+                if ui.button("Generate All").on_hover_text("Piano Ch2 + Bass Ch3 + Drum Ch10").clicked() {
                     self.begin_gesture_undo();
                     let s = self.gen_start;
                     let e = self.gen_end.max(s + 0.25);
@@ -2637,11 +2664,16 @@ impl eframe::App for JpoApp {
                     self.proj.tracks[9].notes.extend(d);
                     self.end_gesture_undo();
                 }
-                if ui.button("Clear Generated (Ch2,3,10)").clicked() {
+                if ui.button("Clear Ch2,3,10").clicked() {
                     self.proj.tracks[1].notes.clear();
                     self.proj.tracks[2].notes.clear();
                     self.proj.tracks[9].notes.clear();
                 }
+                ui.label(
+                    egui::RichText::new("→ output on Ch2/Ch3/Ch10 (not Ch1 preview)")
+                        .small()
+                        .weak(),
+                );
             });
 
             ui.label("Tip: Loop 4/8/16 bars • Shift+drag = box select • Ctrl+Z/Y, C/V/D");
@@ -2652,10 +2684,10 @@ impl eframe::App for JpoApp {
             // Track list (left)
             egui::SidePanel::left("tracks")
                 .resizable(false)
-                .default_width(220.0)
-                .max_width(240.0)
+                .default_width(168.0)
+                .max_width(180.0)
                 .show_inside(ui, |ui| {
-                ui.label("TRACKS  (M=mute S=solo)");
+                ui.label("TRACKS  (M=mute S=solo Vol%)");
                 for ch in 1..=16 {
                     let t_idx = (ch - 1) as usize;
                     let mut mix_changed = false;
@@ -2693,15 +2725,18 @@ impl eframe::App for JpoApp {
                             t.solo = !t.solo;
                             mix_changed = true;
                         }
+                        let mut vol_pct = (t.track_vol * 100.0).round() as i32;
                         if ui
                             .add(
-                                egui::Slider::new(&mut t.track_vol, 0.0..=1.0)
-                                    .show_value(false)
-                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                                egui::DragValue::new(&mut vol_pct)
+                                    .speed(1.0)
+                                    .range(0..=100)
+                                    .prefix("V"),
                             )
-                            .on_hover_text("Track volume")
+                            .on_hover_text("Track volume %")
                             .changed()
                         {
+                            t.track_vol = (vol_pct as f32 / 100.0).clamp(0.0, 1.0);
                             mix_changed = true;
                         }
                     });
@@ -2744,7 +2779,7 @@ impl eframe::App for JpoApp {
                 self.show_arrange_panel(ui);
             } else {
                 // Chord Timeline (always visible - onion source + Ch1 input)
-                ui.label(egui::RichText::new("CHORD TIMELINE (Ch1) — drag to paint blocks, click for palette, Eraser to delete").strong());
+                ui.label(egui::RichText::new("CHORD TIMELINE (Ch1) — empty=paint • top-right drag=next chord • bottom drag=stretch • top click=palette").strong());
                 let _chord_response = self.draw_chord_timeline(ui);
 
                 ui.add_space(4.0);
@@ -2859,10 +2894,21 @@ impl JpoApp {
                 }
 
                 if resp.drag_started() || resp.clicked() || resp.double_clicked() {
+                    let block_y0 = rect.min.y + 8.0;
+                    let block_y1 = rect.max.y - 8.0;
+                    let ptr_y = ptr.y;
+
                     let mut hit = None;
                     let mut hit_kind = ChordDragKind::None;
                     for (i, blk) in self.proj.chord_blocks.iter().enumerate() {
-                        let kind = Self::chord_hit_at(beat, blk, px_per_beat);
+                        let kind = Self::chord_hit_at(
+                            beat,
+                            ptr_y,
+                            blk,
+                            block_y0,
+                            block_y1,
+                            px_per_beat,
+                        );
                         if kind != ChordDragKind::None {
                             hit = Some(i);
                             hit_kind = kind;
@@ -2882,21 +2928,47 @@ impl JpoApp {
                             self.chord_drag_kind = ChordDragKind::None;
                             self.end_gesture_undo();
                         } else if self.edit_mode == EditMode::Pencil {
-                            let blk = &self.proj.chord_blocks[i];
-                            self.selected_block = Some(i);
-                            self.block_drag_orig = (blk.start, blk.dur);
-                            self.drag_start_beat = beat;
-                            self.chord_drag_kind = hit_kind;
-                            self.is_creating = false;
-                            // Palette only on click inside block body (not resize edge / not drag-paint).
-                            if resp.clicked()
-                                && !resp.dragged()
-                                && hit_kind == ChordDragKind::Move
-                            {
-                                self.show_chord_palette = true;
-                                self.palette_block_idx = Some(i);
-                                let preview = blk.clone();
-                                self.preview_chord_block(&preview);
+                            if hit_kind == ChordDragKind::AdjacentCreate && resp.drag_started() {
+                                let anchor_end = self.proj.chord_blocks[i].end();
+                                let q = self.proj.default_quality(1).to_string();
+                                let new = ChordBlock {
+                                    start: anchor_end,
+                                    dur: self.note_len.max(0.5),
+                                    degree: 1,
+                                    quality: q,
+                                    octave: 4,
+                                };
+                                self.block_drag_orig = (new.start, new.dur);
+                                self.proj.chord_blocks.push(new);
+                                self.proj.chord_blocks.sort_by(|a, b| {
+                                    a.start.partial_cmp(&b.start).unwrap()
+                                });
+                                let new_idx = self
+                                    .proj
+                                    .chord_blocks
+                                    .iter()
+                                    .position(|b| (b.start - anchor_end).abs() < 0.001)
+                                    .unwrap_or(i);
+                                self.selected_block = Some(new_idx);
+                                self.drag_start_beat = beat;
+                                self.chord_drag_kind = ChordDragKind::Create;
+                                self.is_creating = true;
+                            } else {
+                                let blk = &self.proj.chord_blocks[i];
+                                self.selected_block = Some(i);
+                                self.block_drag_orig = (blk.start, blk.dur);
+                                self.drag_start_beat = beat;
+                                self.chord_drag_kind = hit_kind;
+                                self.is_creating = false;
+                                if resp.clicked()
+                                    && !resp.dragged()
+                                    && hit_kind == ChordDragKind::Move
+                                {
+                                    self.show_chord_palette = true;
+                                    self.palette_block_idx = Some(i);
+                                    let preview = blk.clone();
+                                    self.preview_chord_block(&preview);
+                                }
                             }
                         }
                     } else if self.edit_mode == EditMode::Pencil {
@@ -2935,7 +3007,9 @@ impl JpoApp {
                             let (orig_start, _orig_dur) = self.block_drag_orig;
                             let db = beat - self.drag_start_beat;
                             match self.chord_drag_kind {
-                                ChordDragKind::Create | ChordDragKind::Resize => {
+                                ChordDragKind::Create
+                                | ChordDragKind::Resize
+                                | ChordDragKind::AdjacentCreate => {
                                     let new_end = beat.max(orig_start + self.note_len * 0.5);
                                     let new_dur = self.snap_dur(new_end - orig_start);
                                     self.proj.chord_blocks[i].dur = new_dur;
