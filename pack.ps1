@@ -38,6 +38,13 @@ New-Item -ItemType Directory -Path $OutDir | Out-Null
 Copy-Item $ExeSrc (Join-Path $OutDir "jpo.exe")
 Copy-Item $Sf2Src (Join-Path $OutDir "FluidR3 GM.SF2")
 
+$PatternsSrc = Join-Path $Root "assets\patterns"
+if (Test-Path $PatternsSrc) {
+    $PatternsDst = Join-Path $OutDir "patterns"
+    New-Item -ItemType Directory -Path $PatternsDst -Force | Out-Null
+    Copy-Item (Join-Path $PatternsSrc "*.mid") $PatternsDst -Force
+}
+
 @'
 JpoProducer — portable pack
 ===========================
@@ -61,6 +68,9 @@ Write-Host "==> Packed to: $OutDir"
 Write-Host "    jpo.exe"
 Write-Host "    FluidR3 GM.SF2"
 Write-Host "    START.txt"
+if (Test-Path (Join-Path $OutDir "patterns")) {
+    Write-Host "    patterns\ (*.mid)"
+}
 
 if ($Zip) {
     $ZipPath = "$OutDir.zip"
