@@ -1093,7 +1093,7 @@ fn default_arrange_repeats() -> u8 {
 enum NoteDragKind { None, Create, Move, Resize }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ChordDragKind { None, Create, Move, Resize }
+enum ChordDragKind { None, Move, Resize }
 
 #[derive(Clone, Debug)]
 struct ClipboardNotes {
@@ -1175,8 +1175,7 @@ struct JpoApp {
     is_creating: bool,
     note_drag_kind: NoteDragKind,
     chord_drag_kind: ChordDragKind,
-    /// True only while painting a brand-new block from empty timeline.
-    chord_paint_new: bool,
+    chord_drag_block_idx: Option<usize>,
     block_drag_orig: (f64, f64), // start, dur for chord block drags
     chord_timeline_mouse_beat: f64,
 
@@ -1272,7 +1271,7 @@ impl Default for JpoApp {
             is_creating: false,
             note_drag_kind: NoteDragKind::None,
             chord_drag_kind: ChordDragKind::None,
-            chord_paint_new: false,
+            chord_drag_block_idx: None,
             block_drag_orig: (0.0, 0.5),
             chord_box_select_start: None,
             chord_timeline_mouse_beat: 0.0,
@@ -1362,7 +1361,7 @@ impl JpoApp {
         self.proj
             .chord_blocks
             .iter()
-            .position(|b| (b.start - beat).abs() < 0.001)
+            .position(|b| (b.start - beat).abs() < 0.01)
     }
 
     fn set_active_chord_idx(&mut self, idx: usize) {
@@ -1470,7 +1469,48 @@ impl JpoApp {
         }
     }
 
+    fn place_chord_block_at(&mut self, snapped: f64) {
+        if self
+            .proj
+            .chord_blocks
+            .iter()
+            .any(|b| snapped >= b.start - 0.001 && snapped < b.end() - 0.001)
+        {
+            return;
+        }
+        self.begin_gesture_undo();
+        let q = self.proj.default_quality(1).to_string();
+        let new = ChordBlock {
+            start: snapped,
+            dur: self.note_len.max(0.5),
+            degree: 1,
+            quality: q,
+            octave: 4,
+            syncopation_fill: false,
+        };
+        self.proj.chord_blocks.push(new);
+        self.proj.chord_blocks.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+        if let Some(idx) = self
+            .proj
+            .chord_blocks
+            .iter()
+            .position(|b| (b.start - snapped).abs() < 0.001)
+        {
+            self.selection.blocks.clear();
+            self.selection.blocks.insert(idx);
+            self.set_active_chord_idx(idx);
+            let preview = self.proj.chord_blocks[idx].clone();
+            self.preview_chord_block(&preview);
+        }
+        self.end_gesture_undo();
+    }
+
     fn copy_chord_blocks(&mut self) {
+        if self.selection.blocks.is_empty() {
+            if let Some(i) = self.active_chord_idx() {
+                self.selection.blocks.insert(i);
+            }
+        }
         let indices = self.selected_chord_indices();
         if indices.is_empty() {
             return;
@@ -2705,7 +2745,9 @@ impl eframe::App for JpoApp {
                 self.do_redo();
             }
             if ctrl && i.key_pressed(egui::Key::C) {
-                if self.ui_mode == UiMode::Sketch && !self.selected_chord_indices().is_empty() {
+                let chord_sel = self.ui_mode == UiMode::Sketch
+                    && (!self.selection.blocks.is_empty() || self.active_chord_beat.is_some());
+                if chord_sel {
                     self.copy_chord_blocks();
                 } else {
                     self.copy_selection();
@@ -2954,7 +2996,7 @@ impl eframe::App for JpoApp {
                 );
             });
 
-            ui.label("Tip: click = playhead • Space = play/stop • Shift+click multi • Alt+drag box • Ctrl+Z/Y, C/V");
+            ui.label("Tip: click empty = chord block • right edge = stretch • Space = play • Shift+click multi • Ctrl+C/V");
         });
 
         // Main area
@@ -3063,7 +3105,7 @@ impl eframe::App for JpoApp {
                 self.show_arrange_panel(ui);
             } else {
                 // Chord Timeline (always visible - onion source + Ch1 input)
-                ui.label(egui::RichText::new("CHORD TIMELINE — click=playhead • drag empty=paint • right edge=stretch • Shift+click=multi • Alt+drag=box select • Space=play").strong());
+                ui.label(egui::RichText::new("CHORD TIMELINE — click empty=place block • click block=select • right edge drag=stretch • Shift+click=multi • Alt+drag=box • Ctrl+C/V • Space=play").strong());
                 let _chord_response = self.draw_chord_timeline(ui);
                 self.show_chord_strip(ui);
 
@@ -3213,7 +3255,7 @@ impl JpoApp {
             painter.text(
                 rect.min + Vec2::new(16.0, 28.0),
                 egui::Align2::LEFT_TOP,
-                "click = playhead • drag = paint chord blocks",
+                "click empty = place chord block (Len setting)",
                 egui::FontId::proportional(12.0),
                 Color32::from_rgb(90, 95, 105),
             );
@@ -3231,13 +3273,9 @@ impl JpoApp {
                     self.chord_box_select_start = Some(beat);
                 }
 
-                if resp.drag_started() && !alt {
-                    self.begin_gesture_undo();
-                }
-
-                if !alt && (resp.drag_started() || resp.clicked() || resp.double_clicked()) {
-                    let mut hit = None;
-                    let mut hit_kind = ChordDragKind::None;
+                let mut hit = None;
+                let mut hit_kind = ChordDragKind::None;
+                if !alt {
                     for (i, blk) in self.proj.chord_blocks.iter().enumerate().rev() {
                         if beat < blk.start || beat > blk.end() {
                             continue;
@@ -3251,7 +3289,9 @@ impl JpoApp {
                             break;
                         }
                     }
+                }
 
+                if !alt && (resp.drag_started() || resp.clicked() || resp.double_clicked()) {
                     if let Some(i) = hit {
                         let should_delete = self.edit_mode == EditMode::Eraser
                             || (self.edit_mode == EditMode::Pencil && resp.double_clicked());
@@ -3261,7 +3301,7 @@ impl JpoApp {
                             self.selection.blocks.remove(&i);
                             self.clear_chord_selection();
                             self.chord_drag_kind = ChordDragKind::None;
-                            self.chord_paint_new = false;
+                            self.chord_drag_block_idx = None;
                             self.end_gesture_undo();
                         } else if self.edit_mode == EditMode::Pencil {
                             let blk = self.proj.chord_blocks[i].clone();
@@ -3269,65 +3309,43 @@ impl JpoApp {
                                 self.select_chord_block(i, shift);
                                 self.set_playhead(beat);
                                 self.chord_drag_kind = ChordDragKind::None;
-                                self.is_creating = false;
+                                self.chord_drag_block_idx = None;
                                 self.preview_chord_block(&blk);
                             } else if resp.drag_started() {
+                                self.begin_gesture_undo();
                                 if !shift {
                                     self.select_chord_block(i, false);
                                 }
                                 self.block_drag_orig = (blk.start, blk.dur);
                                 self.drag_start_beat = beat;
-                                self.chord_paint_new = false;
                                 self.chord_drag_kind = hit_kind;
-                                self.is_creating = false;
+                                self.chord_drag_block_idx = Some(i);
                             }
                         }
-                    } else if self.edit_mode == EditMode::Pencil {
-                        if resp.clicked() && !resp.dragged() {
-                            self.set_playhead(snapped);
-                            if !shift {
-                                self.clear_chord_selection();
-                            }
-                        } else if resp.drag_started() && self.chord_drag_kind == ChordDragKind::None {
-                            self.set_playhead(snapped);
-                            self.begin_gesture_undo();
-                            let q = self.proj.default_quality(1).to_string();
-                            let new = ChordBlock {
-                                start: snapped,
-                                dur: self.note_len.max(0.5),
-                                degree: 1,
-                                quality: q,
-                                octave: 4,
-                                syncopation_fill: false,
-                            };
-                            self.block_drag_orig = (new.start, new.dur);
-                            self.proj.chord_blocks.push(new);
-                            self.proj.chord_blocks.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-                            if let Some(new_idx) = self
-                                .proj
-                                .chord_blocks
-                                .iter()
-                                .position(|b| (b.start - snapped).abs() < 0.001)
-                            {
-                                self.selection.blocks.clear();
-                                self.selection.blocks.insert(new_idx);
-                                self.set_active_chord_idx(new_idx);
-                                self.drag_start_beat = beat;
-                                self.chord_drag_kind = ChordDragKind::Create;
-                                self.chord_paint_new = true;
-                                self.is_creating = true;
-                            }
-                        }
+                    } else if self.edit_mode == EditMode::Pencil
+                        && resp.clicked()
+                        && !resp.dragged()
+                        && !shift
+                    {
+                        self.set_playhead(snapped);
+                        self.clear_chord_selection();
+                        self.place_chord_block_at(snapped);
+                    } else if self.edit_mode == EditMode::Pencil
+                        && resp.clicked()
+                        && !resp.dragged()
+                        && shift
+                    {
+                        self.set_playhead(snapped);
                     }
                 }
 
                 if !alt && resp.dragged() {
-                    if let Some(i) = self.active_chord_idx() {
+                    if let Some(i) = self.chord_drag_block_idx {
                         if i < self.proj.chord_blocks.len() {
                             let (orig_start, _orig_dur) = self.block_drag_orig;
                             let db = beat - self.drag_start_beat;
                             match self.chord_drag_kind {
-                                ChordDragKind::Resize | ChordDragKind::Create => {
+                                ChordDragKind::Resize => {
                                     let new_end = beat.max(orig_start + self.note_len * 0.5);
                                     let new_dur = self.snap_dur(new_end - orig_start);
                                     self.proj.chord_blocks[i].dur = new_dur;
@@ -3381,7 +3399,7 @@ impl JpoApp {
             }
             self.is_creating = false;
             self.chord_drag_kind = ChordDragKind::None;
-            self.chord_paint_new = false;
+            self.chord_drag_block_idx = None;
             self.end_gesture_undo();
         }
 
@@ -3836,7 +3854,7 @@ impl JpoApp {
 
         let Some(idx) = self.active_chord_idx() else {
             let mut hint = format!(
-                "▸ playhead {:.1} — Shift+click multi • Alt+drag box • right edge stretch • Ctrl+C/V at playhead",
+                "▸ playhead {:.1} — click empty = place • Shift+click multi • Alt+drag box • Ctrl+C/V at playhead",
                 self.current_beat
             );
             if self.chord_clipboard.is_some() {
