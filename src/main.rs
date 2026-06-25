@@ -144,6 +144,7 @@ struct PlaybackPlayer {
     current_sample: u64,
     loop_enabled: bool,
     loop_end_sample: u64,
+    patches_applied: bool,
 }
 
 impl PlaybackPlayer {
@@ -173,6 +174,13 @@ impl PlaybackPlayer {
             current_sample: start_sample_offset,
             loop_enabled,
             loop_end_sample,
+            patches_applied: false,
+        }
+    }
+
+    fn apply_patches(synth: &mut Synthesizer, patches: &[(u8, u8)]) {
+        for &(ch, program) in patches {
+            synth.process_midi_message(ch as i32, 0xC0, program as i32, 0);
         }
     }
 
@@ -216,6 +224,11 @@ impl PlaybackPlayer {
                 return;
             }
         };
+
+        if !self.patches_applied {
+            Self::apply_patches(synth, &self.initial_patches);
+            self.patches_applied = true;
+        }
 
         // Efficient scheduler with persistent cursor
         for frame in data.chunks_mut(2) {
@@ -772,6 +785,14 @@ fn parse_pattern_midi(
         ((span_end / 4.0).ceil() * 4.0).max(2.0)
     };
 
+    let template_root = if category == PatternCategory::Drum || notes.is_empty() {
+        template_root
+    } else {
+        let mut pitches: Vec<u8> = notes.iter().map(|n| n.pitch).collect();
+        pitches.sort_unstable();
+        pitches[pitches.len() / 2]
+    };
+
     Ok(LoadedPattern {
         id: id.to_string(),
         category,
@@ -779,6 +800,24 @@ fn parse_pattern_midi(
         template_root,
         notes,
     })
+}
+
+fn melodic_pitch(pattern_pitch: u8, pattern_template: u8, target_root: u8) -> u8 {
+    (pattern_pitch as i32 - pattern_template as i32 + target_root as i32)
+        .clamp(0, 127) as u8
+}
+
+fn pattern_tile_at(fill_start: f64, origin: f64, pat_len: f64) -> f64 {
+    let pat_len = pat_len.max(0.25);
+    if fill_start <= origin + 0.001 {
+        return origin;
+    }
+    let k = ((fill_start - origin) / pat_len).floor();
+    let mut tile = origin + k * pat_len;
+    while tile + pat_len <= fill_start + 0.001 {
+        tile += pat_len;
+    }
+    tile
 }
 
 fn chord_block_at<'a>(blocks: &'a [ChordBlock], beat: f64) -> Option<&'a ChordBlock> {
@@ -818,23 +857,23 @@ fn apply_melodic_pattern(
         if block.end() <= range_start || block.start >= range_end {
             continue;
         }
-        let transpose = proj.degree_root(block.degree, ref_octave) as i32
-            - pattern.template_root as i32;
+        let target_root = proj.degree_root(block.degree, ref_octave);
         let block_end = block.end().min(range_end);
-        let mut tile = block.start;
+        let pat_len = pattern.length_beats.max(0.25);
+        let mut tile = pattern_tile_at(range_start, block.start, pat_len);
         while tile < block_end {
             for pn in &pattern.notes {
                 let t = tile + pn.start_beats;
                 if t >= range_start && t < range_end && t < block_end {
                     notes.push(Note {
                         start: t,
-                        pitch: (pn.pitch as i32 + transpose).clamp(0, 127) as u8,
+                        pitch: melodic_pitch(pn.pitch, pattern.template_root, target_root),
                         dur: pn.dur_beats,
                         vel: pn.vel,
                     });
                 }
             }
-            tile += pattern.length_beats;
+            tile += pat_len;
         }
     }
     notes
@@ -885,23 +924,23 @@ fn apply_melodic_block_range(
         PatternCategory::Bass => 3,
         PatternCategory::Drum => 3,
     };
-    let transpose =
-        proj.degree_root(block.degree, ref_octave) as i32 - pattern.template_root as i32;
+    let target_root = proj.degree_root(block.degree, ref_octave);
     let block_end = block.end().min(range_end);
-    let mut tile = block.start;
+    let pat_len = pattern.length_beats.max(0.25);
+    let mut tile = pattern_tile_at(range_start, block.start, pat_len);
     while tile < block_end {
         for pn in &pattern.notes {
             let t = tile + pn.start_beats;
             if t >= range_start && t < range_end && t < block_end {
                 notes.push(Note {
                     start: t,
-                    pitch: (pn.pitch as i32 + transpose).clamp(0, 127) as u8,
+                    pitch: melodic_pitch(pn.pitch, pattern.template_root, target_root),
                     dur: pn.dur_beats,
                     vel: pn.vel,
                 });
             }
         }
-        tile += pattern.length_beats;
+        tile += pat_len;
     }
     notes
 }
@@ -946,18 +985,17 @@ fn apply_syncopation_splice(
             PatternCategory::Bass => 3,
             _ => 3,
         };
-        let transpose = block.map(|b| {
-            proj.degree_root(b.degree, ref_octave) as i32 - sync_pattern.template_root as i32
-        }).unwrap_or(0);
+        let target_root = block.map(|b| proj.degree_root(b.degree, ref_octave));
 
         for pn in &sync_pattern.notes {
             let t = win_start + pn.start_beats;
             if t >= win_end {
                 continue;
             }
-            let pitch = match sync_pattern.category {
-                PatternCategory::Drum => pn.pitch,
-                _ => (pn.pitch as i32 + transpose).clamp(0, 127) as u8,
+            let pitch = match (sync_pattern.category, target_root) {
+                (PatternCategory::Drum, _) => pn.pitch,
+                (_, Some(root)) => melodic_pitch(pn.pitch, sync_pattern.template_root, root),
+                _ => pn.pitch,
             };
             notes.push(Note {
                 start: t,
@@ -1249,6 +1287,10 @@ struct JpoApp {
     // Phase C — arrange
     ui_mode: UiMode,
     arrange_sequence: Vec<ArrangeSlot>,
+
+    /// Short UI feedback (copy/paste etc.)
+    status_toast: Option<String>,
+    status_toast_until: f64,
 }
 
 impl Default for JpoApp {
@@ -1302,9 +1344,9 @@ impl Default for JpoApp {
             default_velocity: 90,
             drag_sel_offsets: Vec::new(),
             project_path: None,
-            loop_bars: 8,
+            loop_bars: 4,
             loop_playback: true,
-            loop_bank: vec![LoopSketch::new_empty("Loop 1", 8)],
+            loop_bank: vec![LoopSketch::new_empty("Loop 1", 4)],
             active_bank_idx: 0,
             loop_name_counter: 2,
             pattern_lib: PatternLibrary::load(),
@@ -1314,6 +1356,8 @@ impl Default for JpoApp {
             syncopation_fill: true,
             ui_mode: UiMode::Sketch,
             arrange_sequence: vec![ArrangeSlot { bank_idx: 0, repeats: 1 }],
+            status_toast: None,
+            status_toast_until: 0.0,
         }
     }
 }
@@ -1460,13 +1504,88 @@ impl JpoApp {
             return ChordDragKind::None;
         }
         let width = (block_x1 - block_x0).max(1.0);
-        let resize_px = 16.0f32.min(width * 0.35).max(8.0);
+        let resize_px = 24.0f32.min(width * 0.5).max(12.0);
         let dist_right = block_x1 - ptr_x;
-        if dist_right >= -3.0 && dist_right <= resize_px {
+        if dist_right >= -8.0 && dist_right <= resize_px {
             ChordDragKind::Resize
         } else {
             ChordDragKind::Move
         }
+    }
+
+    fn resolve_chord_overlaps(&mut self) {
+        if self.proj.chord_blocks.len() < 2 {
+            return;
+        }
+        let selected_starts: Vec<f64> = self
+            .selected_chord_indices()
+            .iter()
+            .filter_map(|&i| self.proj.chord_blocks.get(i).map(|b| b.start))
+            .collect();
+        let active_start = self.active_chord_beat;
+        self.proj
+            .chord_blocks
+            .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+        let mut i = 0;
+        while i < self.proj.chord_blocks.len() {
+            let start_i = self.proj.chord_blocks[i].start;
+            let end_i = self.proj.chord_blocks[i].end();
+            let j = i + 1;
+            while j < self.proj.chord_blocks.len() {
+                let next_start = self.proj.chord_blocks[j].start;
+                if next_start >= end_i - 0.001 {
+                    break;
+                }
+                if next_start <= start_i + 0.001 {
+                    self.proj.chord_blocks.remove(j);
+                    continue;
+                }
+                let new_dur = (next_start - start_i).max(0.25);
+                self.proj.chord_blocks[i].dur = new_dur;
+                break;
+            }
+            i += 1;
+        }
+        self.selection.blocks.clear();
+        for start in selected_starts {
+            if let Some(idx) = self
+                .proj
+                .chord_blocks
+                .iter()
+                .position(|b| (b.start - start).abs() < 0.001)
+            {
+                self.selection.blocks.insert(idx);
+            }
+        }
+        if let Some(start) = active_start {
+            if let Some(idx) = self
+                .proj
+                .chord_blocks
+                .iter()
+                .position(|b| (b.start - start).abs() < 0.001)
+            {
+                self.set_active_chord_idx(idx);
+            }
+        } else if let Some(&last) = self.selection.blocks.iter().max() {
+            self.set_active_chord_idx(last);
+        }
+    }
+
+    fn has_note_selection(&self) -> bool {
+        if self.selected_ch == 1 {
+            return false;
+        }
+        !self.selected_note_indices(self.track_idx()).is_empty()
+    }
+
+    fn has_chord_selection(&self) -> bool {
+        !self.selection.blocks.is_empty() || self.active_chord_beat.is_some()
+    }
+
+    fn show_toast(&mut self, ctx: &egui::Context, msg: impl Into<String>) {
+        self.status_toast = Some(msg.into());
+        self.status_toast_until = ctx.input(|i| i.time) + 2.0;
+        ctx.request_repaint();
     }
 
     fn place_chord_block_at(&mut self, snapped: f64) {
@@ -1490,6 +1609,7 @@ impl JpoApp {
         };
         self.proj.chord_blocks.push(new);
         self.proj.chord_blocks.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+        self.resolve_chord_overlaps();
         if let Some(idx) = self
             .proj
             .chord_blocks
@@ -1505,7 +1625,7 @@ impl JpoApp {
         self.end_gesture_undo();
     }
 
-    fn copy_chord_blocks(&mut self) {
+    fn copy_chord_blocks(&mut self) -> bool {
         if self.selection.blocks.is_empty() {
             if let Some(i) = self.active_chord_idx() {
                 self.selection.blocks.insert(i);
@@ -1513,20 +1633,21 @@ impl JpoApp {
         }
         let indices = self.selected_chord_indices();
         if indices.is_empty() {
-            return;
+            return false;
         }
         let blocks: Vec<ChordBlock> = indices
             .iter()
             .filter_map(|&i| self.proj.chord_blocks.get(i).cloned())
             .collect();
         if blocks.is_empty() {
-            return;
+            return false;
         }
         let anchor_start = blocks.iter().map(|b| b.start).fold(f64::INFINITY, f64::min);
         self.chord_clipboard = Some(ChordClipboard {
             blocks,
             anchor_start,
         });
+        true
     }
 
     fn paste_chord_blocks(&mut self) {
@@ -1543,6 +1664,7 @@ impl JpoApp {
             self.proj.chord_blocks.push(new);
         }
         self.proj.chord_blocks.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+        self.resolve_chord_overlaps();
         for b in &cb.blocks {
             let target = self.snap_beat((b.start + delta).max(0.0));
             if let Some(idx) = self
@@ -2335,14 +2457,14 @@ impl JpoApp {
         }
     }
 
-    fn copy_selection(&mut self) {
+    fn copy_selection(&mut self) -> bool {
         let t_idx = self.track_idx();
         if self.selected_ch == 1 {
-            return;
+            return false;
         }
         let indices = self.selected_note_indices(t_idx);
         if indices.is_empty() {
-            return;
+            return false;
         }
         let mut notes = Vec::new();
         let mut min_start = f64::MAX;
@@ -2355,25 +2477,26 @@ impl JpoApp {
             }
         }
         if notes.is_empty() {
-            return;
+            return false;
         }
         self.clipboard = Some(ClipboardNotes {
             notes,
             min_start,
             anchor_pitch,
         });
+        true
     }
 
-    fn paste_clipboard(&mut self) {
+    fn paste_clipboard(&mut self) -> bool {
         let Some(cb) = self.clipboard.clone() else {
-            return;
+            return false;
         };
         if self.selected_ch == 1 {
-            return;
+            return false;
         }
         let t_idx = self.track_idx();
         self.begin_gesture_undo();
-        let paste_at = self.snap_beat(self.last_mouse_beat.max(0.0));
+        let paste_at = self.snap_beat(self.current_beat.max(0.0));
         let pitch_base = self.last_mouse_pitch;
         let pitch_shift = pitch_base as i32 - cb.anchor_pitch as i32;
         self.selection.notes.clear();
@@ -2399,11 +2522,13 @@ impl JpoApp {
         }
         self.selected_note = self.selection.notes.iter().find(|&&(t, _)| t == t_idx).copied();
         self.end_gesture_undo();
+        true
     }
 
     fn duplicate_selection(&mut self) {
-        self.copy_selection();
-        self.paste_clipboard();
+        if self.copy_selection() {
+            let _ = self.paste_clipboard();
+        }
     }
 
     fn quantize_selection(&mut self) {
@@ -2510,7 +2635,7 @@ impl JpoApp {
             active_bank_idx: usize,
         }
         fn default_loop_bars() -> u8 {
-            8
+            4
         }
         fn default_loop_playback() -> bool {
             true
@@ -2726,11 +2851,15 @@ fn main() -> eframe::Result<()> {
 impl eframe::App for JpoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let wants_kb = ctx.wants_keyboard_input();
-        ctx.input(|i| {
+        if !wants_kb {
+            ctx.input(|i| {
+                if i.key_pressed(egui::Key::Space) {
+                    self.toggle_playback();
+                }
+            });
+        }
+        ctx.input_mut(|i| {
             let ctrl = i.modifiers.ctrl;
-            if !wants_kb && i.key_pressed(egui::Key::Space) {
-                self.toggle_playback();
-            }
             if i.key_pressed(egui::Key::Delete) {
                 if self.ui_mode == UiMode::Sketch && !self.selected_chord_indices().is_empty() {
                     self.delete_selected_chords();
@@ -2740,30 +2869,61 @@ impl eframe::App for JpoApp {
             }
             if ctrl && i.key_pressed(egui::Key::Z) && !i.modifiers.shift {
                 self.do_undo();
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::Z);
             }
-            if ctrl && (i.key_pressed(egui::Key::Y) || (i.key_pressed(egui::Key::Z) && i.modifiers.shift)) {
+            if ctrl && i.key_pressed(egui::Key::Y) {
                 self.do_redo();
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::Y);
+            }
+            if ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Z) {
+                self.do_redo();
+                i.consume_key(egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT), egui::Key::Z);
             }
             if ctrl && i.key_pressed(egui::Key::C) {
-                let chord_sel = self.ui_mode == UiMode::Sketch
-                    && (!self.selection.blocks.is_empty() || self.active_chord_beat.is_some());
-                if chord_sel {
-                    self.copy_chord_blocks();
-                } else {
-                    self.copy_selection();
+                if self.has_note_selection() {
+                    if self.copy_selection() {
+                        self.show_toast(ctx, "Copied notes");
+                    }
+                } else if self.ui_mode == UiMode::Sketch && self.has_chord_selection() {
+                    if self.copy_chord_blocks() {
+                        self.show_toast(ctx, "Copied chords");
+                    }
                 }
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::C);
             }
             if ctrl && i.key_pressed(egui::Key::V) {
-                if self.ui_mode == UiMode::Sketch && self.chord_clipboard.is_some() {
+                if self.has_note_selection() {
+                    if self.clipboard.is_some() && self.paste_clipboard() {
+                        self.show_toast(ctx, "Pasted notes at playhead");
+                    }
+                } else if self.ui_mode == UiMode::Sketch && self.chord_clipboard.is_some() {
                     self.paste_chord_blocks();
-                } else {
-                    self.paste_clipboard();
+                    self.show_toast(ctx, "Pasted chords at playhead");
+                } else if self.clipboard.is_some() && self.selected_ch != 1 && self.paste_clipboard() {
+                    self.show_toast(ctx, "Pasted notes at playhead");
                 }
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::V);
             }
             if ctrl && i.key_pressed(egui::Key::D) {
                 self.duplicate_selection();
+                i.consume_key(egui::Modifiers::CTRL, egui::Key::D);
             }
         });
+
+        if let Some(ref msg) = self.status_toast {
+            let now = ctx.input(|i| i.time);
+            if now < self.status_toast_until {
+                egui::TopBottomPanel::bottom("status_toast")
+                    .exact_height(22.0)
+                    .show(ctx, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.label(egui::RichText::new(msg).size(12.0).color(Color32::from_rgb(140, 200, 255)));
+                        });
+                    });
+            } else {
+                self.status_toast = None;
+            }
+        }
 
         // Top toolbar — compact: play always visible; extras live in Tools menu
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
@@ -3072,15 +3232,24 @@ impl eframe::App for JpoApp {
                         let t = &mut self.proj.tracks[t_idx];
                         let patch_name =
                             truncate_ascii(gm_instrument_name(t.patch), 12);
+                        let mut patch_changed = false;
                         ui.horizontal(|ui| {
                             ui.add_space(42.0);
-                            ui.add(
-                                egui::DragValue::new(&mut t.patch)
-                                    .speed(1.0)
-                                    .range(0..=127),
-                            );
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut t.patch)
+                                        .speed(1.0)
+                                        .range(0..=127),
+                                )
+                                .changed()
+                            {
+                                patch_changed = true;
+                            }
                             ui.label(egui::RichText::new(patch_name).size(10.0));
                         });
+                        if patch_changed {
+                            self.on_track_mix_changed();
+                        }
                     }
                 }
                 });
@@ -3382,8 +3551,9 @@ impl JpoApp {
                 }
                 self.chord_box_select_start = None;
             }
-            if self.chord_drag_kind == ChordDragKind::Move {
+            if self.chord_drag_kind == ChordDragKind::Move || self.chord_drag_kind == ChordDragKind::Resize {
                 self.proj.chord_blocks.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+                self.resolve_chord_overlaps();
                 if let Some(beat) = self.active_chord_beat {
                     if let Some(idx) = self
                         .proj
