@@ -156,7 +156,12 @@ impl PlaybackPlayer {
         initial_patches: Vec<(u8, u8)>,
         loop_enabled: bool,
         loop_end_sample: u64,
+        start_sample_offset: u64,
     ) -> Self {
+        let mut event_idx = 0;
+        while event_idx < events.len() && events[event_idx].0 < start_sample_offset {
+            event_idx += 1;
+        }
         Self {
             sf_path,
             events,
@@ -164,8 +169,8 @@ impl PlaybackPlayer {
             sample_rate,
             gain,
             initial_patches,
-            event_idx: 0,
-            current_sample: 0,
+            event_idx,
+            current_sample: start_sample_offset,
             loop_enabled,
             loop_end_sample,
         }
@@ -1097,6 +1102,12 @@ struct ClipboardNotes {
     anchor_pitch: u8,
 }
 
+#[derive(Clone, Debug)]
+struct ChordClipboard {
+    blocks: Vec<ChordBlock>,
+    anchor_start: f64,
+}
+
 struct UndoHistory {
     past: Vec<Project>,
     future: Vec<Project>,
@@ -1167,15 +1178,14 @@ struct JpoApp {
     /// True only while painting a brand-new block from empty timeline.
     chord_paint_new: bool,
     block_drag_orig: (f64, f64), // start, dur for chord block drags
-    /// Explicit paste cursor on chord timeline (Shift+click empty).
-    chord_paste_beat: Option<f64>,
     chord_timeline_mouse_beat: f64,
 
     // Box selection state for range tool (editing base)
     box_select_start_beat: Option<f64>,
     box_select_start_pitch: Option<u8>,
 
-    chord_clipboard: Option<ChordBlock>,
+    chord_clipboard: Option<ChordClipboard>,
+    chord_box_select_start: Option<f64>,
 
     // Generate range (user visible)
     gen_start: f64,
@@ -1264,7 +1274,7 @@ impl Default for JpoApp {
             chord_drag_kind: ChordDragKind::None,
             chord_paint_new: false,
             block_drag_orig: (0.0, 0.5),
-            chord_paste_beat: None,
+            chord_box_select_start: None,
             chord_timeline_mouse_beat: 0.0,
             is_playing: false,
             box_select_start_beat: None,
@@ -1361,8 +1371,88 @@ impl JpoApp {
         }
     }
 
-    fn clear_active_chord(&mut self) {
+    fn clear_chord_selection(&mut self) {
         self.active_chord_beat = None;
+        self.selection.blocks.clear();
+    }
+
+    fn selected_chord_indices(&self) -> Vec<usize> {
+        if !self.selection.blocks.is_empty() {
+            let mut v: Vec<_> = self.selection.blocks.iter().copied().collect();
+            v.sort_unstable();
+            v
+        } else if let Some(i) = self.active_chord_idx() {
+            vec![i]
+        } else {
+            vec![]
+        }
+    }
+
+    fn select_chord_block(&mut self, idx: usize, ctrl: bool) {
+        if ctrl {
+            if self.selection.blocks.contains(&idx) {
+                self.selection.blocks.remove(&idx);
+                if self.active_chord_idx() == Some(idx) {
+                    if let Some(&next) = self.selection.blocks.iter().max() {
+                        self.set_active_chord_idx(next);
+                    } else {
+                        self.active_chord_beat = None;
+                    }
+                }
+            } else {
+                self.selection.blocks.insert(idx);
+                self.set_active_chord_idx(idx);
+            }
+        } else {
+            self.selection.blocks.clear();
+            self.selection.blocks.insert(idx);
+            self.set_active_chord_idx(idx);
+        }
+    }
+
+    fn set_playhead(&mut self, beat: f64) {
+        let beat = self.snap_beat(beat.max(0.0));
+        self.current_beat = if self.loop_playback {
+            beat % self.loop_beats()
+        } else {
+            beat
+        };
+        if self.audio_stream.is_some() {
+            let seek_to = self.current_beat;
+            self.stop_playback();
+            self.current_beat = seek_to;
+            self.start_playback();
+        }
+    }
+
+    fn toggle_playback(&mut self) {
+        if self.audio_stream.is_some() {
+            self.stop_playback();
+        } else {
+            self.start_playback();
+        }
+    }
+
+    fn draw_playhead_line(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        start_b: f64,
+        px_per_beat: f64,
+    ) {
+        if self.current_beat >= start_b - 0.01 && self.current_beat <= start_b + self.visible_beats + 0.1
+        {
+            let x = rect.min.x + ((self.current_beat - start_b) * px_per_beat) as f32;
+            painter.line_segment(
+                [Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)],
+                Stroke::new(2.5, Color32::from_rgb(255, 90, 90)),
+            );
+            painter.circle_filled(
+                Pos2::new(x, rect.min.y + 5.0),
+                4.0,
+                Color32::from_rgb(255, 90, 90),
+            );
+        }
     }
 
     fn chord_hit_at(beat: f64, blk: &ChordBlock, px_per_beat: f64, ctrl: bool) -> ChordDragKind {
@@ -1377,38 +1467,72 @@ impl JpoApp {
         }
     }
 
-    fn copy_chord_block(&mut self) {
-        let Some(idx) = self.active_chord_idx() else {
+    fn copy_chord_blocks(&mut self) {
+        let indices = self.selected_chord_indices();
+        if indices.is_empty() {
             return;
-        };
-        self.chord_clipboard = Some(self.proj.chord_blocks[idx].clone());
+        }
+        let blocks: Vec<ChordBlock> = indices
+            .iter()
+            .filter_map(|&i| self.proj.chord_blocks.get(i).cloned())
+            .collect();
+        if blocks.is_empty() {
+            return;
+        }
+        let anchor_start = blocks.iter().map(|b| b.start).fold(f64::INFINITY, f64::min);
+        self.chord_clipboard = Some(ChordClipboard {
+            blocks,
+            anchor_start,
+        });
     }
 
-    fn paste_chord_block(&mut self) {
+    fn paste_chord_blocks(&mut self) {
         let Some(cb) = self.chord_clipboard.clone() else {
             return;
         };
-        let paste_at = self
-            .chord_paste_beat
-            .map(|b| self.snap_beat(b))
-            .unwrap_or_else(|| self.snap_beat(self.chord_timeline_mouse_beat.max(0.0)));
+        let paste_at = self.snap_beat(self.current_beat.max(0.0));
+        let delta = paste_at - cb.anchor_start;
         self.begin_gesture_undo();
-        let mut new = cb;
-        new.start = paste_at;
-        let pasted_dur = new.dur;
-        self.proj.chord_blocks.push(new);
+        self.selection.blocks.clear();
+        for b in &cb.blocks {
+            let mut new = b.clone();
+            new.start = self.snap_beat((b.start + delta).max(0.0));
+            self.proj.chord_blocks.push(new);
+        }
         self.proj.chord_blocks.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-        if let Some(idx) = self
-            .proj
-            .chord_blocks
-            .iter()
-            .position(|b| (b.start - paste_at).abs() < 0.001)
-        {
-            self.set_active_chord_idx(idx);
-            let preview = self.proj.chord_blocks[idx].clone();
+        for b in &cb.blocks {
+            let target = self.snap_beat((b.start + delta).max(0.0));
+            if let Some(idx) = self
+                .proj
+                .chord_blocks
+                .iter()
+                .position(|blk| (blk.start - target).abs() < 0.001)
+            {
+                self.selection.blocks.insert(idx);
+            }
+        }
+        if let Some(&last) = self.selection.blocks.iter().max() {
+            self.set_active_chord_idx(last);
+            let preview = self.proj.chord_blocks[last].clone();
             self.preview_chord_block(&preview);
         }
-        self.chord_paste_beat = Some(paste_at + pasted_dur);
+        self.end_gesture_undo();
+    }
+
+    fn delete_selected_chords(&mut self) {
+        let indices = self.selected_chord_indices();
+        if indices.is_empty() {
+            return;
+        }
+        self.begin_gesture_undo();
+        let mut sorted = indices;
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        for i in sorted {
+            if i < self.proj.chord_blocks.len() {
+                self.proj.chord_blocks.remove(i);
+            }
+        }
+        self.clear_chord_selection();
         self.end_gesture_undo();
     }
 
@@ -1583,7 +1707,7 @@ impl JpoApp {
         self.selection.notes.clear();
         self.selection.blocks.clear();
         self.selected_note = None;
-        self.clear_active_chord();
+        self.clear_chord_selection();
         self.gesture_undo_saved = false;
     }
 
@@ -2133,7 +2257,7 @@ impl JpoApp {
             self.selection.notes.clear();
             self.selection.blocks.clear();
             self.selected_note = None;
-            self.clear_active_chord();
+            self.clear_chord_selection();
             self.gesture_undo_saved = false;
         }
     }
@@ -2144,7 +2268,7 @@ impl JpoApp {
             self.selection.notes.clear();
             self.selection.blocks.clear();
             self.selected_note = None;
-            self.clear_active_chord();
+            self.clear_chord_selection();
             self.gesture_undo_saved = false;
         }
     }
@@ -2378,7 +2502,7 @@ impl JpoApp {
         self.selection.notes.clear();
         self.selection.blocks.clear();
         self.selected_note = None;
-        self.clear_active_chord();
+        self.clear_chord_selection();
         self.project_path = Some(path.to_path_buf());
         self.gesture_undo_saved = false;
         Ok(())
@@ -2558,10 +2682,18 @@ fn main() -> eframe::Result<()> {
 
 impl eframe::App for JpoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let wants_kb = ctx.wants_keyboard_input();
         ctx.input(|i| {
             let ctrl = i.modifiers.ctrl;
+            if !wants_kb && i.key_pressed(egui::Key::Space) {
+                self.toggle_playback();
+            }
             if i.key_pressed(egui::Key::Delete) {
-                self.delete_selected_notes();
+                if self.ui_mode == UiMode::Sketch && !self.selected_chord_indices().is_empty() {
+                    self.delete_selected_chords();
+                } else {
+                    self.delete_selected_notes();
+                }
             }
             if ctrl && i.key_pressed(egui::Key::Z) && !i.modifiers.shift {
                 self.do_undo();
@@ -2570,15 +2702,15 @@ impl eframe::App for JpoApp {
                 self.do_redo();
             }
             if ctrl && i.key_pressed(egui::Key::C) {
-                if self.ui_mode == UiMode::Sketch && self.active_chord_beat.is_some() {
-                    self.copy_chord_block();
+                if self.ui_mode == UiMode::Sketch && !self.selected_chord_indices().is_empty() {
+                    self.copy_chord_blocks();
                 } else {
                     self.copy_selection();
                 }
             }
             if ctrl && i.key_pressed(egui::Key::V) {
                 if self.ui_mode == UiMode::Sketch && self.chord_clipboard.is_some() {
-                    self.paste_chord_block();
+                    self.paste_chord_blocks();
                 } else {
                     self.paste_clipboard();
                 }
@@ -2666,15 +2798,12 @@ impl eframe::App for JpoApp {
                 let play_label = if self.audio_stream.is_some() { "■ Stop" } else { "▶ Play" };
                 if ui
                     .add(egui::Button::new(play_label).min_size(egui::vec2(72.0, 0.0)))
+                    .on_hover_text("Space")
                     .clicked()
                 {
-                    if self.audio_stream.is_some() {
-                        self.stop_playback();
-                    } else {
-                        self.start_playback();
-                    }
+                    self.toggle_playback();
                 }
-                ui.monospace(format!("{:.2}", self.current_beat));
+                ui.monospace(format!("▸ {:.2}", self.current_beat));
             });
         });
 
@@ -2822,7 +2951,7 @@ impl eframe::App for JpoApp {
                 );
             });
 
-            ui.label("Tip: Loop 4/8/16 bars • Shift+drag = box select • Ctrl+Z/Y, C/V/D");
+            ui.label("Tip: click = playhead • Space = play/stop • Shift+drag = box select • Ctrl+Z/Y, C/V");
         });
 
         // Main area
@@ -2852,7 +2981,7 @@ impl eframe::App for JpoApp {
                                     self.selected_ch = ch;
                                     self.selected_note = None;
                                     if ch != 1 {
-                                        self.clear_active_chord();
+                                        self.clear_chord_selection();
                                     }
                                 }
                             },
@@ -2931,7 +3060,7 @@ impl eframe::App for JpoApp {
                 self.show_arrange_panel(ui);
             } else {
                 // Chord Timeline (always visible - onion source + Ch1 input)
-                ui.label(egui::RichText::new("CHORD TIMELINE (Ch1) — drag empty=paint • drag block=move • Ctrl+right edge ONLY=stretch • Shift+click empty=paste here • dbl-click=delete").strong());
+                ui.label(egui::RichText::new("CHORD TIMELINE — click=playhead • drag empty=paint • Ctrl+click=multi • Shift+drag=box select • Ctrl+right edge=stretch • Space=play").strong());
                 let _chord_response = self.draw_chord_timeline(ui);
                 self.show_chord_strip(ui);
 
@@ -2949,17 +3078,15 @@ impl eframe::App for JpoApp {
             }
         });
 
-        // Drive playhead from the real audio thread's sample counter (when playback is active).
-        if self.audio_stream.is_some() {
+        // Drive playhead from the audio thread while playing.
+        if self.audio_stream.is_some() && self.synth_sample_rate > 0 {
             let samples = self.play_position_samples.load(Ordering::Relaxed);
-            if self.synth_sample_rate > 0 {
-                let beat = samples as f64 * self.proj.bpm / (60.0 * self.synth_sample_rate as f64);
-                self.current_beat = if self.loop_playback {
-                    beat % self.loop_beats()
-                } else {
-                    beat
-                };
-            }
+            let beat = samples as f64 * self.proj.bpm / (60.0 * self.synth_sample_rate as f64);
+            self.current_beat = if self.loop_playback {
+                beat % self.loop_beats()
+            } else {
+                beat
+            };
             ctx.request_repaint();
         }
     }
@@ -3002,40 +3129,24 @@ impl JpoApp {
 
         self.draw_loop_boundaries(&painter, rect, start_b, px_per_beat, false);
 
-        if let Some(paste_b) = self.chord_paste_beat {
-            if paste_b >= start_b && paste_b <= end_b + 0.1 {
-                let x = rect.min.x + ((paste_b - start_b) * px_per_beat) as f32;
-                painter.line_segment(
-                    [Pos2::new(x, rect.min.y + 2.0), Pos2::new(x, rect.max.y - 2.0)],
-                    Stroke::new(2.5, Color32::from_rgb(120, 220, 140)),
-                );
-                painter.text(
-                    Pos2::new(x + 4.0, rect.min.y + 4.0),
-                    egui::Align2::LEFT_TOP,
-                    "paste",
-                    egui::FontId::proportional(10.0),
-                    Color32::from_rgb(120, 220, 140),
-                );
-            }
-        }
-
         if let Some(ptr) = resp.hover_pos() {
             let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
             self.chord_timeline_mouse_beat = beat;
         }
 
         // blocks
-        for blk in self.proj.chord_blocks.iter() {
+        for (i, blk) in self.proj.chord_blocks.iter().enumerate() {
             if blk.end() < start_b || blk.start > end_b { continue; }
             let x0 = rect.min.x + ((blk.start - start_b) * px_per_beat) as f32;
             let x1 = rect.min.x + ((blk.end() - start_b) * px_per_beat) as f32;
             let y0 = rect.min.y + 8.0;
             let y1 = rect.max.y - 8.0;
 
-            let selected = self
+            let primary = self
                 .active_chord_beat
                 .map(|b| (b - blk.start).abs() < 0.001)
                 .unwrap_or(false);
+            let selected = self.selection.blocks.contains(&i) || primary;
             let col = if selected {
                 Color32::from_rgb(95, 130, 175)
             } else {
@@ -3050,7 +3161,7 @@ impl JpoApp {
             }
             painter.text(Pos2::new(x0 + 6.0, y0 + 6.0), egui::Align2::LEFT_TOP, label, egui::FontId::proportional(13.0), Color32::WHITE);
 
-            if selected {
+            if primary {
                 painter.rect_stroke(Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)), 3.0, Stroke::new(2.0, Color32::from_rgb(255, 180, 80)));
                 let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
                 let hx = x1 - 3.0;
@@ -3064,12 +3175,46 @@ impl JpoApp {
                     1.0,
                     handle_col,
                 );
+            } else if self.selection.blocks.contains(&i) {
+                painter.rect_stroke(
+                    Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)),
+                    3.0,
+                    Stroke::new(1.5, Color32::from_rgb(180, 200, 255)),
+                );
+            }
+        }
+
+        self.draw_playhead_line(&painter, rect, start_b, px_per_beat);
+
+        let shift = ui.ctx().input(|i| i.modifiers.shift);
+        let box_active = self.chord_box_select_start.is_some();
+        if box_active {
+            if let (Some(sb), Some(ptr)) = (self.chord_box_select_start, resp.interact_pointer_pos()) {
+                let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
+                let x0 = rect.min.x + ((sb.min(beat) - start_b) * px_per_beat) as f32;
+                let x1 = rect.min.x + ((sb.max(beat) - start_b) * px_per_beat) as f32;
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(x0, rect.min.y + 6.0), Pos2::new(x1, rect.max.y - 6.0)),
+                    0.0,
+                    Color32::from_rgba_unmultiplied(70, 130, 255, 55),
+                );
+                painter.rect_stroke(
+                    Rect::from_min_max(Pos2::new(x0, rect.min.y + 6.0), Pos2::new(x1, rect.max.y - 6.0)),
+                    0.0,
+                    Stroke::new(1.5, Color32::from_rgb(90, 150, 255)),
+                );
             }
         }
 
         // empty hint
         if self.proj.chord_blocks.is_empty() {
-            painter.text(rect.min + Vec2::new(16.0, 28.0), egui::Align2::LEFT_TOP, "drag here to paint chord blocks (Ch1)", egui::FontId::proportional(12.0), Color32::from_rgb(90,95,105));
+            painter.text(
+                rect.min + Vec2::new(16.0, 28.0),
+                egui::Align2::LEFT_TOP,
+                "click = playhead • drag = paint chord blocks",
+                egui::FontId::proportional(12.0),
+                Color32::from_rgb(90, 95, 105),
+            );
         }
 
         // interaction
@@ -3077,13 +3222,17 @@ impl JpoApp {
             if let Some(ptr) = resp.interact_pointer_pos() {
                 let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
                 let snapped = self.snap_beat(beat);
+                let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
 
-                if resp.drag_started() {
+                if shift && resp.drag_started() {
+                    self.chord_box_select_start = Some(beat);
+                }
+
+                if resp.drag_started() && !shift {
                     self.begin_gesture_undo();
                 }
 
-                if resp.drag_started() || resp.clicked() || resp.double_clicked() {
-                    let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
+                if !shift && (resp.drag_started() || resp.clicked() || resp.double_clicked()) {
                     let mut hit = None;
                     let mut hit_kind = ChordDragKind::None;
                     for (i, blk) in self.proj.chord_blocks.iter().enumerate() {
@@ -3101,68 +3250,69 @@ impl JpoApp {
                         if should_delete {
                             self.begin_gesture_undo();
                             self.proj.chord_blocks.remove(i);
-                            self.clear_active_chord();
+                            self.selection.blocks.remove(&i);
+                            self.clear_chord_selection();
                             self.chord_drag_kind = ChordDragKind::None;
                             self.chord_paint_new = false;
                             self.end_gesture_undo();
                         } else if self.edit_mode == EditMode::Pencil {
                             let blk = self.proj.chord_blocks[i].clone();
-                            self.set_active_chord_idx(i);
-                            self.block_drag_orig = (blk.start, blk.dur);
-                            self.drag_start_beat = beat;
-                            self.chord_paint_new = false;
-                            if resp.drag_started() {
-                                self.chord_drag_kind = hit_kind;
-                                self.is_creating = false;
-                            } else if resp.clicked() && !resp.dragged() {
+                            if resp.clicked() && !resp.dragged() {
+                                self.select_chord_block(i, ctrl);
+                                self.set_playhead(beat);
                                 self.chord_drag_kind = ChordDragKind::None;
                                 self.is_creating = false;
                                 self.preview_chord_block(&blk);
+                            } else if resp.drag_started() {
+                                self.select_chord_block(i, false);
+                                self.set_playhead(beat);
+                                self.block_drag_orig = (blk.start, blk.dur);
+                                self.drag_start_beat = beat;
+                                self.chord_paint_new = false;
+                                self.chord_drag_kind = hit_kind;
+                                self.is_creating = false;
                             }
                         }
                     } else if self.edit_mode == EditMode::Pencil {
-                        let shift = ui.ctx().input(|i| i.modifiers.shift);
-                        if resp.clicked() && !resp.dragged() && shift {
-                            self.chord_paste_beat = Some(snapped);
-                        } else {
-                            let should_create =
-                                (resp.clicked() && !resp.dragged() && !shift) || resp.drag_started();
-                            if should_create && self.chord_drag_kind == ChordDragKind::None {
-                                self.begin_gesture_undo();
-                                let q = self.proj.default_quality(1).to_string();
-                                let new = ChordBlock {
-                                    start: snapped,
-                                    dur: self.note_len.max(0.5),
-                                    degree: 1,
-                                    quality: q,
-                                    octave: 4,
-                                    syncopation_fill: false,
-                                };
-                                self.block_drag_orig = (new.start, new.dur);
-                                self.proj.chord_blocks.push(new);
-                                self.proj.chord_blocks.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-                                if let Some(new_idx) = self
-                                    .proj
-                                    .chord_blocks
-                                    .iter()
-                                    .position(|b| (b.start - snapped).abs() < 0.001)
-                                {
-                                    self.set_active_chord_idx(new_idx);
-                                    self.drag_start_beat = beat;
-                                    self.chord_drag_kind = ChordDragKind::Create;
-                                    self.chord_paint_new = true;
-                                    self.is_creating = true;
-                                    if resp.clicked() && !resp.dragged() {
-                                        let preview = self.proj.chord_blocks[new_idx].clone();
-                                        self.preview_chord_block(&preview);
-                                    }
-                                }
+                        if resp.clicked() && !resp.dragged() {
+                            self.set_playhead(snapped);
+                            if !ctrl {
+                                self.clear_chord_selection();
+                            }
+                        } else if resp.drag_started() && self.chord_drag_kind == ChordDragKind::None {
+                            self.set_playhead(snapped);
+                            self.begin_gesture_undo();
+                            let q = self.proj.default_quality(1).to_string();
+                            let new = ChordBlock {
+                                start: snapped,
+                                dur: self.note_len.max(0.5),
+                                degree: 1,
+                                quality: q,
+                                octave: 4,
+                                syncopation_fill: false,
+                            };
+                            self.block_drag_orig = (new.start, new.dur);
+                            self.proj.chord_blocks.push(new);
+                            self.proj.chord_blocks.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+                            if let Some(new_idx) = self
+                                .proj
+                                .chord_blocks
+                                .iter()
+                                .position(|b| (b.start - snapped).abs() < 0.001)
+                            {
+                                self.selection.blocks.clear();
+                                self.selection.blocks.insert(new_idx);
+                                self.set_active_chord_idx(new_idx);
+                                self.drag_start_beat = beat;
+                                self.chord_drag_kind = ChordDragKind::Create;
+                                self.chord_paint_new = true;
+                                self.is_creating = true;
                             }
                         }
                     }
                 }
 
-                if resp.dragged() {
+                if !shift && resp.dragged() {
                     if let Some(i) = self.active_chord_idx() {
                         if i < self.proj.chord_blocks.len() {
                             let (orig_start, _orig_dur) = self.block_drag_orig;
@@ -3194,6 +3344,24 @@ impl JpoApp {
         }
 
         if resp.drag_stopped() {
+            if let Some(sb) = self.chord_box_select_start {
+                if let Some(ptr) = resp.interact_pointer_pos() {
+                    let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
+                    let (lo, hi) = (sb.min(beat), sb.max(beat));
+                    if !ui.ctx().input(|i| i.modifiers.ctrl) {
+                        self.selection.blocks.clear();
+                    }
+                    for (i, blk) in self.proj.chord_blocks.iter().enumerate() {
+                        if blk.end() > lo && blk.start < hi {
+                            self.selection.blocks.insert(i);
+                        }
+                    }
+                    if let Some(&last) = self.selection.blocks.iter().max() {
+                        self.set_active_chord_idx(last);
+                    }
+                }
+                self.chord_box_select_start = None;
+            }
             if self.chord_drag_kind == ChordDragKind::Move {
                 self.proj.chord_blocks.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
                 if let Some(beat) = self.active_chord_beat {
@@ -3204,6 +3372,8 @@ impl JpoApp {
                         .position(|b| (b.start - beat).abs() < 0.001)
                     {
                         self.set_active_chord_idx(idx);
+                        self.selection.blocks.clear();
+                        self.selection.blocks.insert(idx);
                     }
                 }
             }
@@ -3465,13 +3635,17 @@ impl JpoApp {
             }
         }
 
-        // playhead
-        if start_b <= self.current_beat && self.current_beat <= end_b {
-            let x = rect.min.x + ((self.current_beat - start_b) * px_per_beat) as f32;
-            painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], Stroke::new(2.0, Color32::from_rgb(255, 230, 120)));
+        self.draw_playhead_line(&painter, rect, start_b, px_per_beat);
+
+        // Ch1 roll: click sets playhead only (chords edited in timeline).
+        if is_ch1 && resp.clicked() && !resp.dragged() {
+            if let Some(ptr) = resp.interact_pointer_pos() {
+                let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
+                self.set_playhead(beat);
+            }
         }
 
-        // mouse interaction (Ch1 roll is preview-only)
+        // mouse interaction (Ch2–16)
         if !is_ch1 && (resp.clicked() || resp.dragged() || resp.double_clicked()) {
             if let Some(ptr) = resp.interact_pointer_pos() {
                 let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
@@ -3576,9 +3750,7 @@ impl JpoApp {
                         } else if resp.drag_started() && self.note_drag_kind == NoteDragKind::None {
                             self.place_piano_note(track_idx, beat, pitch, NoteDragKind::Create);
                         } else if resp.clicked() && !resp.dragged() && self.note_drag_kind == NoteDragKind::None {
-                            self.place_piano_note(track_idx, beat, pitch, NoteDragKind::None);
-                            self.note_drag_kind = NoteDragKind::None;
-                            self.end_gesture_undo();
+                            self.set_playhead(beat);
                         }
                     }
                 }
@@ -3661,10 +3833,10 @@ impl JpoApp {
         ui.label(egui::RichText::new("CHORD STRIP").strong());
 
         let Some(idx) = self.active_chord_idx() else {
-            let mut hint = "Click block = select/edit • Shift+click empty timeline = paste cursor • Ctrl+C/V".to_string();
-            if let Some(pb) = self.chord_paste_beat {
-                hint.push_str(&format!(" • paste @ {:.1}", pb));
-            }
+            let mut hint = format!(
+                "▸ playhead {:.1} — click timeline to move • Ctrl+click multi • Shift+drag box • Ctrl+C/V at playhead",
+                self.current_beat
+            );
             if self.chord_clipboard.is_some() {
                 hint.push_str(" • clipboard ready");
             }
@@ -3672,7 +3844,7 @@ impl JpoApp {
             return;
         };
         if idx >= self.proj.chord_blocks.len() {
-            self.clear_active_chord();
+            self.clear_chord_selection();
             return;
         }
 
@@ -3683,19 +3855,21 @@ impl JpoApp {
         );
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(block_label).strong());
-            if let Some(pb) = self.chord_paste_beat {
+            let sel_n = self.selection.blocks.len();
+            if sel_n > 1 {
                 ui.label(
-                    egui::RichText::new(format!("paste @ {:.1}", pb))
+                    egui::RichText::new(format!("{sel_n} selected"))
                         .small()
-                        .color(Color32::from_rgb(120, 220, 140)),
+                        .color(Color32::from_rgb(180, 200, 255)),
                 );
             }
+            ui.label(
+                egui::RichText::new(format!("▸ {:.1}", self.current_beat))
+                    .small()
+                    .color(Color32::from_rgb(255, 120, 120)),
+            );
             if self.chord_clipboard.is_some() {
-                ui.label(
-                    egui::RichText::new("clipboard ready")
-                        .small()
-                        .weak(),
-                );
+                ui.label(egui::RichText::new("clipboard ready").small().weak());
             }
             ui.separator();
             let mut sync = self.proj.chord_blocks[idx].syncopation_fill;
@@ -3896,8 +4070,12 @@ impl JpoApp {
             0
         };
 
-        // Reset position
-        self.play_position_samples.store(0, Ordering::Relaxed);
+        let mut start_sample = (self.current_beat * samples_per_beat) as u64;
+        if self.loop_playback && loop_end_sample > 0 {
+            start_sample %= loop_end_sample;
+        }
+        self.play_position_samples
+            .store(start_sample, Ordering::Relaxed);
 
         // Snapshot patches for program change support
         let initial_patches: Vec<(u8, u8)> = self.proj.tracks.iter()
@@ -3914,6 +4092,7 @@ impl JpoApp {
             initial_patches,
             self.loop_playback,
             loop_end_sample,
+            start_sample,
         );
 
         // Build stream — player owns everything and has a proper advancing cursor
@@ -3947,8 +4126,15 @@ impl JpoApp {
             drop(stream);
             println!("[Playback] Stopped.");
         }
+        if self.synth_sample_rate > 0 {
+            let samples = self.play_position_samples.load(Ordering::Relaxed);
+            let beat = samples as f64 * self.proj.bpm / (60.0 * self.synth_sample_rate as f64);
+            self.current_beat = if self.loop_playback {
+                beat % self.loop_beats()
+            } else {
+                beat
+            };
+        }
         self.is_playing = false;
-        self.play_position_samples.store(0, Ordering::Relaxed);
-        self.current_beat = 0.0;
     }
 }
