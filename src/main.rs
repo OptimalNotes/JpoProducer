@@ -1388,8 +1388,8 @@ impl JpoApp {
         }
     }
 
-    fn select_chord_block(&mut self, idx: usize, ctrl: bool) {
-        if ctrl {
+    fn select_chord_block(&mut self, idx: usize, shift: bool) {
+        if shift {
             if self.selection.blocks.contains(&idx) {
                 self.selection.blocks.remove(&idx);
                 if self.active_chord_idx() == Some(idx) {
@@ -1455,12 +1455,15 @@ impl JpoApp {
         }
     }
 
-    fn chord_hit_at(beat: f64, blk: &ChordBlock, px_per_beat: f64, ctrl: bool) -> ChordDragKind {
+    /// Right-edge pixel zone = stretch; everything else on the block = move. No modifier key.
+    fn chord_hit_at(ptr_x: f32, block_x0: f32, block_x1: f32, beat: f64, blk: &ChordBlock) -> ChordDragKind {
         if beat < blk.start || beat > blk.end() {
             return ChordDragKind::None;
         }
-        let resize_beats = (12.0 / px_per_beat).clamp(0.06, 0.2);
-        if ctrl && beat >= blk.end() - resize_beats {
+        let width = (block_x1 - block_x0).max(1.0);
+        let resize_px = 16.0f32.min(width * 0.35).max(8.0);
+        let dist_right = block_x1 - ptr_x;
+        if dist_right >= -3.0 && dist_right <= resize_px {
             ChordDragKind::Resize
         } else {
             ChordDragKind::Move
@@ -2951,7 +2954,7 @@ impl eframe::App for JpoApp {
                 );
             });
 
-            ui.label("Tip: click = playhead • Space = play/stop • Shift+drag = box select • Ctrl+Z/Y, C/V");
+            ui.label("Tip: click = playhead • Space = play/stop • Shift+click multi • Alt+drag box • Ctrl+Z/Y, C/V");
         });
 
         // Main area
@@ -3060,7 +3063,7 @@ impl eframe::App for JpoApp {
                 self.show_arrange_panel(ui);
             } else {
                 // Chord Timeline (always visible - onion source + Ch1 input)
-                ui.label(egui::RichText::new("CHORD TIMELINE — click=playhead • drag empty=paint • Ctrl+click=multi • Shift+drag=box select • Ctrl+right edge=stretch • Space=play").strong());
+                ui.label(egui::RichText::new("CHORD TIMELINE — click=playhead • drag empty=paint • right edge=stretch • Shift+click=multi • Alt+drag=box select • Space=play").strong());
                 let _chord_response = self.draw_chord_timeline(ui);
                 self.show_chord_strip(ui);
 
@@ -3163,17 +3166,17 @@ impl JpoApp {
 
             if primary {
                 painter.rect_stroke(Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)), 3.0, Stroke::new(2.0, Color32::from_rgb(255, 180, 80)));
-                let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
-                let hx = x1 - 3.0;
-                let handle_col = if ctrl {
-                    Color32::from_rgb(255, 200, 120)
-                } else {
-                    Color32::from_rgb(90, 95, 110)
-                };
+                let width = (x1 - x0).max(1.0);
+                let resize_px = 16.0f32.min(width * 0.35).max(8.0);
+                let hx0 = x1 - resize_px;
                 painter.rect_filled(
-                    Rect::from_min_max(Pos2::new(hx - 2.0, y0 + 4.0), Pos2::new(hx + 4.0, y1 - 4.0)),
+                    Rect::from_min_max(Pos2::new(hx0, y0 + 3.0), Pos2::new(x1, y1 - 3.0)),
                     1.0,
-                    handle_col,
+                    Color32::from_rgba_unmultiplied(255, 200, 120, 70),
+                );
+                painter.line_segment(
+                    [Pos2::new(x1 - 1.0, y0 + 4.0), Pos2::new(x1 - 1.0, y1 - 4.0)],
+                    Stroke::new(2.0, Color32::from_rgb(255, 200, 120)),
                 );
             } else if self.selection.blocks.contains(&i) {
                 painter.rect_stroke(
@@ -3186,7 +3189,6 @@ impl JpoApp {
 
         self.draw_playhead_line(&painter, rect, start_b, px_per_beat);
 
-        let shift = ui.ctx().input(|i| i.modifiers.shift);
         let box_active = self.chord_box_select_start.is_some();
         if box_active {
             if let (Some(sb), Some(ptr)) = (self.chord_box_select_start, resp.interact_pointer_pos()) {
@@ -3222,21 +3224,27 @@ impl JpoApp {
             if let Some(ptr) = resp.interact_pointer_pos() {
                 let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
                 let snapped = self.snap_beat(beat);
-                let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
+                let shift = ui.ctx().input(|i| i.modifiers.shift);
+                let alt = ui.ctx().input(|i| i.modifiers.alt);
 
-                if shift && resp.drag_started() {
+                if alt && resp.drag_started() {
                     self.chord_box_select_start = Some(beat);
                 }
 
-                if resp.drag_started() && !shift {
+                if resp.drag_started() && !alt {
                     self.begin_gesture_undo();
                 }
 
-                if !shift && (resp.drag_started() || resp.clicked() || resp.double_clicked()) {
+                if !alt && (resp.drag_started() || resp.clicked() || resp.double_clicked()) {
                     let mut hit = None;
                     let mut hit_kind = ChordDragKind::None;
-                    for (i, blk) in self.proj.chord_blocks.iter().enumerate() {
-                        let kind = Self::chord_hit_at(beat, blk, px_per_beat, ctrl);
+                    for (i, blk) in self.proj.chord_blocks.iter().enumerate().rev() {
+                        if beat < blk.start || beat > blk.end() {
+                            continue;
+                        }
+                        let x0 = rect.min.x + ((blk.start - start_b) * px_per_beat) as f32;
+                        let x1 = rect.min.x + ((blk.end() - start_b) * px_per_beat) as f32;
+                        let kind = Self::chord_hit_at(ptr.x, x0, x1, beat, blk);
                         if kind != ChordDragKind::None {
                             hit = Some(i);
                             hit_kind = kind;
@@ -3258,14 +3266,15 @@ impl JpoApp {
                         } else if self.edit_mode == EditMode::Pencil {
                             let blk = self.proj.chord_blocks[i].clone();
                             if resp.clicked() && !resp.dragged() {
-                                self.select_chord_block(i, ctrl);
+                                self.select_chord_block(i, shift);
                                 self.set_playhead(beat);
                                 self.chord_drag_kind = ChordDragKind::None;
                                 self.is_creating = false;
                                 self.preview_chord_block(&blk);
                             } else if resp.drag_started() {
-                                self.select_chord_block(i, false);
-                                self.set_playhead(beat);
+                                if !shift {
+                                    self.select_chord_block(i, false);
+                                }
                                 self.block_drag_orig = (blk.start, blk.dur);
                                 self.drag_start_beat = beat;
                                 self.chord_paint_new = false;
@@ -3276,7 +3285,7 @@ impl JpoApp {
                     } else if self.edit_mode == EditMode::Pencil {
                         if resp.clicked() && !resp.dragged() {
                             self.set_playhead(snapped);
-                            if !ctrl {
+                            if !shift {
                                 self.clear_chord_selection();
                             }
                         } else if resp.drag_started() && self.chord_drag_kind == ChordDragKind::None {
@@ -3312,19 +3321,13 @@ impl JpoApp {
                     }
                 }
 
-                if !shift && resp.dragged() {
+                if !alt && resp.dragged() {
                     if let Some(i) = self.active_chord_idx() {
                         if i < self.proj.chord_blocks.len() {
                             let (orig_start, _orig_dur) = self.block_drag_orig;
                             let db = beat - self.drag_start_beat;
-                            let ctrl_now = ui.ctx().input(|i| i.modifiers.ctrl);
                             match self.chord_drag_kind {
-                                ChordDragKind::Resize if ctrl_now => {
-                                    let new_end = beat.max(orig_start + self.note_len * 0.5);
-                                    let new_dur = self.snap_dur(new_end - orig_start);
-                                    self.proj.chord_blocks[i].dur = new_dur;
-                                }
-                                ChordDragKind::Create if self.chord_paint_new => {
+                                ChordDragKind::Resize | ChordDragKind::Create => {
                                     let new_end = beat.max(orig_start + self.note_len * 0.5);
                                     let new_dur = self.snap_dur(new_end - orig_start);
                                     self.proj.chord_blocks[i].dur = new_dur;
@@ -3335,7 +3338,6 @@ impl JpoApp {
                                     self.active_chord_beat = Some(new_start);
                                 }
                                 ChordDragKind::None => {}
-                                ChordDragKind::Create | ChordDragKind::Resize => {}
                             }
                         }
                     }
@@ -3348,7 +3350,7 @@ impl JpoApp {
                 if let Some(ptr) = resp.interact_pointer_pos() {
                     let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
                     let (lo, hi) = (sb.min(beat), sb.max(beat));
-                    if !ui.ctx().input(|i| i.modifiers.ctrl) {
+                    if !ui.ctx().input(|i| i.modifiers.shift) {
                         self.selection.blocks.clear();
                     }
                     for (i, blk) in self.proj.chord_blocks.iter().enumerate() {
@@ -3834,7 +3836,7 @@ impl JpoApp {
 
         let Some(idx) = self.active_chord_idx() else {
             let mut hint = format!(
-                "▸ playhead {:.1} — click timeline to move • Ctrl+click multi • Shift+drag box • Ctrl+C/V at playhead",
+                "▸ playhead {:.1} — Shift+click multi • Alt+drag box • right edge stretch • Ctrl+C/V at playhead",
                 self.current_beat
             );
             if self.chord_clipboard.is_some() {
