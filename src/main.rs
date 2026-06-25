@@ -812,15 +812,21 @@ fn note_overlaps_range(n: &Note, range_start: f64, range_end: f64) -> bool {
     n.start < range_end - 0.001 && n.end() > range_start + 0.001
 }
 
-fn replace_notes_in_range(notes: &mut Vec<Note>, range_start: f64, range_end: f64, new_notes: Vec<Note>) {
-    notes.retain(|n| !note_overlaps_range(n, range_start, range_end));
-    notes.extend(new_notes);
+fn dedupe_notes(notes: &mut Vec<Note>) {
     notes.sort_by(|a, b| {
         a.start
             .partial_cmp(&b.start)
             .unwrap()
             .then(a.pitch.cmp(&b.pitch))
     });
+    notes.dedup_by(|a, b| (a.start - b.start).abs() < 0.02 && a.pitch == b.pitch);
+}
+
+fn replace_notes_in_range(notes: &mut Vec<Note>, range_start: f64, range_end: f64, mut new_notes: Vec<Note>) {
+    notes.retain(|n| !note_overlaps_range(n, range_start, range_end));
+    dedupe_notes(&mut new_notes);
+    notes.extend(new_notes);
+    dedupe_notes(notes);
 }
 
 fn chord_block_at<'a>(blocks: &'a [ChordBlock], beat: f64) -> Option<&'a ChordBlock> {
@@ -851,7 +857,7 @@ fn apply_melodic_pattern(
 ) -> Vec<Note> {
     let mut notes = Vec::new();
     let ref_octave = match pattern.category {
-        PatternCategory::Piano => 4,
+        PatternCategory::Piano => 3,
         PatternCategory::Bass => 3,
         PatternCategory::Drum => 3,
     };
@@ -923,7 +929,7 @@ fn apply_melodic_block_range(
 ) -> Vec<Note> {
     let mut notes = Vec::new();
     let ref_octave = match pattern.category {
-        PatternCategory::Piano => 4,
+        PatternCategory::Piano => 3,
         PatternCategory::Bass => 3,
         PatternCategory::Drum => 3,
     };
@@ -984,7 +990,7 @@ fn apply_syncopation_splice(
     for &(win_start, win_end) in windows {
         let block = chord_block_at(&proj.chord_blocks, win_start);
         let ref_octave = match sync_pattern.category {
-            PatternCategory::Piano => 4,
+            PatternCategory::Piano => 3,
             PatternCategory::Bass => 3,
             _ => 3,
         };
@@ -1305,7 +1311,7 @@ impl Default for JpoApp {
             proj: Project::default(),
             selected_ch: 4,
             visible_start: 0.0,
-            visible_beats: 8.0,
+            visible_beats: 16.0,
             current_beat: 0.0,
             edit_mode: EditMode::Pencil,
             note_len: 0.5,
@@ -1335,7 +1341,7 @@ impl Default for JpoApp {
             last_mouse_pitch: 60,
             chord_clipboard: None,
             gen_start: 0.0,
-            gen_end: 32.0,
+            gen_end: 16.0,
             soundfont_path: find_soundfont(),
             audio_stream: None,
             play_position_samples: Arc::new(AtomicU64::new(0)),
@@ -1522,34 +1528,33 @@ impl JpoApp {
 
     fn handle_edit_shortcuts(&mut self, ctx: &egui::Context, i: &mut egui::InputState) {
         let ctrl = i.modifiers.ctrl;
-        let chord_focus = self.ui_mode == UiMode::Sketch && self.piano_roll_focused == false;
-        let roll_focus = self.selected_ch != 1 && self.piano_roll_focused;
+        let on_piano_track = self.ui_mode == UiMode::Sketch && self.selected_ch != 1;
 
-        if ctrl && i.key_pressed(egui::Key::A) && roll_focus {
+        if ctrl && i.key_pressed(egui::Key::A) && on_piano_track {
             self.select_all_notes_in_track(self.track_idx());
             i.consume_key(egui::Modifiers::CTRL, egui::Key::A);
             return;
         }
 
         if ctrl && i.key_pressed(egui::Key::C) {
-            if roll_focus && self.has_note_selection() {
+            if on_piano_track && self.has_note_selection() {
                 if self.copy_selection() {
                     self.show_toast(ctx, "Copied notes");
                 } else {
                     self.show_toast(ctx, "Nothing to copy");
                 }
-            } else if chord_focus && self.has_chord_selection() {
+            } else if self.has_chord_selection() {
                 if self.copy_chord_blocks() {
                     self.show_toast(ctx, "Copied chords");
                 }
-            } else if roll_focus {
-                self.show_toast(ctx, "Select notes first");
+            } else if on_piano_track {
+                self.show_toast(ctx, "Select notes first (Shift+click)");
             }
             i.consume_key(egui::Modifiers::CTRL, egui::Key::C);
             return;
         }
 
-        if ctrl && i.key_pressed(egui::Key::X) && roll_focus {
+        if ctrl && i.key_pressed(egui::Key::X) && on_piano_track {
             if self.cut_selection() {
                 self.show_toast(ctx, "Cut notes");
             } else {
@@ -1560,25 +1565,23 @@ impl JpoApp {
         }
 
         if ctrl && i.key_pressed(egui::Key::V) {
-            if roll_focus {
-                if self.clipboard.is_some() {
-                    if self.paste_clipboard() {
-                        self.show_toast(ctx, "Pasted notes at playhead");
-                    }
-                } else {
-                    self.show_toast(ctx, "Clipboard empty");
+            if on_piano_track && self.clipboard.is_some() {
+                if self.paste_clipboard() {
+                    self.show_toast(ctx, "Pasted notes at playhead");
                 }
-            } else if chord_focus && self.chord_clipboard.is_some() {
+            } else if self.chord_clipboard.is_some() {
                 self.paste_chord_blocks();
                 self.show_toast(ctx, "Pasted chords at playhead");
-            } else if chord_focus {
+            } else if on_piano_track {
+                self.show_toast(ctx, "Note clipboard empty — Ctrl+C first");
+            } else {
                 self.show_toast(ctx, "Chord clipboard empty");
             }
             i.consume_key(egui::Modifiers::CTRL, egui::Key::V);
             return;
         }
 
-        if ctrl && i.key_pressed(egui::Key::D) && roll_focus {
+        if ctrl && i.key_pressed(egui::Key::D) && on_piano_track {
             if self.duplicate_selection() {
                 self.show_toast(ctx, "Duplicated notes");
             }
@@ -1586,7 +1589,7 @@ impl JpoApp {
             return;
         }
 
-        if roll_focus && self.has_note_selection() {
+        if on_piano_track && self.has_note_selection() {
             let step = if i.modifiers.shift { self.note_len } else { 0.25 };
             if i.key_pressed(egui::Key::ArrowLeft) {
                 self.nudge_selection(-step, 0);
@@ -1668,14 +1671,15 @@ impl JpoApp {
     }
 
     /// Right-edge pixel zone = stretch; everything else on the block = move. No modifier key.
+    /// resize_px: min(32, width*0.4), floor 16px. Slop: 12px outside right edge still counts as resize.
     fn chord_hit_at(ptr_x: f32, block_x0: f32, block_x1: f32, beat: f64, blk: &ChordBlock) -> ChordDragKind {
         if beat < blk.start || beat > blk.end() {
             return ChordDragKind::None;
         }
         let width = (block_x1 - block_x0).max(1.0);
-        let resize_px = 24.0f32.min(width * 0.5).max(12.0);
+        let resize_px = 32.0f32.min(width * 0.4).max(16.0);
         let dist_right = block_x1 - ptr_x;
-        if dist_right >= -8.0 && dist_right <= resize_px {
+        if dist_right >= -12.0 && dist_right <= resize_px {
             ChordDragKind::Resize
         } else {
             ChordDragKind::Move
@@ -2549,7 +2553,7 @@ impl JpoApp {
 
             ui.separator();
             ui.label(
-                egui::RichText::new("Shift+drag = box select • Ctrl+Z/Y, C/V/D")
+                egui::RichText::new("click empty = place • Shift+click multi • Shift+drag box • Ctrl+C/V/X/D")
                     .small()
                     .weak(),
             );
@@ -2847,13 +2851,13 @@ impl JpoApp {
         Ok(())
     }
 
-    fn place_piano_note(&mut self, track_idx: usize, beat: f64, pitch: u8, drag_kind: NoteDragKind) {
+    /// Click empty grid = place note at Len (same UX as chord blocks).
+    fn place_piano_note_at(&mut self, track_idx: usize, beat: f64, pitch: u8) {
         self.begin_gesture_undo();
-        let dur = self.note_len;
         let new_n = Note {
             start: self.snap_beat(beat),
             pitch: pitch.clamp(0, 127),
-            dur,
+            dur: self.note_len,
             vel: self.default_velocity,
         };
         self.proj.tracks[track_idx].notes.push(new_n);
@@ -2864,13 +2868,11 @@ impl JpoApp {
                 .then(a.pitch.cmp(&b.pitch))
         });
         let new_idx = self.proj.tracks[track_idx].notes.len() - 1;
+        self.selection.notes.clear();
+        self.selection.notes.insert((track_idx, new_idx));
         self.selected_note = Some((track_idx, new_idx));
-        self.drag_orig = (new_n.start, new_n.pitch, new_n.dur);
-        self.drag_start_beat = beat;
-        self.drag_start_pitch = pitch;
-        self.is_creating = drag_kind == NoteDragKind::Create;
-        self.note_drag_kind = drag_kind;
-        self.drag_sel_offsets = vec![(new_idx, 0.0, 0)];
+        self.note_drag_kind = NoteDragKind::None;
+        self.end_gesture_undo();
         self.preview_note(
             self.selected_ch,
             self.proj.tracks[track_idx].patch,
@@ -3032,7 +3034,7 @@ impl eframe::App for JpoApp {
         ctx.input_mut(|i| {
             if i.key_pressed(egui::Key::Delete) {
                 if self.ui_mode == UiMode::Sketch
-                    && !self.piano_roll_focused
+                    && self.selected_ch == 1
                     && !self.selected_chord_indices().is_empty()
                 {
                     self.delete_selected_chords();
@@ -3431,7 +3433,7 @@ impl eframe::App for JpoApp {
                 let roll_label = if self.selected_ch == 1 {
                     "PIANO ROLL (Ch1 preview — actual input is in the Chord Timeline above)"
                 } else {
-                    "PIANO ROLL — pink = key scale, blue = chord tones in block range"
+                    "PIANO ROLL — click empty = place note (Len) • drag note = move • right = resize • Shift+click multi • Ctrl+C/V"
                 };
                 ui.label(roll_label);
                 let roll_h = ui.available_height().clamp(180.0, 450.0);
@@ -3665,7 +3667,8 @@ impl JpoApp {
                             let db = beat - self.drag_start_beat;
                             match self.chord_drag_kind {
                                 ChordDragKind::Resize => {
-                                    let new_end = beat.max(orig_start + self.note_len * 0.5);
+                                    let snapped = self.snap_beat(beat);
+                                    let new_end = snapped.max(orig_start + self.note_len * 0.5);
                                     let new_dur = self.snap_dur(new_end - orig_start);
                                     self.proj.chord_blocks[i].dur = new_dur;
                                 }
@@ -4093,9 +4096,8 @@ impl JpoApp {
                         if resp.drag_started() && shift {
                             self.box_select_start_beat = Some(beat);
                             self.box_select_start_pitch = Some(pitch);
-                        } else if resp.drag_started() && self.note_drag_kind == NoteDragKind::None {
-                            self.place_piano_note(track_idx, beat, pitch, NoteDragKind::Create);
                         } else if resp.clicked() && !resp.dragged() && self.note_drag_kind == NoteDragKind::None {
+                            self.place_piano_note_at(track_idx, beat, pitch);
                             self.set_playhead(beat);
                         }
                     }
