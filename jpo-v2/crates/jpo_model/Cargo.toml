@@ -1,0 +1,8 @@
+[package]
+name = "jpo_model"
+version = "0.1.0"
+edition = "2021"
+description = "JpoProducer v2 core data model"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

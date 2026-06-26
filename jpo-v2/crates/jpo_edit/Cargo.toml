@@ -1,0 +1,8 @@
+[package]
+name = "jpo_edit"
+version = "0.1.0"
+edition = "2021"
+description = "JpoProducer v2 edit engine (commands, selection, clipboard)"
+
+[dependencies]
+jpo_model = { path = "../jpo_model" }
