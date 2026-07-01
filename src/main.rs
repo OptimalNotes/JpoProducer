@@ -1343,7 +1343,10 @@ fn default_arrange_repeats() -> u8 {
 enum NoteDragKind { None, Create, Move, Resize }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ChordDragKind { None, Move, Resize }
+enum ChordDragKind { None, Create, Move, Resize }
+
+/// Trackpad taps often register as micro-drags; slop in pixels for tap-vs-drag.
+const POINTER_SLOP_PX: f32 = 8.0;
 
 #[derive(Clone, Debug)]
 struct ClipboardNotes {
@@ -2009,6 +2012,13 @@ impl JpoApp {
         }
     }
 
+    fn note_resize_at_ptr(ptr_x: f32, note_x0: f32, note_x1: f32) -> bool {
+        let width = (note_x1 - note_x0).max(1.0);
+        let resize_px = 20.0f32.min(width * 0.45).max(12.0);
+        let dist_right = note_x1 - ptr_x;
+        dist_right >= -POINTER_SLOP_PX && dist_right <= resize_px
+    }
+
     /// Right-edge pixel zone = stretch; everything else on the block = move. No modifier key.
     /// resize_px: min(32, width*0.4), floor 16px. Slop: 12px outside right edge still counts as resize.
     fn chord_hit_at(ptr_x: f32, block_x0: f32, block_x1: f32, beat: f64, blk: &ChordBlock) -> ChordDragKind {
@@ -2016,9 +2026,9 @@ impl JpoApp {
             return ChordDragKind::None;
         }
         let width = (block_x1 - block_x0).max(1.0);
-        let resize_px = 32.0f32.min(width * 0.4).max(16.0);
+        let resize_px = 32.0f32.min(width * 0.4).max(20.0);
         let dist_right = block_x1 - ptr_x;
-        if dist_right >= -12.0 && dist_right <= resize_px {
+        if dist_right >= -POINTER_SLOP_PX && dist_right <= resize_px {
             ChordDragKind::Resize
         } else {
             ChordDragKind::Move
@@ -3673,10 +3683,10 @@ impl eframe::App for JpoApp {
                 AppTab::Edit => {
                     egui::SidePanel::left("tracks")
                         .resizable(false)
-                        .default_width(168.0)
-                        .max_width(180.0)
+                        .default_width(196.0)
+                        .max_width(220.0)
                         .show_inside(ui, |ui| {
-                            ui.label("TRACKS  (M=mute S=solo Vol%)");
+                            ui.label("TRACKS  (M=mute S=solo Vol% • P=patch)");
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -3736,6 +3746,31 @@ impl eframe::App for JpoApp {
                                                 mix_changed = true;
                                             }
                                         });
+                                        if ch != 1 {
+                                            let t = &mut self.proj.tracks[t_idx];
+                                            let patch_name =
+                                                truncate_ascii(gm_instrument_name(t.patch), 14);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(4.0);
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(&mut t.patch)
+                                                            .speed(1.0)
+                                                            .range(0..=127)
+                                                            .prefix("P"),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    mix_changed = true;
+                                                }
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(patch_name).size(10.0),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            });
+                                        }
                                         if mix_changed {
                                             self.on_track_mix_changed();
                                         }
@@ -3967,19 +4002,44 @@ impl JpoApp {
                                 self.chord_drag_block_idx = Some(i);
                             }
                         }
-                    } else if self.edit_mode == EditMode::Pencil
-                        && resp.clicked()
-                        && !resp.dragged()
-                        && !shift
-                    {
-                        self.set_playhead(snapped);
-                        self.clear_chord_selection();
-                        self.place_chord_block_at(snapped);
-                    } else if self.edit_mode == EditMode::Pencil
-                        && resp.clicked()
-                        && !resp.dragged()
-                        && shift
-                    {
+                    } else if self.edit_mode == EditMode::Pencil && !shift && hit.is_none() {
+                        if resp.drag_started() {
+                            self.begin_gesture_undo();
+                            let q = self.proj.default_quality(1).to_string();
+                            let dur = self.snap_dur(self.note_len.max(0.0625));
+                            self.proj.chord_blocks.push(ChordBlock {
+                                start: snapped,
+                                dur,
+                                degree: 1,
+                                quality: q,
+                                octave: 4,
+                                syncopation_fill: false,
+                            });
+                            self.proj.chord_blocks.sort_by(|a, b| {
+                                a.start.partial_cmp(&b.start).unwrap()
+                            });
+                            self.resolve_chord_overlaps();
+                            if let Some(idx) = self
+                                .proj
+                                .chord_blocks
+                                .iter()
+                                .position(|b| (b.start - snapped).abs() < 0.001)
+                            {
+                                self.selection.blocks.clear();
+                                self.selection.blocks.insert(idx);
+                                self.set_active_chord_idx(idx);
+                                self.block_drag_orig = (snapped, dur);
+                                self.drag_start_beat = beat;
+                                self.chord_drag_kind = ChordDragKind::Create;
+                                self.chord_drag_block_idx = Some(idx);
+                                self.preview_chord_block(&self.proj.chord_blocks[idx].clone());
+                            }
+                        } else if resp.clicked() {
+                            self.set_playhead(snapped);
+                            self.clear_chord_selection();
+                            self.place_chord_block_at(snapped);
+                        }
+                    } else if self.edit_mode == EditMode::Pencil && resp.clicked() && shift {
                         self.set_playhead(snapped);
                     }
                 }
@@ -3990,9 +4050,9 @@ impl JpoApp {
                             let (orig_start, _orig_dur) = self.block_drag_orig;
                             let db = beat - self.drag_start_beat;
                             match self.chord_drag_kind {
-                                ChordDragKind::Resize => {
+                                ChordDragKind::Create | ChordDragKind::Resize => {
                                     let snapped = self.snap_beat(beat);
-                                    let new_end = snapped.max(orig_start + self.note_len * 0.5);
+                                    let new_end = snapped.max(orig_start + 0.0625);
                                     let new_dur = self.snap_dur(new_end - orig_start);
                                     self.proj.chord_blocks[i].dur = new_dur;
                                 }
@@ -4358,9 +4418,13 @@ impl JpoApp {
                 }
 
                 if resp.drag_started() || resp.clicked() || resp.double_clicked() {
+                    let beat_slop = (POINTER_SLOP_PX as f64 / px_per_beat).max(0.05);
                     let mut hit = None;
                     for (i, n) in notes.iter().enumerate() {
-                        if n.start - 0.06 <= beat && beat <= n.end() + 0.06 && (n.pitch as i32 - pitch as i32).abs() <= 1 {
+                        if n.start - beat_slop <= beat
+                            && beat <= n.end() + beat_slop
+                            && (n.pitch as i32 - pitch as i32).abs() <= 1
+                        {
                             hit = Some(i);
                             break;
                         }
@@ -4389,7 +4453,9 @@ impl JpoApp {
                                 self.drag_start_beat = beat;
                                 self.drag_start_pitch = pitch;
                                 self.is_creating = false;
-                                let grab_resize = beat >= n.end() - 0.18;
+                                let nx0 = rect.min.x + ((n.start - start_b) * px_per_beat) as f32;
+                                let nx1 = rect.min.x + ((n.end() - start_b) * px_per_beat) as f32;
+                                let grab_resize = Self::note_resize_at_ptr(ptr.x, nx0, nx1);
                                 self.note_drag_kind = if grab_resize {
                                     NoteDragKind::Resize
                                 } else {
@@ -4420,7 +4486,40 @@ impl JpoApp {
                         if resp.drag_started() && shift {
                             self.box_select_start_beat = Some(beat);
                             self.box_select_start_pitch = Some(pitch);
-                        } else if resp.clicked() && !resp.dragged() && self.note_drag_kind == NoteDragKind::None {
+                        } else if resp.drag_started() && self.note_drag_kind == NoteDragKind::None {
+                            self.begin_gesture_undo();
+                            let snapped = self.snap_beat(beat);
+                            let dur = self.snap_dur(self.note_len.max(0.0625));
+                            let new_n = Note {
+                                start: snapped,
+                                pitch: pitch.clamp(0, 127),
+                                dur,
+                                vel: self.default_velocity,
+                            };
+                            self.proj.tracks[track_idx].notes.push(new_n);
+                            self.proj.tracks[track_idx].notes.sort_by(|a, b| {
+                                a.start
+                                    .partial_cmp(&b.start)
+                                    .unwrap()
+                                    .then(a.pitch.cmp(&b.pitch))
+                            });
+                            let new_idx = self.proj.tracks[track_idx].notes.len() - 1;
+                            self.selection.notes.clear();
+                            self.selection.notes.insert((track_idx, new_idx));
+                            self.selected_note = Some((track_idx, new_idx));
+                            self.drag_orig = (snapped, pitch, dur);
+                            self.drag_start_beat = beat;
+                            self.drag_start_pitch = pitch;
+                            self.note_drag_kind = NoteDragKind::Create;
+                            self.drag_sel_offsets = vec![(new_idx, 0.0, 0)];
+                            self.is_creating = true;
+                            self.preview_note(
+                                self.selected_ch,
+                                self.proj.tracks[track_idx].patch,
+                                pitch,
+                                self.default_velocity,
+                            );
+                        } else if resp.clicked() && self.note_drag_kind == NoteDragKind::None {
                             self.place_piano_note_at(track_idx, beat, pitch);
                             self.set_playhead(beat);
                         }
