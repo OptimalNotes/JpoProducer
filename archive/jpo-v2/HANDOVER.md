@@ -9,8 +9,8 @@
 
 | 項目 | 内容 |
 |------|------|
-| パス | `C:\Users\user\JpoProducer\jpo\jpo-v2\` |
-| v1（凍結） | `C:\Users\user\JpoProducer\jpo\`（`src/main.rs` 単体） |
+| パス | `C:\Users\user\JpoProducer\archive\jpo-v2\` |
+| 現行アプリ | `C:\Users\user\JpoProducer\`（`src/main.rs` 単体） |
 | GitHub | https://github.com/OptimalNotes/JpoProducer |
 | スタック | Rust + egui 0.30 + eframe |
 
@@ -46,7 +46,7 @@ jpo-v2/
 ## 4. ビルド・実行
 
 ```powershell
-cd "C:\Users\user\JpoProducer\jpo\jpo-v2"
+cd "C:\Users\user\JpoProducer\archive\jpo-v2"
 cargo test          # AI が実行
 cargo run           # 人間が GUI 確認
 ```

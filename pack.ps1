@@ -24,13 +24,9 @@ try {
 $ExeSrc = Join-Path $Root "target\release\jpo.exe"
 if (-not (Test-Path $ExeSrc)) { throw "Missing $ExeSrc" }
 
-# SF2: prefer jpo/ copy, then project root
-$Sf2Candidates = @(
-    (Join-Path $Root "FluidR3 GM.SF2"),
-    (Join-Path $Root "..\FluidR3 GM.SF2")
-)
-$Sf2Src = $Sf2Candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $Sf2Src) { throw "FluidR3 GM.SF2 not found (place it in jpo/ or JpoProducer/)" }
+# SF2: project root (same folder as Cargo.toml)
+$Sf2Src = Join-Path $Root "FluidR3 GM.SF2"
+if (-not (Test-Path $Sf2Src)) { throw "FluidR3 GM.SF2 not found (place it in JpoProducer/)" }
 
 if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
 New-Item -ItemType Directory -Path $OutDir | Out-Null

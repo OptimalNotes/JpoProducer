@@ -1,7 +1,8 @@
 # JpoProducer 引継ぎ書
 
-**最終更新:** 2026-06-26  
-**方針:** v2 凍結 → **v1 を 4タブ方式に再設計（v0.3.0）**
+**最終更新:** 2026-07-02  
+**方針:** v2 凍結 → **v1 を 4タブ方式に再設計（v0.3.0）**  
+**リポジトリルート:** `C:\Users\user\JpoProducer\`（旧 `jpo/` サブフォルダは廃止）
 
 ---
 
@@ -29,16 +30,29 @@
 ## ビルド
 
 ```powershell
-cd "C:\Users\user\JpoProducer\jpo"
+cd "C:\Users\user\JpoProducer"
 cargo run    # 人間が GUI 確認
 cargo build
 ```
 
 ---
 
+## フォルダ
+
+| パス | 内容 |
+|------|------|
+| `src/main.rs` | **現行アプリ**（編集はここだけ） |
+| `assets/patterns/` | ジェネレータ用パターン MIDI |
+| `archive/python/` | 旧 Python 版（メンテなし） |
+| `archive/jpo-v2/` | 凍結 v2（EditEngine 参考。Tab3 取り込みは F3） |
+| `dist/` | `pack.ps1` の出力（git 管理外） |
+| `FluidR3 GM.SF2` | ローカル配置のみ（git 管理外） |
+
+---
+
 ## 凍結
 
-- [`jpo-v2/`](jpo-v2/) — M1 のみ。Tab3 で EditEngine 再利用は将来検討
+- [`archive/jpo-v2/`](archive/jpo-v2/) — M1 のみ。Tab3 で EditEngine 再利用は将来検討（F3）
 
 ---
 

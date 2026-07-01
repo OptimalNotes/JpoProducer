@@ -1,0 +1,11 @@
+dearpygui>=1.11.1
+mido>=1.3.2
+pyperclip>=1.8.2
+# For high-quality GM playback with the bundled soundfont (recommended)
+pyfluidsynth>=1.3.0
+# Note: On Windows you may also need the FluidSynth runtime DLLs (libfluidsynth-*.dll) in PATH
+# or next to python.exe. The soundfont "FluidR3 GM.SF2" is now used by default.
+
+# Fallback / alternative MIDI output (optional)
+# python-rtmidi>=1.5.8
+#   To enable: install Visual C++ Build Tools then `pip install python-rtmidi`

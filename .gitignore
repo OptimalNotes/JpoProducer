@@ -1,5 +1,7 @@
 /target/
 /dist/
+archive/jpo-v2/target/
+archive/**/target/
 **/*.exe
 **/*.pdb
 
