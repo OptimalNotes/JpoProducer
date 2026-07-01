@@ -612,6 +612,198 @@ fn expand_chords(proj: &Project) -> Vec<Note> {
     out
 }
 
+// === GROK / PROGRESSION PARSING ===
+
+fn normalize_roman_token(token: &str) -> String {
+    token
+        .replace('Ⅰ', "I")
+        .replace('ⅰ', "i")
+        .replace('Ⅱ', "II")
+        .replace('ⅱ', "ii")
+        .replace('Ⅲ', "III")
+        .replace('ⅲ', "iii")
+        .replace('Ⅳ', "IV")
+        .replace('ⅳ', "iv")
+        .replace('Ⅴ', "V")
+        .replace('ⅴ', "v")
+        .replace('Ⅵ', "VI")
+        .replace('ⅵ', "vi")
+        .replace('Ⅶ', "VII")
+        .replace('ⅶ', "vii")
+}
+
+fn split_progression_tokens(s: &str) -> Vec<String> {
+    let mut buf = String::new();
+    for c in s.chars() {
+        match c {
+            '|' | ',' | '/' | '\n' | '\t' | '–' | '—' | '-' => buf.push(' '),
+            _ => buf.push(c),
+        }
+    }
+    buf.split_whitespace()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+fn parse_literal_chord(proj: &Project, token: &str) -> Option<(u8, String)> {
+    let t = token.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let roots = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    let (root_str, quality): (&str, &str) = if let Some(rest) = t.strip_prefix("Bb") {
+        ("A#", rest)
+    } else if let Some(rest) = t.strip_prefix("Db") {
+        ("C#", rest)
+    } else if let Some(rest) = t.strip_prefix("Eb") {
+        ("D#", rest)
+    } else if let Some(rest) = t.strip_prefix("Gb") {
+        ("F#", rest)
+    } else if let Some(rest) = t.strip_prefix("Ab") {
+        ("G#", rest)
+    } else {
+        let mut matched: Option<(&str, &str)> = None;
+        for r in roots {
+            if t.starts_with(r) {
+                matched = Some((r, &t[r.len()..]));
+                break;
+            }
+        }
+        matched?
+    };
+    let root_pc = roots.iter().position(|&r| r == root_str)? as u8;
+    let semis = proj.scale_semitones();
+    let mut degree = None;
+    for (i, &s) in semis.iter().enumerate() {
+        let pc = ((proj.key_root as i32 + s).rem_euclid(12)) as u8;
+        if pc == root_pc {
+            degree = Some((i as u8) + 1);
+            break;
+        }
+    }
+    let degree = degree?;
+    let quality = match quality.to_lowercase().as_str() {
+        "" | "maj" | "major" => proj.default_quality(degree).to_string(),
+        "m" | "min" | "minor" => "m".to_string(),
+        "7" => "7".to_string(),
+        "maj7" | "m7" | "dim" | "aug" | "sus4" => quality.to_lowercase(),
+        _ => proj.default_quality(degree).to_string(),
+    };
+    Some((degree, quality))
+}
+
+fn parse_roman_chord(proj: &Project, token: &str) -> Option<(u8, String)> {
+    let t = token.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.starts_with('b') || t.starts_with('B') {
+        return parse_literal_chord(proj, t);
+    }
+    let t = normalize_roman_token(t);
+    let roman_part: String = t
+        .chars()
+        .take_while(|c| *c == 'I' || *c == 'V' || *c == 'i' || *c == 'v')
+        .collect();
+    if roman_part.is_empty() {
+        return None;
+    }
+    let qual_tail = &t[roman_part.len()..];
+    let roman = roman_part;
+    let degree = match roman.to_uppercase().as_str() {
+        "I" => 1,
+        "II" => 2,
+        "III" => 3,
+        "IV" => 4,
+        "V" => 5,
+        "VI" => 6,
+        "VII" => 7,
+        _ => return None,
+    };
+    let lower = roman.chars().any(|c| c.is_ascii_lowercase());
+    let mut quality = if lower { "m".to_string() } else { proj.default_quality(degree).to_string() };
+    let tail = qual_tail.to_lowercase();
+    if tail.contains("maj7") {
+        quality = "maj7".to_string();
+    } else if tail.contains("m7") {
+        quality = "m7".to_string();
+    } else if tail.contains('7') {
+        quality = "7".to_string();
+    } else if tail.contains("dim") {
+        quality = "dim".to_string();
+    } else if tail.contains("aug") || tail.contains('+') {
+        quality = "aug".to_string();
+    } else if tail.contains("sus4") {
+        quality = "sus4".to_string();
+    }
+    Some((degree, quality))
+}
+
+fn parse_chord_token(proj: &Project, token: &str) -> Option<(u8, String)> {
+    parse_roman_chord(proj, token).or_else(|| parse_literal_chord(proj, token))
+}
+
+fn parse_progression_text(proj: &Project, text: &str) -> Vec<(u8, String)> {
+    split_progression_tokens(text)
+        .iter()
+        .filter_map(|tok| parse_chord_token(proj, tok))
+        .collect()
+}
+
+fn parse_midi_track_notes(data: &[u8], paste_at: f64) -> Result<Vec<Note>, String> {
+    let smf = Smf::parse(data).map_err(|e| format!("MIDI parse: {e}"))?;
+    let ppq = match smf.header.timing {
+        midly::Timing::Metrical(t) => t.as_int() as f64,
+        _ => PPQ as f64,
+    };
+    let track = smf
+        .tracks
+        .iter()
+        .max_by_key(|t| t.len())
+        .ok_or_else(|| "MIDI: no tracks".to_string())?;
+
+    let mut abs_tick = 0u32;
+    let mut active: std::collections::HashMap<u8, (u32, u8)> = std::collections::HashMap::new();
+    let mut pairs: Vec<(u32, u32, u8, u8)> = Vec::new();
+
+    for ev in track {
+        abs_tick = abs_tick.saturating_add(ev.delta.as_int());
+        if let TrackEventKind::Midi { message, .. } = &ev.kind {
+            match message {
+                MidiMessage::NoteOn { key, vel } if vel.as_int() > 0 => {
+                    active.insert(key.as_int(), (abs_tick, vel.as_int()));
+                }
+                MidiMessage::NoteOn { key, .. } | MidiMessage::NoteOff { key, .. } => {
+                    if let Some((on_tick, vel)) = active.remove(&key.as_int()) {
+                        pairs.push((on_tick, abs_tick, key.as_int(), vel));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if pairs.is_empty() {
+        return Err("MIDI: no notes found".to_string());
+    }
+
+    let min_tick = pairs.iter().map(|p| p.0).min().unwrap_or(0);
+    let mut notes = Vec::new();
+    for (on, off, pitch, vel) in pairs {
+        let rel_start = (on.saturating_sub(min_tick)) as f64 / ppq;
+        let dur = ((off.saturating_sub(on)) as f64 / ppq).max(0.0625);
+        notes.push(Note {
+            start: paste_at + rel_start,
+            pitch,
+            dur,
+            vel,
+        });
+    }
+    notes.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap().then(a.pitch.cmp(&b.pitch)));
+    Ok(notes)
+}
+
 // === PATTERN ENGINE ===
 // Key-C MIDI templates from assets/patterns — tiled per chord block (melodic) or range (drums).
 
@@ -1123,7 +1315,18 @@ fn find_soundfont() -> Option<std::path::PathBuf> {
 enum EditMode { Pencil, Eraser }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum UiMode { Sketch, Arrange }
+enum AppTab {
+    Chord,
+    Generate,
+    Edit,
+    Arrange,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrokImportMode {
+    NaturalLanguage,
+    MidiFile,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ArrangeSlot {
@@ -1294,15 +1497,19 @@ struct JpoApp {
     syncopation_fill: bool,
 
     // Phase C — arrange
-    ui_mode: UiMode,
+    active_tab: AppTab,
     arrange_sequence: Vec<ArrangeSlot>,
 
     /// Short UI feedback (copy/paste etc.)
     status_toast: Option<String>,
     status_toast_until: f64,
 
-    /// True after interacting with the piano roll (Ch2–16); drives edit shortcuts.
+    /// True after interacting with the piano roll (Edit tab only).
     piano_roll_focused: bool,
+
+    /// Grok: natural-language progression paste, or MIDI file import.
+    grok_import_mode: GrokImportMode,
+    grok_paste_text: String,
 }
 
 impl Default for JpoApp {
@@ -1314,7 +1521,7 @@ impl Default for JpoApp {
             visible_beats: 16.0,
             current_beat: 0.0,
             edit_mode: EditMode::Pencil,
-            note_len: 0.5,
+            note_len: 0.5, // 1/8 note default (beat units)
             snap_enabled: true,
             active_chord_beat: None,
             selected_note: None,
@@ -1366,17 +1573,147 @@ impl Default for JpoApp {
             bass_pattern_id: "Bass8beat01".to_string(),
             drum_pattern_id: "Drum8beat_01".to_string(),
             syncopation_fill: true,
-            ui_mode: UiMode::Sketch,
+            active_tab: AppTab::Chord,
             arrange_sequence: vec![ArrangeSlot { bank_idx: 0, repeats: 1 }],
             status_toast: None,
             status_toast_until: 0.0,
             piano_roll_focused: false,
+            grok_import_mode: GrokImportMode::NaturalLanguage,
+            grok_paste_text: String::new(),
         }
     }
 }
 
 impl JpoApp {
     fn track_idx(&self) -> usize { (self.selected_ch - 1) as usize }
+
+    fn switch_tab(&mut self, tab: AppTab) {
+        self.active_tab = tab;
+        self.piano_roll_focused = false;
+        if tab != AppTab::Edit {
+            self.selected_note = None;
+            self.selection.notes.clear();
+        }
+        if tab != AppTab::Chord {
+            self.clear_chord_selection();
+        }
+    }
+
+    fn apply_grok_natural_language(&mut self, ctx: &egui::Context) {
+        let chords = parse_progression_text(&self.proj, &self.grok_paste_text);
+        if chords.is_empty() {
+            self.show_toast(ctx, "Could not parse progression — try C | Am | F | G or I-vi-IV-V");
+            return;
+        }
+        let count = chords.len();
+        self.begin_gesture_undo();
+        let mut beat = self.snap_beat(self.current_beat.max(0.0));
+        let dur = self.snap_dur(self.note_len);
+        for (degree, quality) in chords {
+            self.proj.chord_blocks.push(ChordBlock {
+                start: beat,
+                dur,
+                degree,
+                quality,
+                octave: 4,
+                syncopation_fill: false,
+            });
+            beat += dur;
+        }
+        self.proj.chord_blocks.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+        self.resolve_chord_overlaps();
+        self.end_gesture_undo();
+        self.show_toast(ctx, &format!("Placed {count} chord block(s) at playhead"));
+    }
+
+    fn import_midi_to_selected_track(&mut self, path: &std::path::Path, ctx: &egui::Context) {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.show_toast(ctx, &format!("Read failed: {e}"));
+                return;
+            }
+        };
+        let paste_at = self.snap_beat(self.current_beat.max(0.0));
+        match parse_midi_track_notes(&data, paste_at) {
+            Ok(notes) => {
+                let count = notes.len();
+                self.begin_gesture_undo();
+                let t_idx = self.track_idx();
+                if self.active_tab == AppTab::Chord {
+                    // Grok chord MIDI: replace blocks in loop range with best-effort single blocks
+                    self.show_toast(ctx, "Chord tab: use Natural Language for progressions; switch to Edit for MIDI parts");
+                    self.end_gesture_undo();
+                    return;
+                }
+                self.proj.tracks[t_idx].notes.extend(notes);
+                self.proj.tracks[t_idx]
+                    .notes
+                    .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap().then(a.pitch.cmp(&b.pitch)));
+                self.end_gesture_undo();
+                self.show_toast(ctx, &format!("Imported {count} notes to Ch{}", self.selected_ch));
+            }
+            Err(e) => self.show_toast(ctx, &e),
+        }
+    }
+
+    fn show_grok_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(egui::RichText::new("Grok import").strong());
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.grok_import_mode,
+                GrokImportMode::NaturalLanguage,
+                "Natural language",
+            );
+            ui.selectable_value(&mut self.grok_import_mode, GrokImportMode::MidiFile, "MIDI file");
+        });
+        match self.grok_import_mode {
+            GrokImportMode::NaturalLanguage => {
+                ui.label(
+                    egui::RichText::new("Paste Grok response (C | Am | F | G or I-vi-IV-V)")
+                        .small()
+                        .weak(),
+                );
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.grok_paste_text)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Apply at playhead").clicked() {
+                        self.apply_grok_natural_language(ctx);
+                    }
+                    if ui.button("Copy Grok prompt").clicked() {
+                        let roots = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+                        let prompt = format!(
+                            "J-Popコード進行提案\nKey: {} {}\nBPM: {}\nLoop: {} bars\n細かいコード割り（1/8拍単位可）で4-8小節の進行を、ローマ数字と実コード名で提案して。例: C | Am | F | G",
+                            roots[self.proj.key_root as usize],
+                            if self.proj.is_minor { "minor" } else { "major" },
+                            self.proj.bpm as i32,
+                            self.loop_bars,
+                        );
+                        ui.ctx().output_mut(|o| o.copied_text = prompt);
+                        self.show_toast(ctx, "Prompt copied");
+                    }
+                });
+            }
+            GrokImportMode::MidiFile => {
+                ui.label(
+                    egui::RichText::new("Import Grok-exported .mid to selected track at playhead (Edit tab)")
+                        .small()
+                        .weak(),
+                );
+                if ui.button("Import MIDI file…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("MIDI", &["mid", "midi"])
+                        .pick_file()
+                    {
+                        self.import_midi_to_selected_track(&path, ctx);
+                    }
+                }
+            }
+        }
+    }
 
     fn visible_pitch_min(&self) -> u8 {
         (self.visible_pitch_center - self.visible_pitch_span / 2.0)
@@ -1528,7 +1865,7 @@ impl JpoApp {
 
     fn handle_edit_shortcuts(&mut self, ctx: &egui::Context, i: &mut egui::InputState) {
         let ctrl = i.modifiers.ctrl;
-        let on_piano_track = self.ui_mode == UiMode::Sketch && self.selected_ch != 1;
+        let on_piano_track = self.active_tab == AppTab::Edit && self.selected_ch != 1;
 
         if ctrl && i.key_pressed(egui::Key::A) && on_piano_track {
             self.select_all_notes_in_track(self.track_idx());
@@ -1537,18 +1874,20 @@ impl JpoApp {
         }
 
         if ctrl && i.key_pressed(egui::Key::C) {
-            if on_piano_track && self.has_note_selection() {
+            if self.active_tab == AppTab::Chord && self.has_chord_selection() {
+                if self.copy_chord_blocks() {
+                    self.show_toast(ctx, "Copied chords");
+                }
+            } else if on_piano_track && self.has_note_selection() {
                 if self.copy_selection() {
                     self.show_toast(ctx, "Copied notes");
                 } else {
                     self.show_toast(ctx, "Nothing to copy");
                 }
-            } else if self.has_chord_selection() {
-                if self.copy_chord_blocks() {
-                    self.show_toast(ctx, "Copied chords");
-                }
             } else if on_piano_track {
                 self.show_toast(ctx, "Select notes first (Shift+click)");
+            } else if self.active_tab == AppTab::Chord {
+                self.show_toast(ctx, "Select chord blocks first");
             }
             i.consume_key(egui::Modifiers::CTRL, egui::Key::C);
             return;
@@ -1565,17 +1904,17 @@ impl JpoApp {
         }
 
         if ctrl && i.key_pressed(egui::Key::V) {
-            if on_piano_track && self.clipboard.is_some() {
+            if self.active_tab == AppTab::Chord && self.chord_clipboard.is_some() {
+                self.paste_chord_blocks();
+                self.show_toast(ctx, "Pasted chords at playhead");
+            } else if on_piano_track && self.clipboard.is_some() {
                 if self.paste_clipboard() {
                     self.show_toast(ctx, "Pasted notes at playhead");
                 }
-            } else if self.chord_clipboard.is_some() {
-                self.paste_chord_blocks();
-                self.show_toast(ctx, "Pasted chords at playhead");
+            } else if self.active_tab == AppTab::Chord {
+                self.show_toast(ctx, "Chord clipboard empty — Ctrl+C first");
             } else if on_piano_track {
                 self.show_toast(ctx, "Note clipboard empty — Ctrl+C first");
-            } else {
-                self.show_toast(ctx, "Chord clipboard empty");
             }
             i.consume_key(egui::Modifiers::CTRL, egui::Key::V);
             return;
@@ -3033,12 +3372,9 @@ impl eframe::App for JpoApp {
         }
         ctx.input_mut(|i| {
             if i.key_pressed(egui::Key::Delete) {
-                if self.ui_mode == UiMode::Sketch
-                    && self.selected_ch == 1
-                    && !self.selected_chord_indices().is_empty()
-                {
+                if self.active_tab == AppTab::Chord && !self.selected_chord_indices().is_empty() {
                     self.delete_selected_chords();
-                } else {
+                } else if self.active_tab == AppTab::Edit {
                     self.delete_selected_notes();
                 }
             }
@@ -3077,17 +3413,18 @@ impl eframe::App for JpoApp {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             let roots = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
             ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(self.ui_mode == UiMode::Sketch, "Sketch")
-                    .clicked()
-                {
-                    self.ui_mode = UiMode::Sketch;
-                }
-                if ui
-                    .selectable_label(self.ui_mode == UiMode::Arrange, "Arrange")
-                    .clicked()
-                {
-                    self.ui_mode = UiMode::Arrange;
+                for (tab, label) in [
+                    (AppTab::Chord, "1 Chord"),
+                    (AppTab::Generate, "2 Generate"),
+                    (AppTab::Edit, "3 Edit"),
+                    (AppTab::Arrange, "4 Arrange"),
+                ] {
+                    if ui
+                        .selectable_label(self.active_tab == tab, label)
+                        .clicked()
+                    {
+                        self.switch_tab(tab);
+                    }
                 }
 
                 ui.separator();
@@ -3160,7 +3497,7 @@ impl eframe::App for JpoApp {
             });
         });
 
-        // Bottom controls — always pinned so Zoom/Generate never clip off-screen
+        // Bottom controls — tab-specific (reduces input overlap)
         egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Loop").strong());
@@ -3192,225 +3529,112 @@ impl eframe::App for JpoApp {
                 ui.add(egui::Slider::new(&mut self.visible_start, 0.0..=max_scroll));
             });
 
-            ui.horizontal(|ui| {
-                ui.label("Pitch Zoom");
-                if ui.add(egui::Slider::new(&mut self.visible_pitch_span, 12.0..=72.0)).changed() {
-                    self.clamp_pitch_center();
+            match self.active_tab {
+                AppTab::Chord => {
+                    self.show_grok_panel(ui, ctx);
+                    ui.label("Tip: Tab1 — place chords (Len 1/8 default) • Shift+multi • Ctrl+C/V • Space=play");
                 }
-                ui.label("Pitch Scroll");
-                let (p_lo, p_hi) = self.pitch_scroll_range();
-                if ui
-                    .add(egui::Slider::new(&mut self.visible_pitch_center, p_lo..=p_hi))
-                    .changed()
-                {
-                    self.clamp_pitch_center();
-                }
-                if ui.button("Fit C2-C6").clicked() {
-                    self.visible_pitch_center = 60.0;
-                    self.visible_pitch_span = 48.0;
-                }
-                if ui.button("Fit C3-C5").clicked() {
-                    self.visible_pitch_center = 60.0;
-                    self.visible_pitch_span = 24.0;
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Onion");
-                ui.label("Scale");
-                ui.add(egui::Slider::new(&mut self.scale_opacity, 0.0..=1.0).step_by(0.02));
-                ui.label("Chord");
-                ui.add(egui::Slider::new(&mut self.chord_opacity, 0.0..=1.0).step_by(0.02));
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Generate range (beats)");
-                ui.add(egui::DragValue::new(&mut self.gen_start).speed(0.5).range(0.0..=128.0));
-                ui.label("→");
-                ui.add(egui::DragValue::new(&mut self.gen_end).speed(0.5).range(0.0..=128.0));
-                if ui.button("Gen=Visible").clicked() {
-                    self.gen_start = self.visible_start;
-                    self.gen_end = self.visible_start + self.visible_beats;
-                }
-                if ui.button("Gen=Loop").clicked() {
-                    self.gen_start = 0.0;
-                    self.gen_end = self.loop_beats();
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Piano");
-                egui::ComboBox::from_id_salt("gen_piano_pat")
-                    .selected_text(&self.piano_pattern_id)
-                    .width(88.0)
-                    .show_ui(ui, |ui| {
-                        for id in self.pattern_lib.ids_for(PatternCategory::Piano, false) {
-                            if ui.selectable_label(self.piano_pattern_id == id, id).clicked() {
-                                self.piano_pattern_id = id.to_string();
-                            }
-                        }
-                    });
-                ui.label("Bass");
-                egui::ComboBox::from_id_salt("gen_bass_pat")
-                    .selected_text(&self.bass_pattern_id)
-                    .width(96.0)
-                    .show_ui(ui, |ui| {
-                        for id in self.pattern_lib.ids_for(PatternCategory::Bass, false) {
-                            if ui.selectable_label(self.bass_pattern_id == id, id).clicked() {
-                                self.bass_pattern_id = id.to_string();
-                            }
-                        }
-                    });
-                ui.label("Drum");
-                egui::ComboBox::from_id_salt("gen_drum_pat")
-                    .selected_text(&self.drum_pattern_id)
-                    .width(108.0)
-                    .show_ui(ui, |ui| {
-                        for id in self.pattern_lib.ids_for(PatternCategory::Drum, false) {
-                            if ui.selectable_label(self.drum_pattern_id == id, id).clicked() {
-                                self.drum_pattern_id = id.to_string();
-                            }
-                        }
-                    });
-                ui.checkbox(&mut self.syncopation_fill, "Syncopation fill");
-                if ui.button("Generate All").on_hover_text("Piano Ch2 + Bass Ch3 + Drum Ch10").clicked() {
-                    self.begin_gesture_undo();
-                    let s = self.gen_start;
-                    let e = self.gen_end.max(s + 0.25);
-                    let (p, b, d) = generate_from_patterns(
-                        &self.pattern_lib,
-                        &self.proj,
-                        s,
-                        e,
-                        &self.piano_pattern_id,
-                        &self.bass_pattern_id,
-                        &self.drum_pattern_id,
-                        self.syncopation_fill,
-                    );
-                    replace_notes_in_range(&mut self.proj.tracks[1].notes, s, e, p);
-                    replace_notes_in_range(&mut self.proj.tracks[2].notes, s, e, b);
-                    replace_notes_in_range(&mut self.proj.tracks[9].notes, s, e, d);
-                    self.end_gesture_undo();
-                }
-                if ui.button("Clear Ch2,3,10").clicked() {
-                    self.proj.tracks[1].notes.clear();
-                    self.proj.tracks[2].notes.clear();
-                    self.proj.tracks[9].notes.clear();
-                }
-                ui.label(
-                    egui::RichText::new("→ output on Ch2/Ch3/Ch10 (not Ch1 preview)")
-                        .small()
-                        .weak(),
-                );
-            });
-
-            ui.label("Tip: click empty = chord block • right edge = stretch • Space = play • Shift+click multi • Ctrl+C/V");
-        });
-
-        // Main area
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Track list (left)
-            egui::SidePanel::left("tracks")
-                .resizable(false)
-                .default_width(168.0)
-                .max_width(180.0)
-                .show_inside(ui, |ui| {
-                ui.label("TRACKS  (M=mute S=solo Vol%)");
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                for ch in 1..=16 {
-                    let t_idx = (ch - 1) as usize;
-                    let mut mix_changed = false;
+                AppTab::Generate => {
                     ui.horizontal(|ui| {
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(40.0, 18.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                if ui
-                                    .selectable_label(self.selected_ch == ch, track_short_label(ch))
-                                    .clicked()
-                                {
-                                    self.selected_ch = ch;
-                                    self.selected_note = None;
-                                    self.piano_roll_focused = ch != 1;
-                                    if ch != 1 {
-                                        self.clear_chord_selection();
+                        ui.label("Generate range (beats)");
+                        ui.add(egui::DragValue::new(&mut self.gen_start).speed(0.5).range(0.0..=128.0));
+                        ui.label("→");
+                        ui.add(egui::DragValue::new(&mut self.gen_end).speed(0.5).range(0.0..=128.0));
+                        if ui.button("Gen=Loop").clicked() {
+                            self.gen_start = 0.0;
+                            self.gen_end = self.loop_beats();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Piano");
+                        egui::ComboBox::from_id_salt("gen_piano_pat")
+                            .selected_text(&self.piano_pattern_id)
+                            .width(88.0)
+                            .show_ui(ui, |ui| {
+                                for id in self.pattern_lib.ids_for(PatternCategory::Piano, false) {
+                                    if ui.selectable_label(self.piano_pattern_id == id, id).clicked() {
+                                        self.piano_pattern_id = id.to_string();
                                     }
                                 }
-                            },
-                        );
-                        let t = &mut self.proj.tracks[t_idx];
-                        let m_label = if t.muted { "M" } else { "m" };
-                        let s_label = if t.solo { "S" } else { "s" };
-                        if ui
-                            .add(egui::Button::new(m_label).min_size(Vec2::new(18.0, 16.0)))
-                            .on_hover_text("Mute")
-                            .clicked()
-                        {
-                            t.muted = !t.muted;
-                            mix_changed = true;
+                            });
+                        ui.label("Bass");
+                        egui::ComboBox::from_id_salt("gen_bass_pat")
+                            .selected_text(&self.bass_pattern_id)
+                            .width(96.0)
+                            .show_ui(ui, |ui| {
+                                for id in self.pattern_lib.ids_for(PatternCategory::Bass, false) {
+                                    if ui.selectable_label(self.bass_pattern_id == id, id).clicked() {
+                                        self.bass_pattern_id = id.to_string();
+                                    }
+                                }
+                            });
+                        ui.label("Drum");
+                        egui::ComboBox::from_id_salt("gen_drum_pat")
+                            .selected_text(&self.drum_pattern_id)
+                            .width(108.0)
+                            .show_ui(ui, |ui| {
+                                for id in self.pattern_lib.ids_for(PatternCategory::Drum, false) {
+                                    if ui.selectable_label(self.drum_pattern_id == id, id).clicked() {
+                                        self.drum_pattern_id = id.to_string();
+                                    }
+                                }
+                            });
+                        ui.checkbox(&mut self.syncopation_fill, "Syncopation fill");
+                        if ui.button("Generate All").clicked() {
+                            self.begin_gesture_undo();
+                            let s = self.gen_start;
+                            let e = self.gen_end.max(s + 0.25);
+                            let (p, b, d) = generate_from_patterns(
+                                &self.pattern_lib,
+                                &self.proj,
+                                s,
+                                e,
+                                &self.piano_pattern_id,
+                                &self.bass_pattern_id,
+                                &self.drum_pattern_id,
+                                self.syncopation_fill,
+                            );
+                            replace_notes_in_range(&mut self.proj.tracks[1].notes, s, e, p);
+                            replace_notes_in_range(&mut self.proj.tracks[2].notes, s, e, b);
+                            replace_notes_in_range(&mut self.proj.tracks[9].notes, s, e, d);
+                            self.end_gesture_undo();
+                            self.show_toast(ctx, "Generated Ch2/3/10");
                         }
-                        if ui
-                            .add(egui::Button::new(s_label).min_size(Vec2::new(18.0, 16.0)))
-                            .on_hover_text("Solo")
-                            .clicked()
-                        {
-                            t.solo = !t.solo;
-                            mix_changed = true;
-                        }
-                        let mut vol_pct = (t.track_vol * 100.0).round() as i32;
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut vol_pct)
-                                    .speed(1.0)
-                                    .range(0..=100)
-                                    .prefix("V"),
-                            )
-                            .on_hover_text("Track volume %")
-                            .changed()
-                        {
-                            t.track_vol = (vol_pct as f32 / 100.0).clamp(0.0, 1.0);
-                            mix_changed = true;
+                        if ui.button("Clear Ch2,3,10").clicked() {
+                            self.proj.tracks[1].notes.clear();
+                            self.proj.tracks[2].notes.clear();
+                            self.proj.tracks[9].notes.clear();
                         }
                     });
-                    if mix_changed {
-                        self.on_track_mix_changed();
-                    }
-                    if ch != 1 {
-                        let t = &mut self.proj.tracks[t_idx];
-                        let patch_name =
-                            truncate_ascii(gm_instrument_name(t.patch), 12);
-                        let mut patch_changed = false;
-                        ui.horizontal(|ui| {
-                            ui.add_space(42.0);
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut t.patch)
-                                        .speed(1.0)
-                                        .range(0..=127),
-                                )
-                                .changed()
-                            {
-                                patch_changed = true;
-                            }
-                            ui.label(egui::RichText::new(patch_name).size(10.0));
-                        });
-                        if patch_changed {
-                            self.on_track_mix_changed();
+                }
+                AppTab::Edit => {
+                    ui.horizontal(|ui| {
+                        ui.label("Pitch Zoom");
+                        if ui.add(egui::Slider::new(&mut self.visible_pitch_span, 12.0..=72.0)).changed() {
+                            self.clamp_pitch_center();
                         }
-                    }
+                        ui.label("Onion Chord");
+                        ui.add(egui::Slider::new(&mut self.chord_opacity, 0.0..=1.0).step_by(0.02));
+                        if ui.button("Import MIDI…").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("MIDI", &["mid", "midi"])
+                                .pick_file()
+                            {
+                                self.import_midi_to_selected_track(&path, ctx);
+                            }
+                        }
+                    });
+                    self.show_grok_panel(ui, ctx);
+                    ui.label("Tip: Tab3 — piano roll only • Ctrl+C/V/X/D • Grok MIDI import");
                 }
-                });
-                ui.separator();
-                ui.label("Synth: MIDI Out (port or softsynth) + rustysynth ready");
-                if let Some(ref p) = self.soundfont_path {
-                    ui.label(format!("SF2: found ({})", p.display()));
-                } else {
-                    ui.label(egui::RichText::new("SF2: NOT FOUND — copy FluidR3 GM.SF2 next to jpo.exe (or into jpo/ for dev)").color(Color32::from_rgb(255, 180, 80)));
+                AppTab::Arrange => {
+                    ui.label("Tip: Tab4 — sequence loops • Space plays full arrange timeline");
                 }
-            });
+            }
+        });
 
+        // Main area — one tab = one primary interaction surface
+        egui::CentralPanel::default().show(ctx, |ui| {
             egui::SidePanel::right("loop_bank")
                 .resizable(false)
                 .default_width(132.0)
@@ -3419,25 +3643,119 @@ impl eframe::App for JpoApp {
                     self.show_loop_bank_panel(ui);
                 });
 
-            if self.ui_mode == UiMode::Arrange {
-                self.show_arrange_panel(ui);
-            } else {
-                // Chord Timeline (always visible - onion source + Ch1 input)
-                ui.label(egui::RichText::new("CHORD TIMELINE — click empty=place block • click block=select • right edge drag=stretch • Shift+click=multi • Alt+drag=box • Ctrl+C/V • Space=play").strong());
-                let _chord_response = self.draw_chord_timeline(ui);
-                self.show_chord_strip(ui);
+            match self.active_tab {
+                AppTab::Chord => {
+                    ui.label(
+                        egui::RichText::new("TAB 1 CHORD — fine grid placement • Shift+click multi • Ctrl+C/V")
+                            .strong(),
+                    );
+                    let _chord_response = self.draw_chord_timeline(ui);
+                    self.show_chord_strip(ui);
+                }
+                AppTab::Generate => {
+                    ui.label(
+                        egui::RichText::new("TAB 2 GENERATE — preview chords + pattern accompaniment")
+                            .strong(),
+                    );
+                    let _chord_response = self.draw_chord_timeline(ui);
+                    ui.add_space(8.0);
+                    ui.label(format!(
+                        "Ch2 Piano: {} notes • Ch3 Bass: {} • Ch10 Drum: {}",
+                        self.proj.tracks[1].notes.len(),
+                        self.proj.tracks[2].notes.len(),
+                        self.proj.tracks[9].notes.len(),
+                    ));
+                    ui.label(
+                        egui::RichText::new("Use bottom panel to Generate All. Edit notes in Tab 3.")
+                            .weak(),
+                    );
+                }
+                AppTab::Edit => {
+                    egui::SidePanel::left("tracks")
+                        .resizable(false)
+                        .default_width(168.0)
+                        .max_width(180.0)
+                        .show_inside(ui, |ui| {
+                            ui.label("TRACKS  (M=mute S=solo Vol%)");
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for ch in 1..=16 {
+                                        let t_idx = (ch - 1) as usize;
+                                        let mut mix_changed = false;
+                                        ui.horizontal(|ui| {
+                                            ui.allocate_ui_with_layout(
+                                                Vec2::new(40.0, 18.0),
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .selectable_label(
+                                                            self.selected_ch == ch,
+                                                            track_short_label(ch),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        self.selected_ch = ch;
+                                                        self.selected_note = None;
+                                                        self.piano_roll_focused = ch != 1;
+                                                        if ch != 1 {
+                                                            self.clear_chord_selection();
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                            let t = &mut self.proj.tracks[t_idx];
+                                            let m_label = if t.muted { "M" } else { "m" };
+                                            let s_label = if t.solo { "S" } else { "s" };
+                                            if ui
+                                                .add(egui::Button::new(m_label).min_size(Vec2::new(18.0, 16.0)))
+                                                .clicked()
+                                            {
+                                                t.muted = !t.muted;
+                                                mix_changed = true;
+                                            }
+                                            if ui
+                                                .add(egui::Button::new(s_label).min_size(Vec2::new(18.0, 16.0)))
+                                                .clicked()
+                                            {
+                                                t.solo = !t.solo;
+                                                mix_changed = true;
+                                            }
+                                            let mut vol_pct = (t.track_vol * 100.0).round() as i32;
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(&mut vol_pct)
+                                                        .speed(1.0)
+                                                        .range(0..=100)
+                                                        .prefix("V"),
+                                                )
+                                                .changed()
+                                            {
+                                                t.track_vol =
+                                                    (vol_pct as f32 / 100.0).clamp(0.0, 1.0);
+                                                mix_changed = true;
+                                            }
+                                        });
+                                        if mix_changed {
+                                            self.on_track_mix_changed();
+                                        }
+                                    }
+                                });
+                        });
 
-                ui.add_space(4.0);
-
-                // Piano Roll
-                let roll_label = if self.selected_ch == 1 {
-                    "PIANO ROLL (Ch1 preview — actual input is in the Chord Timeline above)"
-                } else {
-                    "PIANO ROLL — click empty = place note (Len) • drag note = move • right = resize • Shift+click multi • Ctrl+C/V"
-                };
-                ui.label(roll_label);
-                let roll_h = ui.available_height().clamp(180.0, 450.0);
-                let _roll_response = self.draw_piano_roll_with_keyboard(ui, roll_h);
+                    ui.label(
+                        egui::RichText::new("TAB 3 EDIT — piano roll • chord onion background • Ctrl+C/V")
+                            .strong(),
+                    );
+                    if self.selected_ch == 1 {
+                        ui.label("Select Ch2–16 in the track list to edit generated/hand parts.");
+                    }
+                    let roll_h = ui.available_height().clamp(220.0, 520.0);
+                    let _roll_response = self.draw_piano_roll_with_keyboard(ui, roll_h);
+                }
+                AppTab::Arrange => {
+                    self.show_arrange_panel(ui);
+                }
             }
         });
 
@@ -3458,9 +3776,15 @@ impl eframe::App for JpoApp {
 impl JpoApp {
     // ===== Chord Timeline drawing + interaction =====
     fn draw_chord_timeline(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        let editable = self.active_tab == AppTab::Chord;
         let desired = Vec2::new(ui.available_width().min(980.0), 92.0);
-        let (resp, painter) = ui.allocate_painter(desired, Sense::click_and_drag());
-        if resp.clicked() || resp.dragged() || resp.drag_started() {
+        let sense = if editable {
+            Sense::click_and_drag()
+        } else {
+            Sense::hover()
+        };
+        let (resp, painter) = ui.allocate_painter(desired, sense);
+        if editable && (resp.clicked() || resp.dragged() || resp.drag_started()) {
             self.piano_roll_focused = false;
         }
 
@@ -3582,8 +3906,8 @@ impl JpoApp {
             );
         }
 
-        // interaction
-        if resp.clicked() || resp.dragged() || resp.double_clicked() {
+        // interaction (Chord tab only)
+        if editable && (resp.clicked() || resp.dragged() || resp.double_clicked()) {
             if let Some(ptr) = resp.interact_pointer_pos() {
                 let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
                 let snapped = self.snap_beat(beat);
@@ -3685,7 +4009,7 @@ impl JpoApp {
             }
         }
 
-        if resp.drag_stopped() {
+        if editable && resp.drag_stopped() {
             if let Some(sb) = self.chord_box_select_start {
                 if let Some(ptr) = resp.interact_pointer_pos() {
                     let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
@@ -4298,7 +4622,7 @@ impl JpoApp {
 
         let mut events: Vec<(u64, u8, bool, u8, u8)> = Vec::new();
 
-        if self.ui_mode == UiMode::Arrange && !self.arrange_sequence.is_empty() {
+        if self.active_tab == AppTab::Arrange && !self.arrange_sequence.is_empty() {
             let mut beat_offset = 0.0f64;
             for slot in &self.arrange_sequence {
                 let Some(sketch) = self.loop_bank.get(slot.bank_idx) else {
@@ -4408,7 +4732,7 @@ impl JpoApp {
         let bpm = self.proj.bpm.max(1.0);
         let samples_per_beat = sample_rate as f64 * (60.0 / bpm);
         let loop_end_sample = if self.loop_playback {
-            let loop_beats = if self.ui_mode == UiMode::Arrange {
+            let loop_beats = if self.active_tab == AppTab::Arrange {
                 self.arrange_total_beats().max(0.25)
             } else {
                 self.loop_beats()

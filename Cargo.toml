@@ -1,6 +1,6 @@
 [package]
 name = "jpo"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "JpoProducer - Lightweight J-Pop/J-Rock MIDI sketch tool (Rust + egui version)"
 authors = ["Grok + user"]
