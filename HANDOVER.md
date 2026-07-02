@@ -19,7 +19,7 @@
 | **B** | done | Tab1: クリック配置のみ、右端ハンドル伸長、`enforce_chord_timeline_no_overlap` |
 | **C-1** | pending | Tab2 生成ルール: 1-pass、BPM gate、**ベース/ピアノ pitch fold**（下記） |
 | **C-2** | pending | Tab2 UI: Piano / Bass / Drum 3レーン preview |
-| **D** | pending | Tab3: Select/Draw/Erase、修飾キーなし範囲選択、Ctrl+クリック複選 |
+| **D** | done | Tab3: Select/Draw/Erase、marquee（Shift不要）、Ctrl+click 複選、Ctrl+C/V Tab3のみ |
 
 ### ピッチマッピング（C-1 で実装 — 忘れないこと）
 

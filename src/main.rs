@@ -1330,8 +1330,13 @@ fn find_soundfont() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Tab1 chords: Draw + Erase. Tab3 piano roll: Select + Draw + Erase (standard MIDI editor).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum EditMode { Pencil, Eraser }
+enum EditMode {
+    Select,
+    Draw,
+    Erase,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AppTab {
@@ -1576,7 +1581,7 @@ impl Default for JpoApp {
             visible_start: 0.0,
             visible_beats: 16.0,
             current_beat: 0.0,
-            edit_mode: EditMode::Pencil,
+            edit_mode: EditMode::Select,
             note_len: 0.5, // 1/8 note default (beat units)
             snap_enabled: true,
             active_chord_beat: None,
@@ -1660,6 +1665,15 @@ impl JpoApp {
         self.active_tab = tab;
         self.piano_roll_focused = false;
         self.clear_interaction_state();
+        if tab == AppTab::Edit {
+            self.edit_mode = EditMode::Select;
+            if self.selected_ch == 1 {
+                self.selected_ch = 2;
+            }
+            self.piano_roll_focused = true;
+        } else if tab == AppTab::Chord {
+            self.edit_mode = EditMode::Draw;
+        }
         if tab != AppTab::Edit {
             self.selected_note = None;
             self.selection.notes.clear();
@@ -1861,8 +1875,8 @@ impl JpoApp {
         NoteId(max_id + 1)
     }
 
-    fn select_note_toggle(&mut self, track_idx: usize, note_id: NoteId, shift: bool) {
-        if shift {
+    fn select_note_toggle(&mut self, track_idx: usize, note_id: NoteId, additive: bool) {
+        if additive {
             if self.selection.notes.contains(&(track_idx, note_id)) {
                 self.selection.notes.remove(&(track_idx, note_id));
                 if self.selected_note == Some((track_idx, note_id)) {
@@ -2080,6 +2094,18 @@ impl JpoApp {
                 Color32::from_rgb(255, 90, 90),
             );
         }
+    }
+
+    fn find_note_hit(notes: &[Note], beat: f64, pitch: u8, beat_slop: f64) -> Option<usize> {
+        for (i, n) in notes.iter().enumerate() {
+            if n.start - beat_slop <= beat
+                && beat <= n.end() + beat_slop
+                && (n.pitch as i32 - pitch as i32).abs() <= 1
+            {
+                return Some(i);
+            }
+        }
+        None
     }
 
     fn note_resize_at_ptr(ptr_x: f32, note_x0: f32, note_x1: f32) -> bool {
@@ -2841,8 +2867,9 @@ impl JpoApp {
 
     fn edit_tool_label(&self) -> &'static str {
         match self.edit_mode {
-            EditMode::Pencil => "Pencil",
-            EditMode::Eraser => "Eraser",
+            EditMode::Select => "Select",
+            EditMode::Draw => "Draw",
+            EditMode::Erase => "Erase",
         }
     }
 
@@ -2854,14 +2881,25 @@ impl JpoApp {
         };
         ui.menu_button(menu_title, |ui| {
             if matches!(self.active_tab, AppTab::Chord | AppTab::Edit) {
-                ui.label(egui::RichText::new("Edit tool").strong());
-                if ui.selectable_label(self.edit_mode == EditMode::Pencil, "Pencil").clicked() {
-                    self.edit_mode = EditMode::Pencil;
-                    ui.close_menu();
-                }
-                if ui.selectable_label(self.edit_mode == EditMode::Eraser, "Eraser").clicked() {
-                    self.edit_mode = EditMode::Eraser;
-                    ui.close_menu();
+                ui.label(egui::RichText::new("Tool").strong());
+                if self.active_tab == AppTab::Edit {
+                    for (mode, label) in [
+                        (EditMode::Select, "Select"),
+                        (EditMode::Draw, "Draw"),
+                        (EditMode::Erase, "Erase"),
+                    ] {
+                        if ui.selectable_label(self.edit_mode == mode, label).clicked() {
+                            self.edit_mode = mode;
+                            ui.close_menu();
+                        }
+                    }
+                } else {
+                    for (mode, label) in [(EditMode::Draw, "Draw"), (EditMode::Erase, "Erase")] {
+                        if ui.selectable_label(self.edit_mode == mode, label).clicked() {
+                            self.edit_mode = mode;
+                            ui.close_menu();
+                        }
+                    }
                 }
             }
 
@@ -3009,7 +3047,7 @@ impl JpoApp {
 
             ui.separator();
             ui.label(
-                egui::RichText::new("click empty = place • Shift+click multi • Shift+drag box • Ctrl+C/V/X/D")
+                egui::RichText::new("Tab3: Select=marquee • Ctrl+click add • Draw=place • Ctrl+C/V/X/D/A")
                     .small()
                     .weak(),
             );
@@ -3610,6 +3648,31 @@ impl eframe::App for JpoApp {
 
                 if self.active_tab == AppTab::Edit {
                     ui.separator();
+                    for (mode, label) in [
+                        (EditMode::Select, "Select"),
+                        (EditMode::Draw, "Draw"),
+                        (EditMode::Erase, "Erase"),
+                    ] {
+                        if ui.selectable_label(self.edit_mode == mode, label).clicked() {
+                            self.edit_mode = mode;
+                        }
+                    }
+                    ui.separator();
+                    ui.label("Len");
+                    egui::ComboBox::from_id_salt("toolbar_edit_note_len")
+                        .selected_text(self.note_len_label())
+                        .width(48.0)
+                        .show_ui(ui, |ui| {
+                            for (label, val) in Self::NOTE_LENS {
+                                if ui
+                                    .selectable_label((self.note_len - val).abs() < 0.01, label)
+                                    .clicked()
+                                {
+                                    self.set_len(val);
+                                }
+                            }
+                        });
+                    ui.separator();
                     let snap_label = if self.snap_enabled { "Snap" } else { "Snap off" };
                     if ui
                         .selectable_label(self.snap_enabled, snap_label)
@@ -3769,7 +3832,7 @@ impl eframe::App for JpoApp {
                         }
                     });
                     self.show_grok_panel(ui, ctx);
-                    ui.label("Tip: Tab3 — piano roll • Ctrl+C/V/X/D/A (this tab only) • Import MIDI");
+                    ui.label("Tip: Tab3 — Select=marquee • Ctrl+click add • Draw=place • Ctrl+C/V/X/D/A • Del");
                 }
                 AppTab::Arrange => {
                     ui.label("Tip: Tab4 — sequence loops • Space plays full arrange timeline");
@@ -3790,7 +3853,7 @@ impl eframe::App for JpoApp {
             match self.active_tab {
                 AppTab::Chord => {
                     ui.label(
-                        egui::RichText::new("TAB 1 CHORD — fine grid placement • Shift+click multi • Ctrl+C/V")
+                        egui::RichText::new("TAB 1 CHORD — click place • drag move • right edge stretch")
                             .strong(),
                     );
                     let _chord_response = self.draw_chord_timeline(ui);
@@ -4079,8 +4142,8 @@ impl JpoApp {
 
                 if resp.drag_started() {
                     if let Some((i, hit_kind)) = chord_hit(self, beat, ptr.x) {
-                        let should_delete = self.edit_mode == EditMode::Eraser
-                            || (self.edit_mode == EditMode::Pencil && resp.double_clicked());
+                        let should_delete = self.edit_mode == EditMode::Erase
+                            || (self.edit_mode == EditMode::Draw && resp.double_clicked());
                         if should_delete {
                             self.begin_gesture_undo();
                             self.proj.chord_blocks.remove(i);
@@ -4089,7 +4152,7 @@ impl JpoApp {
                             self.chord_drag_kind = ChordDragKind::None;
                             self.chord_drag_block_idx = None;
                             self.end_gesture_undo();
-                        } else if self.edit_mode == EditMode::Pencil {
+                        } else if self.edit_mode == EditMode::Draw {
                             self.begin_gesture_undo();
                             let blk = self.proj.chord_blocks[i].clone();
                             self.select_chord_block(i, false);
@@ -4103,7 +4166,7 @@ impl JpoApp {
 
                 if resp.clicked() && !resp.dragged() {
                     if let Some((i, _)) = chord_hit(self, beat, ptr.x) {
-                        if self.edit_mode == EditMode::Eraser {
+                        if self.edit_mode == EditMode::Erase {
                             self.begin_gesture_undo();
                             self.proj.chord_blocks.remove(i);
                             self.clear_chord_selection();
@@ -4114,7 +4177,7 @@ impl JpoApp {
                             self.set_playhead(beat);
                             self.preview_chord_block(&blk);
                         }
-                    } else if self.edit_mode == EditMode::Pencil {
+                    } else if self.edit_mode == EditMode::Draw {
                         self.set_playhead(snapped);
                         self.place_chord_block_at(snapped);
                     }
@@ -4262,7 +4325,10 @@ impl JpoApp {
     fn draw_piano_roll_grid(&mut self, ui: &mut egui::Ui, width: f32, height: f32) -> egui::Response {
         let desired = Vec2::new(width, height);
         let (resp, painter) = ui.allocate_painter(desired, Sense::click_and_drag());
-        if resp.clicked() || resp.dragged() || resp.drag_started() {
+        if self.active_tab == AppTab::Edit {
+            resp.request_focus();
+        }
+        if resp.clicked() || resp.dragged() || resp.drag_started() || resp.hovered() {
             self.piano_roll_focused = true;
         }
 
@@ -4432,22 +4498,20 @@ impl JpoApp {
             }
         }
 
-        // mouse interaction (Ch2–16)
-        if !is_ch1 && (resp.clicked() || resp.dragged() || resp.double_clicked()) {
+        // Tab3 standard MIDI editor (Ch2–16 only)
+        let std_edit = self.active_tab == AppTab::Edit && !is_ch1;
+        if std_edit && (resp.clicked() || resp.dragged() || resp.drag_started()) {
             if let Some(ptr) = resp.interact_pointer_pos() {
                 let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
                 let norm = ((ptr.y - rect.min.y) as f64 / h).clamp(0.0, 1.0);
                 let pitch = (max_p as f64 - norm * (max_p - min_p) as f64).round() as u8;
+                let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
+                let beat_slop = (POINTER_SLOP_PX as f64 / px_per_beat).max(0.05);
 
                 self.last_mouse_beat = beat;
                 self.last_mouse_pitch = pitch;
 
-                let shift = ui.ctx().input(|i| i.modifiers.shift);
-
-                // Box-select overlay (Shift+drag on empty area)
-                let box_active = self.box_select_start_beat.is_some()
-                    && self.note_drag_kind == NoteDragKind::None;
-                if box_active {
+                if self.box_select_start_beat.is_some() && self.note_drag_kind == NoteDragKind::None {
                     if let (Some(sb), Some(sp)) = (self.box_select_start_beat, self.box_select_start_pitch) {
                         let p_lo = sp.min(pitch);
                         let p_hi = sp.max(pitch);
@@ -4470,169 +4534,203 @@ impl JpoApp {
                     }
                 }
 
+                let hit = Self::find_note_hit(&notes, beat, pitch, beat_slop);
+
                 if resp.drag_started() {
                     self.begin_gesture_undo();
-                }
-
-                if resp.drag_started() || resp.clicked() || resp.double_clicked() {
-                    let beat_slop = (POINTER_SLOP_PX as f64 / px_per_beat).max(0.05);
-                    let mut hit = None;
-                    for (i, n) in notes.iter().enumerate() {
-                        if n.start - beat_slop <= beat
-                            && beat <= n.end() + beat_slop
-                            && (n.pitch as i32 - pitch as i32).abs() <= 1
-                        {
-                            hit = Some(i);
-                            break;
-                        }
-                    }
-
-                    if let Some(i) = hit {
-                        let should_delete = self.edit_mode == EditMode::Eraser
-                            || (self.edit_mode == EditMode::Pencil && resp.double_clicked());
-                        if should_delete && i < self.proj.tracks[track_idx].notes.len() {
-                            self.begin_gesture_undo();
-                            self.proj.tracks[track_idx].notes.remove(i);
-                            self.selected_note = None;
-                            self.selection.notes.retain(|&(t, _)| t != track_idx);
-                            self.end_gesture_undo();
-                        } else if !should_delete && self.edit_mode == EditMode::Pencil {
-                            if resp.clicked() && !resp.dragged() && shift {
-                                let hit_note_id = self.proj.tracks[track_idx].notes.get(i).map(|note| note.id).unwrap_or_else(|| self.next_note_id());
-                                self.select_note_toggle(track_idx, hit_note_id, true);
+                    match self.edit_mode {
+                        EditMode::Erase => {
+                            if let Some(i) = hit {
+                                if i < self.proj.tracks[track_idx].notes.len() {
+                                    let removed_id = self.proj.tracks[track_idx].notes[i].id;
+                                    self.proj.tracks[track_idx].notes.remove(i);
+                                    self.selection.notes.remove(&(track_idx, removed_id));
+                                    if self.selected_note == Some((track_idx, removed_id)) {
+                                        self.selected_note = None;
+                                    }
+                                }
+                                self.end_gesture_undo();
                             } else {
-                                self.box_select_start_beat = None;
-                                self.box_select_start_pitch = None;
-                                let hit_note_id = self.proj.tracks[track_idx].notes.get(i).map(|note| note.id).unwrap_or_else(|| self.next_note_id());
-                        if !(resp.drag_started() && self.selection.notes.contains(&(track_idx, hit_note_id))) {
-                            self.select_note_toggle(track_idx, hit_note_id, false);
+                                self.gesture_undo_saved = false;
+                            }
                         }
-                        let n = &self.proj.tracks[track_idx].notes[i];
-                                self.drag_orig = (n.start, n.pitch, n.dur);
+                        EditMode::Select => {
+                            if let Some(i) = hit {
+                                let (nid, nstart, npitch, ndur) = {
+                                    let n = &self.proj.tracks[track_idx].notes[i];
+                                    (n.id, n.start, n.pitch, n.dur)
+                                };
+                                if !(ctrl && self.selection.notes.contains(&(track_idx, nid))) {
+                                    if !ctrl {
+                                        self.selection.notes.clear();
+                                    }
+                                    self.select_note_toggle(track_idx, nid, ctrl);
+                                }
+                                self.drag_orig = (nstart, npitch, ndur);
                                 self.drag_start_beat = beat;
                                 self.drag_start_pitch = pitch;
-                                self.is_creating = false;
-                                let nx0 = rect.min.x + ((n.start - start_b) * px_per_beat) as f32;
-                                let nx1 = rect.min.x + ((n.end() - start_b) * px_per_beat) as f32;
-                                let grab_resize = Self::note_resize_at_ptr(ptr.x, nx0, nx1);
-                                self.note_drag_kind = if grab_resize {
+                                let nx0 = rect.min.x + ((nstart - start_b) * px_per_beat) as f32;
+                                let nx1 = rect.min.x + ((nstart + ndur - start_b) * px_per_beat) as f32;
+                                self.note_drag_kind = if Self::note_resize_at_ptr(ptr.x, nx0, nx1) {
                                     NoteDragKind::Resize
                                 } else {
                                     NoteDragKind::Move
                                 };
-                                let is_multi = self.selection.notes.contains(&(track_idx, n.id));
-                                if is_multi {
-                                    self.drag_sel_offsets = self
-                                        .selection
-                                        .notes
-                                        .iter()
-                                        .filter(|&&(t, _)| t == track_idx)
-                                        .filter_map(|&(_, id)| {
-                                            self.proj.tracks[track_idx]
-                                                .notes
-                                                .iter()
-                                                .find(|note| note.id == id)
-                                                .map(|nn| (id, nn.start - n.start, nn.pitch as i32 - n.pitch as i32))
-                                        })
-                                        .collect();
-                                } else {
-                                    self.drag_sel_offsets = vec![(n.id, 0.0, 0)];
-                                }
+                                self.drag_sel_offsets = self
+                                    .selection
+                                    .notes
+                                    .iter()
+                                    .filter(|&&(t, _)| t == track_idx)
+                                    .filter_map(|&(_, id)| {
+                                        self.proj.tracks[track_idx].notes.iter().find(|nn| nn.id == id).map(
+                                            |nn| (id, nn.start - nstart, nn.pitch as i32 - npitch as i32),
+                                        )
+                                    })
+                                    .collect();
+                            } else {
+                                self.box_select_start_beat = Some(beat);
+                                self.box_select_start_pitch = Some(pitch);
+                                self.gesture_undo_saved = false;
                             }
                         }
-                    } else if self.edit_mode == EditMode::Pencil {
-                        if resp.drag_started() && shift {
-                            self.box_select_start_beat = Some(beat);
-                            self.box_select_start_pitch = Some(pitch);
-                        } else if resp.drag_started() && self.note_drag_kind == NoteDragKind::None {
-                            self.begin_gesture_undo();
-                            let snapped = self.snap_beat(beat);
-                            let dur = self.snap_dur(self.note_len.max(0.0625));
-                            let new_n = Note {
-                                id: self.next_note_id(),
-                                start: snapped,
-                                pitch: pitch.clamp(0, 127),
-                                dur,
-                                vel: self.default_velocity,
-                            };
-                            self.proj.tracks[track_idx].notes.push(new_n);
-                            self.proj.tracks[track_idx].notes.sort_by(|a, b| {
-                                a.start
-                                    .partial_cmp(&b.start)
-                                    .unwrap()
-                                    .then(a.pitch.cmp(&b.pitch))
-                            });
-                            let new_idx = self.proj.tracks[track_idx].notes.len() - 1;
-                            self.selection.notes.clear();
-                            self.selection.notes.insert((track_idx, new_n.id));
-                            self.selected_note = Some((track_idx, new_n.id));
-                            self.drag_orig = (snapped, pitch, dur);
-                            self.drag_start_beat = beat;
-                            self.drag_start_pitch = pitch;
-                            self.note_drag_kind = NoteDragKind::Create;
-                            self.drag_sel_offsets = vec![(new_n.id, 0.0, 0)];
-                            self.is_creating = true;
-                            self.preview_note(
-                                self.selected_ch,
-                                self.proj.tracks[track_idx].patch,
-                                pitch,
-                                self.default_velocity,
-                            );
-                        } else if resp.clicked() && self.note_drag_kind == NoteDragKind::None {
-                            self.place_piano_note_at(track_idx, beat, pitch);
-                            self.set_playhead(beat);
+                        EditMode::Draw => {
+                            if let Some(i) = hit {
+                                let (nid, nstart, npitch, ndur) = {
+                                    let n = &self.proj.tracks[track_idx].notes[i];
+                                    (n.id, n.start, n.pitch, n.dur)
+                                };
+                                self.selection.notes.clear();
+                                self.selection.notes.insert((track_idx, nid));
+                                self.selected_note = Some((track_idx, nid));
+                                self.drag_orig = (nstart, npitch, ndur);
+                                self.drag_start_beat = beat;
+                                self.drag_start_pitch = pitch;
+                                let nx0 = rect.min.x + ((nstart - start_b) * px_per_beat) as f32;
+                                let nx1 = rect.min.x + ((nstart + ndur - start_b) * px_per_beat) as f32;
+                                self.note_drag_kind = if Self::note_resize_at_ptr(ptr.x, nx0, nx1) {
+                                    NoteDragKind::Resize
+                                } else {
+                                    NoteDragKind::Move
+                                };
+                                self.drag_sel_offsets = vec![(nid, 0.0, 0)];
+                            } else {
+                                let snapped = self.snap_beat(beat);
+                                let dur = self.snap_dur(self.note_len.max(0.0625));
+                                let new_n = Note {
+                                    id: self.next_note_id(),
+                                    start: snapped,
+                                    pitch: pitch.clamp(0, 127),
+                                    dur,
+                                    vel: self.default_velocity,
+                                };
+                                self.proj.tracks[track_idx].notes.push(new_n);
+                                self.proj.tracks[track_idx].notes.sort_by(|a, b| {
+                                    a.start
+                                        .partial_cmp(&b.start)
+                                        .unwrap()
+                                        .then(a.pitch.cmp(&b.pitch))
+                                });
+                                self.selection.notes.clear();
+                                self.selection.notes.insert((track_idx, new_n.id));
+                                self.selected_note = Some((track_idx, new_n.id));
+                                self.drag_orig = (snapped, pitch, dur);
+                                self.drag_start_beat = beat;
+                                self.drag_start_pitch = pitch;
+                                self.note_drag_kind = NoteDragKind::Create;
+                                self.drag_sel_offsets = vec![(new_n.id, 0.0, 0)];
+                                self.preview_note(
+                                    self.selected_ch,
+                                    self.proj.tracks[track_idx].patch,
+                                    pitch,
+                                    self.default_velocity,
+                                );
+                            }
                         }
                     }
                 }
 
-                if resp.dragged() {
-                    if let Some((ti, ni)) = self.selected_note {
-                        if ti == track_idx {
-                            let db = beat - self.drag_start_beat;
-                            let dp = pitch as i32 - self.drag_start_pitch as i32;
-
-                            match self.note_drag_kind {
-                                NoteDragKind::Create | NoteDragKind::Resize => {
-                                    let new_dur = self.snap_dur((self.drag_orig.2 + db).max(0.0625));
-                                    for &(sni, _, _) in &self.drag_sel_offsets {
-                                        if let Some(note) = self.proj.tracks[track_idx].notes.iter_mut().find(|note| note.id == sni) {
-                                            note.dur = new_dur;
-                                        }
-                                    }
+                if resp.clicked() && !resp.dragged() {
+                    match self.edit_mode {
+                        EditMode::Erase => {
+                            if let Some(i) = hit {
+                                self.begin_gesture_undo();
+                                if i < self.proj.tracks[track_idx].notes.len() {
+                                    let removed_id = self.proj.tracks[track_idx].notes[i].id;
+                                    self.proj.tracks[track_idx].notes.remove(i);
+                                    self.selection.notes.remove(&(track_idx, removed_id));
+                                    self.selected_note = None;
                                 }
-                                NoteDragKind::Move => {
-                                    let new_start = self.snap_beat((self.drag_orig.0 + db).max(0.0));
-                                    let new_pitch = (self.drag_orig.1 as i32 + dp).clamp(0, 127) as u8;
-                                    let mut updates: Vec<(NoteId, f64, u8)> = Vec::new();
-                                    for &(sni, ds, dpp) in &self.drag_sel_offsets {
-                                        if let Some(note) = self.proj.tracks[track_idx].notes.iter().find(|note| note.id == sni) {
-                                            let snapped = self.snap_beat((new_start + ds).max(0.0));
-                                            let p = (new_pitch as i32 + dpp).clamp(0, 127) as u8;
-                                            updates.push((sni, snapped, p));
-                                        }
-                                    }
-                                    for (sni, snapped, p) in updates {
-                                        if let Some(note) = self.proj.tracks[track_idx].notes.iter_mut().find(|note| note.id == sni) {
-                                            note.start = snapped;
-                                            note.pitch = p;
-                                        }
-                                    }
-                                    if self.last_move_preview_pitch != Some(new_pitch) {
-                                        self.last_move_preview_pitch = Some(new_pitch);
-                                        let patch = self.proj.tracks[track_idx].patch;
-                                        let vel = self.proj.tracks[track_idx].notes.iter().find(|note| note.id == ni).map(|n| n.vel).unwrap_or(self.default_velocity);
-                                        self.preview_note(self.selected_ch, patch, new_pitch, vel);
-                                    }
-                                }
-                                NoteDragKind::None => {}
+                                self.end_gesture_undo();
                             }
                         }
+                        EditMode::Select => {
+                            if let Some(i) = hit {
+                                let id = self.proj.tracks[track_idx].notes[i].id;
+                                self.select_note_toggle(track_idx, id, ctrl);
+                            } else if !ctrl {
+                                self.selection.notes.clear();
+                                self.selected_note = None;
+                            }
+                        }
+                        EditMode::Draw => {
+                            if hit.is_none() {
+                                self.place_piano_note_at(track_idx, beat, pitch);
+                                self.set_playhead(beat);
+                            }
+                        }
+                    }
+                }
+
+                if resp.dragged() && self.note_drag_kind != NoteDragKind::None {
+                    let db = beat - self.drag_start_beat;
+                    let dp = pitch as i32 - self.drag_start_pitch as i32;
+                    match self.note_drag_kind {
+                        NoteDragKind::Create | NoteDragKind::Resize => {
+                            let new_dur = self.snap_dur((self.drag_orig.2 + db).max(0.0625));
+                            for &(sni, _, _) in &self.drag_sel_offsets {
+                                if let Some(note) = self.proj.tracks[track_idx]
+                                    .notes
+                                    .iter_mut()
+                                    .find(|note| note.id == sni)
+                                {
+                                    note.dur = new_dur;
+                                }
+                            }
+                        }
+                        NoteDragKind::Move => {
+                            let new_start = self.snap_beat((self.drag_orig.0 + db).max(0.0));
+                            let new_pitch = (self.drag_orig.1 as i32 + dp).clamp(0, 127) as u8;
+                            let mut updates: Vec<(NoteId, f64, u8)> = Vec::new();
+                            for &(sni, ds, dpp) in &self.drag_sel_offsets {
+                                updates.push((
+                                    sni,
+                                    self.snap_beat((new_start + ds).max(0.0)),
+                                    (new_pitch as i32 + dpp).clamp(0, 127) as u8,
+                                ));
+                            }
+                            for (sni, start, p) in updates {
+                                if let Some(note) = self.proj.tracks[track_idx]
+                                    .notes
+                                    .iter_mut()
+                                    .find(|note| note.id == sni)
+                                {
+                                    note.start = start;
+                                    note.pitch = p;
+                                }
+                            }
+                            if self.last_move_preview_pitch != Some(new_pitch) {
+                                self.last_move_preview_pitch = Some(new_pitch);
+                                let patch = self.proj.tracks[track_idx].patch;
+                                self.preview_note(self.selected_ch, patch, new_pitch, self.default_velocity);
+                            }
+                        }
+                        NoteDragKind::None => {}
                     }
                 }
             }
         }
 
-        if resp.drag_stopped() {
+        if std_edit && resp.drag_stopped() {
             if let (Some(sb), Some(sp)) = (self.box_select_start_beat, self.box_select_start_pitch) {
                 let cur_b = self.last_mouse_beat;
                 let cur_p = self.last_mouse_pitch;
@@ -4641,8 +4739,10 @@ impl JpoApp {
                 let min_p_sel = sp.min(cur_p);
                 let max_p_sel = sp.max(cur_p);
                 if (max_b - min_b).abs() > 0.04 || max_p_sel.abs_diff(min_p_sel) > 0 {
-                    self.begin_gesture_undo();
-                    if !ui.ctx().input(|i| i.modifiers.shift) {
+                    if !self.gesture_undo_saved {
+                        self.begin_gesture_undo();
+                    }
+                    if !ui.ctx().input(|i| i.modifiers.ctrl) {
                         self.selection.notes.clear();
                     }
                     self.finalize_box_selection(min_b, max_b, min_p_sel, max_p_sel);
@@ -4651,13 +4751,12 @@ impl JpoApp {
                 self.box_select_start_beat = None;
                 self.box_select_start_pitch = None;
             }
-            self.is_creating = false;
             if self.note_drag_kind != NoteDragKind::None {
-                self.note_drag_kind = NoteDragKind::None;
+                self.end_gesture_undo();
             }
+            self.note_drag_kind = NoteDragKind::None;
             self.last_move_preview_pitch = None;
             self.drag_sel_offsets.clear();
-            self.end_gesture_undo();
         }
 
         resp
