@@ -114,8 +114,12 @@ impl ChordBlock {
     fn end(&self) -> f64 { self.start + self.dur }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+struct NoteId(u64);
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct Note {
+    id: NoteId,
     start: f64,
     pitch: u8,
     dur: f64,
@@ -421,8 +425,8 @@ fn scaled_velocity(vel: u8, track_vol: f32) -> u8 {
 #[derive(Clone, Debug, Default)]
 #[allow(dead_code)]
 struct Selection {
-    // (track_idx, note_idx) for regular notes
-    notes: HashSet<(usize, usize)>,
+    // (track_idx, note_id) for regular notes
+    notes: HashSet<(usize, NoteId)>,
     // block indices for Ch1
     blocks: HashSet<usize>,
 }
@@ -604,9 +608,17 @@ impl Project {
 
 fn expand_chords(proj: &Project) -> Vec<Note> {
     let mut out = vec![];
+    let mut next_id = 1u64;
     for b in &proj.chord_blocks {
         for p in proj.chord_pitches(b) {
-            out.push(Note { start: b.start, pitch: p, dur: b.dur, vel: 78 });
+            out.push(Note {
+                id: NoteId(next_id),
+                start: b.start,
+                pitch: p,
+                dur: b.dur,
+                vel: 78,
+            });
+            next_id += 1;
         }
     }
     out
@@ -794,6 +806,7 @@ fn parse_midi_track_notes(data: &[u8], paste_at: f64) -> Result<Vec<Note>, Strin
         let rel_start = (on.saturating_sub(min_tick)) as f64 / ppq;
         let dur = ((off.saturating_sub(on)) as f64 / ppq).max(0.0625);
         notes.push(Note {
+            id: NoteId(0),
             start: paste_at + rel_start,
             pitch,
             dur,
@@ -1067,6 +1080,7 @@ fn apply_melodic_pattern(
                 let t = tile + pn.start_beats;
                 if t >= range_start && t < range_end && t < block_end {
                     notes.push(Note {
+                        id: NoteId(0),
                         start: t,
                         pitch: melodic_pitch(pn.pitch, pattern.template_root, target_root),
                         dur: pn.dur_beats,
@@ -1089,6 +1103,7 @@ fn apply_drum_pattern(pattern: &LoadedPattern, range_start: f64, range_end: f64)
             let t = tile + pn.start_beats;
             if t >= range_start && t < range_end {
                 notes.push(Note {
+                    id: NoteId(0),
                     start: t,
                     pitch: pn.pitch,
                     dur: pn.dur_beats,
@@ -1134,6 +1149,7 @@ fn apply_melodic_block_range(
             let t = tile + pn.start_beats;
             if t >= range_start && t < range_end && t < block_end {
                 notes.push(Note {
+                    id: NoteId(0),
                     start: t,
                     pitch: melodic_pitch(pn.pitch, pattern.template_root, target_root),
                     dur: pn.dur_beats,
@@ -1199,6 +1215,7 @@ fn apply_syncopation_splice(
                 _ => pn.pitch,
             };
             notes.push(Note {
+                id: NoteId(0),
                 start: t,
                 pitch,
                 dur: pn.dur_beats.min(win_end - t).max(0.05),
@@ -1355,6 +1372,40 @@ struct ClipboardNotes {
     anchor_pitch: u8,
 }
 
+fn clipboard_anchor_from_notes(notes: &[Note]) -> (f64, u8) {
+    notes.iter().fold((f64::MAX, 0u8), |(min_start, anchor_pitch), note| {
+        if note.start < min_start {
+            (note.start, note.pitch)
+        } else {
+            (min_start, anchor_pitch)
+        }
+    })
+}
+
+fn build_pasted_notes(
+    cb: &ClipboardNotes,
+    paste_at: f64,
+    pitch_shift: i32,
+    base_id: NoteId,
+) -> Vec<Note> {
+    let mut next_id = base_id.0;
+    cb.notes
+        .iter()
+        .map(|n| {
+            let rel = n.start - cb.min_start;
+            let note = Note {
+                id: NoteId(next_id),
+                start: paste_at + rel,
+                pitch: (n.pitch as i32 + pitch_shift).clamp(0, 127) as u8,
+                dur: n.dur,
+                vel: n.vel,
+            };
+            next_id += 1;
+            note
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 struct ChordClipboard {
     blocks: Vec<ChordBlock>,
@@ -1417,7 +1468,7 @@ struct JpoApp {
     // interaction state
     /// Stable chord selection keyed by block start beat (survives sort_by).
     active_chord_beat: Option<f64>,
-    selected_note: Option<(usize, usize)>, // (track_idx, note_idx)
+    selected_note: Option<(usize, NoteId)>, // (track_idx, note_id)
 
     // New multi-selection (priority #2 editing foundation)
     selection: Selection,
@@ -1481,8 +1532,8 @@ struct JpoApp {
     gesture_undo_saved: bool,
     clipboard: Option<ClipboardNotes>,
     default_velocity: u8,
-    /// Per-note offsets during multi-note move (idx, start_delta, pitch_delta).
-    drag_sel_offsets: Vec<(usize, f64, i32)>,
+    /// Per-note offsets during multi-note move (note_id, start_delta, pitch_delta).
+    drag_sel_offsets: Vec<(NoteId, f64, i32)>,
     project_path: Option<std::path::PathBuf>,
 
     // Phase B — loop sketch model
@@ -1784,41 +1835,51 @@ impl JpoApp {
         }
     }
 
-    fn select_note_toggle(&mut self, track_idx: usize, note_idx: usize, shift: bool) {
+    fn next_note_id(&self) -> NoteId {
+        let mut max_id = 0u64;
+        for track in &self.proj.tracks {
+            for note in &track.notes {
+                max_id = max_id.max(note.id.0);
+            }
+        }
+        NoteId(max_id + 1)
+    }
+
+    fn select_note_toggle(&mut self, track_idx: usize, note_id: NoteId, shift: bool) {
         if shift {
-            if self.selection.notes.contains(&(track_idx, note_idx)) {
-                self.selection.notes.remove(&(track_idx, note_idx));
-                if self.selected_note == Some((track_idx, note_idx)) {
+            if self.selection.notes.contains(&(track_idx, note_id)) {
+                self.selection.notes.remove(&(track_idx, note_id));
+                if self.selected_note == Some((track_idx, note_id)) {
                     self.selected_note = self
                         .selection
                         .notes
                         .iter()
                         .filter(|&&(t, _)| t == track_idx)
-                        .min_by_key(|&&(_, i)| i)
+                        .min_by_key(|&(_, id)| id.0)
                         .copied();
                 }
             } else {
-                self.selection.notes.insert((track_idx, note_idx));
-                self.selected_note = Some((track_idx, note_idx));
+                self.selection.notes.insert((track_idx, note_id));
+                self.selected_note = Some((track_idx, note_id));
             }
         } else {
             self.selection.notes.clear();
-            self.selection.notes.insert((track_idx, note_idx));
-            self.selected_note = Some((track_idx, note_idx));
+            self.selection.notes.insert((track_idx, note_id));
+            self.selected_note = Some((track_idx, note_id));
         }
     }
 
     fn select_all_notes_in_track(&mut self, track_idx: usize) {
         self.selection.notes.clear();
-        for (i, _) in self.proj.tracks[track_idx].notes.iter().enumerate() {
-            self.selection.notes.insert((track_idx, i));
+        for note in &self.proj.tracks[track_idx].notes {
+            self.selection.notes.insert((track_idx, note.id));
         }
         self.selected_note = self
             .selection
             .notes
             .iter()
             .filter(|&&(t, _)| t == track_idx)
-            .min_by_key(|&&(_, i)| i)
+            .min_by_key(|&(_, id)| id.0)
             .copied();
     }
 
@@ -1836,14 +1897,14 @@ impl JpoApp {
         if self.selected_ch == 1 {
             return;
         }
-        let indices = self.selected_note_indices(t_idx);
-        if indices.is_empty() {
+        let ids = self.selected_note_ids(t_idx);
+        if ids.is_empty() {
             return;
         }
         self.begin_gesture_undo();
-        let mut updates: Vec<(usize, f64, u8)> = Vec::new();
-        for i in indices {
-            if let Some(n) = self.proj.tracks[t_idx].notes.get(i) {
+        let mut updates: Vec<(NoteId, f64, u8)> = Vec::new();
+        for id in ids {
+            if let Some(n) = self.proj.tracks[t_idx].notes.iter().find(|n| n.id == id) {
                 let start = if beat_delta.abs() > 0.0 {
                     self.snap_beat((n.start + beat_delta).max(0.0))
                 } else {
@@ -1854,11 +1915,11 @@ impl JpoApp {
                 } else {
                     n.pitch
                 };
-                updates.push((i, start, pitch));
+                updates.push((id, start, pitch));
             }
         }
-        for (i, start, pitch) in updates {
-            if let Some(n) = self.proj.tracks[t_idx].notes.get_mut(i) {
+        for (id, start, pitch) in updates {
+            if let Some(n) = self.proj.tracks[t_idx].notes.iter_mut().find(|n| n.id == id) {
                 n.start = start;
                 n.pitch = pitch;
             }
@@ -2097,7 +2158,7 @@ impl JpoApp {
         if self.selected_ch == 1 {
             return false;
         }
-        !self.selected_note_indices(self.track_idx()).is_empty()
+        !self.selected_note_ids(self.track_idx()).is_empty()
     }
 
     fn has_chord_selection(&self) -> bool {
@@ -2307,7 +2368,7 @@ impl JpoApp {
             let in_time = n.start <= max_b && n.end() >= min_b;
             let in_pitch = n.pitch >= min_p && n.pitch <= max_p;
             if in_time && in_pitch {
-                self.selection.notes.insert((t_idx, i));
+                self.selection.notes.insert((t_idx, n.id));
             }
         }
         self.selected_note = self
@@ -2315,7 +2376,7 @@ impl JpoApp {
             .notes
             .iter()
             .filter(|&&(t, _)| t == t_idx)
-            .min_by_key(|&&(_, i)| i)
+            .min_by_key(|&(_, id)| id)
             .copied();
     }
 
@@ -2629,6 +2690,7 @@ impl JpoApp {
                 let chords = Self::expand_sketch_chords(sketch);
                 for n in chords {
                     track_notes[0].push(Note {
+                        id: NoteId(0),
                         start: beat_offset + n.start,
                         pitch: n.pitch,
                         dur: n.dur,
@@ -2639,6 +2701,7 @@ impl JpoApp {
                     let ti = (tr.ch.saturating_sub(1)) as usize;
                     for n in &tr.notes {
                         track_notes[ti].push(Note {
+                            id: NoteId(0),
                             start: beat_offset + n.start,
                             pitch: n.pitch,
                             dur: n.dur,
@@ -2801,7 +2864,7 @@ impl JpoApp {
                 ui.label("Default");
                 ui.add(egui::DragValue::new(&mut self.default_velocity).speed(1).range(1..=127));
             });
-            let sel_count = self.selected_note_indices(self.track_idx()).len();
+            let sel_count = self.selected_note_ids(self.track_idx()).len();
             if sel_count > 0 && self.selected_ch != 1 {
                 let mut v = self.default_velocity;
                 ui.horizontal(|ui| {
@@ -2960,17 +3023,17 @@ impl JpoApp {
         }
     }
 
-    fn selected_note_indices(&self, track_idx: usize) -> Vec<usize> {
+    fn selected_note_ids(&self, track_idx: usize) -> Vec<NoteId> {
         if !self.selection.notes.is_empty() {
             self.selection
                 .notes
                 .iter()
                 .filter(|&&(t, _)| t == track_idx)
-                .map(|&(_, i)| i)
+                .map(|&(_, id)| id)
                 .collect()
-        } else if let Some((t, i)) = self.selected_note {
+        } else if let Some((t, id)) = self.selected_note {
             if t == track_idx {
-                vec![i]
+                vec![id]
             } else {
                 vec![]
             }
@@ -2984,23 +3047,20 @@ impl JpoApp {
         if self.selected_ch == 1 {
             return false;
         }
-        let indices = self.selected_note_indices(t_idx);
-        if indices.is_empty() {
+        let ids = self.selected_note_ids(t_idx);
+        if ids.is_empty() {
             return false;
         }
         let mut notes = Vec::new();
-        let mut min_start = f64::MAX;
-        let mut anchor_pitch = 60u8;
-        for &i in &indices {
-            if let Some(n) = self.proj.tracks[t_idx].notes.get(i) {
-                min_start = min_start.min(n.start);
-                anchor_pitch = n.pitch;
+        for id in &ids {
+            if let Some(n) = self.proj.tracks[t_idx].notes.iter().find(|n| &n.id == id) {
                 notes.push(*n);
             }
         }
         if notes.is_empty() {
             return false;
         }
+        let (min_start, anchor_pitch) = clipboard_anchor_from_notes(&notes);
         self.clipboard = Some(ClipboardNotes {
             notes,
             min_start,
@@ -3021,15 +3081,9 @@ impl JpoApp {
         let paste_at = self.snap_beat(self.current_beat.max(0.0));
         let pitch_base = self.last_mouse_pitch;
         let pitch_shift = pitch_base as i32 - cb.anchor_pitch as i32;
+        let pasted = build_pasted_notes(&cb, paste_at, pitch_shift, self.next_note_id());
         self.selection.notes.clear();
-        for n in &cb.notes {
-            let rel = n.start - cb.min_start;
-            let new_n = Note {
-                start: self.snap_beat(paste_at + rel),
-                pitch: (n.pitch as i32 + pitch_shift).clamp(0, 127) as u8,
-                dur: n.dur,
-                vel: n.vel,
-            };
+        for new_n in pasted {
             self.proj.tracks[t_idx].notes.push(new_n);
         }
         self.proj.tracks[t_idx].notes.sort_by(|a, b| {
@@ -3040,7 +3094,7 @@ impl JpoApp {
         });
         let start_len = self.proj.tracks[t_idx].notes.len() - cb.notes.len();
         for i in start_len..self.proj.tracks[t_idx].notes.len() {
-            self.selection.notes.insert((t_idx, i));
+            self.selection.notes.insert((t_idx, self.proj.tracks[t_idx].notes[i].id));
         }
         self.selected_note = self.selection.notes.iter().find(|&&(t, _)| t == t_idx).copied();
         self.end_gesture_undo();
@@ -3060,16 +3114,16 @@ impl JpoApp {
         if self.selected_ch == 1 {
             return;
         }
-        let indices = self.selected_note_indices(t_idx);
-        if indices.is_empty() {
+        let ids = self.selected_note_ids(t_idx);
+        if ids.is_empty() {
             return;
         }
         self.begin_gesture_undo();
-        for i in indices {
-            if let Some(n) = self.proj.tracks[t_idx].notes.get(i) {
+        for id in ids {
+            if let Some(n) = self.proj.tracks[t_idx].notes.iter().find(|n| n.id == id) {
                 let snapped_start = self.snap_beat(n.start);
                 let snapped_dur = self.snap_dur(n.dur);
-                if let Some(nn) = self.proj.tracks[t_idx].notes.get_mut(i) {
+                if let Some(nn) = self.proj.tracks[t_idx].notes.iter_mut().find(|n| n.id == id) {
                     nn.start = snapped_start;
                     nn.dur = snapped_dur;
                 }
@@ -3080,13 +3134,13 @@ impl JpoApp {
 
     fn apply_velocity_to_selection(&mut self, vel: u8) {
         let t_idx = self.track_idx();
-        let indices = self.selected_note_indices(t_idx);
-        if indices.is_empty() {
+        let ids = self.selected_note_ids(t_idx);
+        if ids.is_empty() {
             return;
         }
         self.begin_gesture_undo();
-        for i in indices {
-            if let Some(n) = self.proj.tracks[t_idx].notes.get_mut(i) {
+        for id in ids {
+            if let Some(n) = self.proj.tracks[t_idx].notes.iter_mut().find(|n| n.id == id) {
                 n.vel = vel;
             }
         }
@@ -3204,6 +3258,7 @@ impl JpoApp {
     fn place_piano_note_at(&mut self, track_idx: usize, beat: f64, pitch: u8) {
         self.begin_gesture_undo();
         let new_n = Note {
+            id: self.next_note_id(),
             start: self.snap_beat(beat),
             pitch: pitch.clamp(0, 127),
             dur: self.note_len,
@@ -3218,8 +3273,8 @@ impl JpoApp {
         });
         let new_idx = self.proj.tracks[track_idx].notes.len() - 1;
         self.selection.notes.clear();
-        self.selection.notes.insert((track_idx, new_idx));
-        self.selected_note = Some((track_idx, new_idx));
+        self.selection.notes.insert((track_idx, new_n.id));
+        self.selected_note = Some((track_idx, new_n.id));
         self.note_drag_kind = NoteDragKind::None;
         self.end_gesture_undo();
         self.preview_note(
@@ -3233,27 +3288,21 @@ impl JpoApp {
     fn delete_selected_notes(&mut self) {
         self.begin_gesture_undo();
         if !self.selection.notes.is_empty() {
-            let mut by_track: std::collections::HashMap<usize, Vec<usize>> =
+            let mut by_track: std::collections::HashMap<usize, Vec<NoteId>> =
                 std::collections::HashMap::new();
-            for &(t, i) in &self.selection.notes {
-                by_track.entry(t).or_default().push(i);
+            for &(t, id) in &self.selection.notes {
+                by_track.entry(t).or_default().push(id);
             }
-            for (t, mut indices) in by_track {
-                indices.sort_unstable_by(|a, b| b.cmp(a));
-                for i in indices {
-                    if t < self.proj.tracks.len() && i < self.proj.tracks[t].notes.len() {
-                        self.proj.tracks[t].notes.remove(i);
-                    }
+            for (t, ids) in by_track {
+                if t < self.proj.tracks.len() {
+                    self.proj.tracks[t].notes.retain(|n| !ids.contains(&n.id));
                 }
             }
             self.selection.notes.clear();
             self.selected_note = None;
-        } else if let Some((t, i)) = self.selected_note {
-            if t < self.proj.tracks.len()
-                && i < self.proj.tracks[t].notes.len()
-                && self.proj.tracks[t].ch != 1
-            {
-                self.proj.tracks[t].notes.remove(i);
+        } else if let Some((t, id)) = self.selected_note {
+            if t < self.proj.tracks.len() && self.proj.tracks[t].ch != 1 {
+                self.proj.tracks[t].notes.retain(|n| n.id != id);
                 self.selected_note = None;
             }
         }
@@ -3368,6 +3417,40 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(JpoApp::default()))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_anchor_uses_the_earliest_note() {
+        let notes = vec![
+            Note { id: NoteId(1), start: 2.0, pitch: 70, dur: 1.0, vel: 90 },
+            Note { id: NoteId(2), start: 4.0, pitch: 80, dur: 1.0, vel: 90 },
+        ];
+        let (min_start, anchor_pitch) = clipboard_anchor_from_notes(&notes);
+        assert_eq!(min_start, 2.0);
+        assert_eq!(anchor_pitch, 70);
+    }
+
+    #[test]
+    fn pasted_notes_preserve_source_pitches_when_no_transpose_is_requested() {
+        let cb = ClipboardNotes {
+            notes: vec![
+                Note { id: NoteId(1), start: 1.0, pitch: 64, dur: 0.5, vel: 90 },
+                Note { id: NoteId(2), start: 2.0, pitch: 67, dur: 0.5, vel: 95 },
+            ],
+            min_start: 1.0,
+            anchor_pitch: 64,
+        };
+        let pasted = build_pasted_notes(&cb, 8.0, 0, NoteId(100));
+        assert_eq!(pasted.len(), 2);
+        assert_eq!(pasted[0].start, 8.0);
+        assert_eq!(pasted[0].pitch, 64);
+        assert_eq!(pasted[1].start, 9.0);
+        assert_eq!(pasted[1].pitch, 67);
+    }
 }
 
 impl eframe::App for JpoApp {
@@ -4342,8 +4425,8 @@ impl JpoApp {
             let y0 = rect.min.y + (norm_top * h) as f32;
             let y1 = rect.min.y + (norm_bot * h) as f32;
 
-            let is_single_sel = self.selected_note.map_or(false, |(_, idx)| idx == i);
-            let is_multi_sel = self.selection.notes.contains(&(track_idx, i));
+            let is_single_sel = self.selected_note.map_or(false, |(_, id)| n.id == id);
+            let is_multi_sel = self.selection.notes.contains(&(track_idx, n.id));
             let sel = is_single_sel || is_multi_sel;
             let col = self.note_fill_color(n.vel, sel, is_ch1);
             painter.rect_filled(Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)), 2.0, col);
@@ -4441,14 +4524,16 @@ impl JpoApp {
                             self.end_gesture_undo();
                         } else if !should_delete && self.edit_mode == EditMode::Pencil {
                             if resp.clicked() && !resp.dragged() && shift {
-                                self.select_note_toggle(track_idx, i, true);
+                                let hit_note_id = self.proj.tracks[track_idx].notes.get(i).map(|note| note.id).unwrap_or_else(|| self.next_note_id());
+                                self.select_note_toggle(track_idx, hit_note_id, true);
                             } else {
                                 self.box_select_start_beat = None;
                                 self.box_select_start_pitch = None;
-                                if !(resp.drag_started() && self.selection.notes.contains(&(track_idx, i))) {
-                                    self.select_note_toggle(track_idx, i, false);
-                                }
-                                let n = &self.proj.tracks[track_idx].notes[i];
+                                let hit_note_id = self.proj.tracks[track_idx].notes.get(i).map(|note| note.id).unwrap_or_else(|| self.next_note_id());
+                        if !(resp.drag_started() && self.selection.notes.contains(&(track_idx, hit_note_id))) {
+                            self.select_note_toggle(track_idx, hit_note_id, false);
+                        }
+                        let n = &self.proj.tracks[track_idx].notes[i];
                                 self.drag_orig = (n.start, n.pitch, n.dur);
                                 self.drag_start_beat = beat;
                                 self.drag_start_pitch = pitch;
@@ -4461,24 +4546,23 @@ impl JpoApp {
                                 } else {
                                     NoteDragKind::Move
                                 };
-                                let is_multi = self.selection.notes.contains(&(track_idx, i));
+                                let is_multi = self.selection.notes.contains(&(track_idx, n.id));
                                 if is_multi {
                                     self.drag_sel_offsets = self
                                         .selection
                                         .notes
                                         .iter()
                                         .filter(|&&(t, _)| t == track_idx)
-                                        .map(|&(_, idx)| {
-                                            let nn = &self.proj.tracks[track_idx].notes[idx];
-                                            (
-                                                idx,
-                                                nn.start - n.start,
-                                                nn.pitch as i32 - n.pitch as i32,
-                                            )
+                                        .filter_map(|&(_, id)| {
+                                            self.proj.tracks[track_idx]
+                                                .notes
+                                                .iter()
+                                                .find(|note| note.id == id)
+                                                .map(|nn| (id, nn.start - n.start, nn.pitch as i32 - n.pitch as i32))
                                         })
                                         .collect();
                                 } else {
-                                    self.drag_sel_offsets = vec![(i, 0.0, 0)];
+                                    self.drag_sel_offsets = vec![(n.id, 0.0, 0)];
                                 }
                             }
                         }
@@ -4491,6 +4575,7 @@ impl JpoApp {
                             let snapped = self.snap_beat(beat);
                             let dur = self.snap_dur(self.note_len.max(0.0625));
                             let new_n = Note {
+                                id: self.next_note_id(),
                                 start: snapped,
                                 pitch: pitch.clamp(0, 127),
                                 dur,
@@ -4505,13 +4590,13 @@ impl JpoApp {
                             });
                             let new_idx = self.proj.tracks[track_idx].notes.len() - 1;
                             self.selection.notes.clear();
-                            self.selection.notes.insert((track_idx, new_idx));
-                            self.selected_note = Some((track_idx, new_idx));
+                            self.selection.notes.insert((track_idx, new_n.id));
+                            self.selected_note = Some((track_idx, new_n.id));
                             self.drag_orig = (snapped, pitch, dur);
                             self.drag_start_beat = beat;
                             self.drag_start_pitch = pitch;
                             self.note_drag_kind = NoteDragKind::Create;
-                            self.drag_sel_offsets = vec![(new_idx, 0.0, 0)];
+                            self.drag_sel_offsets = vec![(new_n.id, 0.0, 0)];
                             self.is_creating = true;
                             self.preview_note(
                                 self.selected_ch,
@@ -4536,26 +4621,32 @@ impl JpoApp {
                                 NoteDragKind::Create | NoteDragKind::Resize => {
                                     let new_dur = self.snap_dur((self.drag_orig.2 + db).max(0.0625));
                                     for &(sni, _, _) in &self.drag_sel_offsets {
-                                        if sni < self.proj.tracks[track_idx].notes.len() {
-                                            self.proj.tracks[track_idx].notes[sni].dur = new_dur;
+                                        if let Some(note) = self.proj.tracks[track_idx].notes.iter_mut().find(|note| note.id == sni) {
+                                            note.dur = new_dur;
                                         }
                                     }
                                 }
                                 NoteDragKind::Move => {
                                     let new_start = self.snap_beat((self.drag_orig.0 + db).max(0.0));
                                     let new_pitch = (self.drag_orig.1 as i32 + dp).clamp(0, 127) as u8;
+                                    let mut updates: Vec<(NoteId, f64, u8)> = Vec::new();
                                     for &(sni, ds, dpp) in &self.drag_sel_offsets {
-                                        if sni < self.proj.tracks[track_idx].notes.len() {
+                                        if let Some(note) = self.proj.tracks[track_idx].notes.iter().find(|note| note.id == sni) {
                                             let snapped = self.snap_beat((new_start + ds).max(0.0));
                                             let p = (new_pitch as i32 + dpp).clamp(0, 127) as u8;
-                                            self.proj.tracks[track_idx].notes[sni].start = snapped;
-                                            self.proj.tracks[track_idx].notes[sni].pitch = p;
+                                            updates.push((sni, snapped, p));
+                                        }
+                                    }
+                                    for (sni, snapped, p) in updates {
+                                        if let Some(note) = self.proj.tracks[track_idx].notes.iter_mut().find(|note| note.id == sni) {
+                                            note.start = snapped;
+                                            note.pitch = p;
                                         }
                                     }
                                     if self.last_move_preview_pitch != Some(new_pitch) {
                                         self.last_move_preview_pitch = Some(new_pitch);
                                         let patch = self.proj.tracks[track_idx].patch;
-                                        let vel = self.proj.tracks[track_idx].notes[ni].vel;
+                                        let vel = self.proj.tracks[track_idx].notes.iter().find(|note| note.id == ni).map(|n| n.vel).unwrap_or(self.default_velocity);
                                         self.preview_note(self.selected_ch, patch, new_pitch, vel);
                                     }
                                 }
@@ -4931,14 +5022,14 @@ mod generate_tests {
     #[test]
     fn replace_notes_in_range_removes_overlap_only() {
         let mut notes = vec![
-            Note { start: 0.0, pitch: 60, dur: 1.0, vel: 90 },
-            Note { start: 8.0, pitch: 62, dur: 1.0, vel: 90 },
+            Note { id: NoteId(1), start: 0.0, pitch: 60, dur: 1.0, vel: 90 },
+            Note { id: NoteId(2), start: 8.0, pitch: 62, dur: 1.0, vel: 90 },
         ];
         replace_notes_in_range(
             &mut notes,
             0.0,
             4.0,
-            vec![Note { start: 0.0, pitch: 64, dur: 1.0, vel: 90 }],
+            vec![Note { id: NoteId(1), start: 0.0, pitch: 64, dur: 1.0, vel: 90 }],
         );
         assert_eq!(notes.len(), 2);
         assert_eq!(notes[0].pitch, 64);
