@@ -21,6 +21,7 @@ use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
 const PPQ: u16 = 480;
 const SYNCOPATION_WINDOW_BEATS: f64 = 2.0;
+const SYNCOPATION_MIN_REFILL_BEATS: f64 = 1.5;
 
 const PITCH_CLASS_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
@@ -817,6 +818,104 @@ fn parse_midi_track_notes(data: &[u8], paste_at: f64) -> Result<Vec<Note>, Strin
     Ok(notes)
 }
 
+/// Parse all notes on a 1-based MIDI channel (Ch2=2, Ch10=10) from a multi-track SMF.
+fn parse_midi_channel_notes(data: &[u8], ch: u8) -> Result<Vec<Note>, String> {
+    let smf = Smf::parse(data).map_err(|e| format!("MIDI parse: {e}"))?;
+    let ppq = match smf.header.timing {
+        midly::Timing::Metrical(t) => t.as_int() as f64,
+        _ => PPQ as f64,
+    };
+    let midi_ch = ch.saturating_sub(1);
+
+    let mut pairs: Vec<(u32, u32, u8, u8)> = Vec::new();
+    for track in &smf.tracks {
+        let mut abs_tick = 0u32;
+        let mut cur_channel = 0u8;
+        let mut active: std::collections::HashMap<u8, (u32, u8)> =
+            std::collections::HashMap::new();
+        for ev in track {
+            abs_tick = abs_tick.saturating_add(ev.delta.as_int());
+            if let TrackEventKind::Midi { channel, message } = &ev.kind {
+                cur_channel = channel.as_int();
+                if cur_channel != midi_ch {
+                    continue;
+                }
+                match message {
+                    MidiMessage::NoteOn { key, vel } if vel.as_int() > 0 => {
+                        active.insert(key.as_int(), (abs_tick, vel.as_int()));
+                    }
+                    MidiMessage::NoteOn { key, .. } | MidiMessage::NoteOff { key, .. } => {
+                        if let Some((on_tick, vel)) = active.remove(&key.as_int()) {
+                            pairs.push((on_tick, abs_tick, key.as_int(), vel));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if pairs.is_empty() {
+        return Err(format!("MIDI Ch{ch}: no notes found"));
+    }
+
+    let mut notes = Vec::new();
+    for (on, off, pitch, vel) in pairs {
+        let start = on as f64 / ppq;
+        let dur = ((off.saturating_sub(on)) as f64 / ppq).max(0.05);
+        notes.push(Note {
+            id: NoteId(0),
+            start,
+            pitch,
+            dur,
+            vel,
+        });
+    }
+    notes.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap()
+            .then(a.pitch.cmp(&b.pitch))
+    });
+    Ok(notes)
+}
+
+fn note_time_events(notes: &[Note]) -> Vec<(f64, f64)> {
+    let mut ev: Vec<(f64, f64)> = notes
+        .iter()
+        .map(|n| {
+            let s = (n.start * 100.0).round() / 100.0;
+            let d = (n.dur * 100.0).round() / 100.0;
+            (s, d)
+        })
+        .collect();
+    ev.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap()));
+    ev
+}
+
+fn time_events_match(a: &[Note], b: &[Note], tol: f64) -> bool {
+    let ea = note_time_events(a);
+    let eb = note_time_events(b);
+    if ea.len() != eb.len() {
+        return false;
+    }
+    ea.iter()
+        .zip(eb.iter())
+        .all(|((as_, ad), (bs, bd))| (as_ - bs).abs() <= tol && (ad - bd).abs() <= tol)
+}
+
+fn count_temporal_overlaps(notes: &[Note]) -> usize {
+    let mut n = 0usize;
+    for i in 0..notes.len() {
+        for j in (i + 1)..notes.len() {
+            if notes[i].start < notes[j].end() - 0.001 && notes[j].start < notes[i].end() - 0.001 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 // === PATTERN ENGINE ===
 // Key-C MIDI templates from assets/patterns — tiled per chord block (melodic) or range (drums).
 
@@ -841,6 +940,8 @@ struct LoadedPattern {
     category: PatternCategory,
     length_beats: f64,
     template_root: u8,
+    /// BPM the pattern MIDI was authored at (default 120).
+    reference_bpm: f64,
     notes: Vec<PatternNote>,
 }
 
@@ -990,20 +1091,75 @@ fn parse_pattern_midi(
         ((span_end / 4.0).ceil() * 4.0).max(2.0)
     };
 
+    let reference_bpm = extract_reference_bpm(&smf);
+
     Ok(LoadedPattern {
         id: id.to_string(),
         category,
         length_beats,
         template_root,
+        reference_bpm,
         notes,
     })
 }
 
-// UPDATE-ROADMAP: Phase C-1 — replace melodic_pitch with map_pattern_pitch (pitch-class fold).
-// See HANDOVER.md「ピッチマッピング」: C..D# up, E..B down; Bass clamp 28-52, Piano 48-72.
-fn melodic_pitch(pattern_pitch: u8, pattern_template: u8, target_root: u8) -> u8 {
-    (pattern_pitch as i32 - pattern_template as i32 + target_root as i32)
-        .clamp(0, 127) as u8
+fn extract_reference_bpm(smf: &Smf) -> f64 {
+    for track in &smf.tracks {
+        for ev in track {
+            if let TrackEventKind::Meta(MetaMessage::Tempo(us)) = &ev.kind {
+                let micros = u32::from(*us);
+                if micros > 0 {
+                    return 60_000_000.0 / micros as f64;
+                }
+            }
+        }
+    }
+    120.0
+}
+
+/// Pattern notes are stored in beat units; project BPM affects playback, not beat-grid duration.
+fn pattern_time_scale(_pattern: &LoadedPattern, _proj: &Project) -> f64 {
+    1.0
+}
+
+/// Parallel transpose: preserve pattern voicing intervals from template key.
+fn melodic_pitch(pattern_pitch: u8, template_root: u8, target_root: u8) -> u8 {
+    (pattern_pitch as i32 + target_root as i32 - template_root as i32).clamp(0, 127) as u8
+}
+
+/// Pitch-class fold: C..D# keep upper octave (+0..+3), E..B fold down (-12..-5).
+fn map_pattern_pitch(
+    pattern_pitch: u8,
+    pattern_template: u8,
+    chord_root: u8,
+    clamp_min: u8,
+    clamp_max: u8,
+) -> u8 {
+    let interval = pattern_pitch as i32 - pattern_template as i32;
+    let rel = interval.rem_euclid(12);
+    let folded = if rel <= 3 { rel } else { rel - 12 };
+    (chord_root as i32 + folded)
+        .clamp(clamp_min as i32, clamp_max as i32) as u8
+}
+
+fn melodic_mapped_pitch(
+    pattern: &LoadedPattern,
+    pattern_pitch: u8,
+    proj: &Project,
+    block: &ChordBlock,
+) -> u8 {
+    match pattern.category {
+        PatternCategory::Drum => pattern_pitch,
+        PatternCategory::Piano => {
+            let target = proj.degree_root(block.degree, 3);
+            melodic_pitch(pattern_pitch, pattern.template_root, target)
+                .clamp(36, 96)
+        }
+        PatternCategory::Bass => {
+            let chord_root = proj.degree_root(block.degree, 2);
+            map_pattern_pitch(pattern_pitch, pattern.template_root, chord_root, 28, 52)
+        }
+    }
 }
 
 fn pattern_tile_at(fill_start: f64, origin: f64, pat_len: f64) -> f64 {
@@ -1029,6 +1185,25 @@ fn dedupe_notes(notes: &mut Vec<Note>) {
     notes.dedup_by(|a, b| (a.start - b.start).abs() < 0.02 && a.pitch == b.pitch);
 }
 
+/// At each onset, keep one note per pitch class (highest velocity wins).
+fn trim_piano_pitch_class_dupes(notes: &mut Vec<Note>) {
+    if notes.is_empty() {
+        return;
+    }
+    let mut sorted: Vec<Note> = notes.drain(..).collect();
+    sorted.sort_by(|a, b| {
+        let as_ = (a.start * 100.0).round() as i64;
+        let bs = (b.start * 100.0).round() as i64;
+        as_.cmp(&bs)
+            .then((a.pitch % 12).cmp(&(b.pitch % 12)))
+            .then(b.vel.cmp(&a.vel))
+    });
+    sorted.dedup_by(|a, b| {
+        (a.start * 100.0).round() == (b.start * 100.0).round() && a.pitch % 12 == b.pitch % 12
+    });
+    *notes = sorted;
+}
+
 fn replace_notes_in_range(notes: &mut Vec<Note>, range_start: f64, range_end: f64, mut new_notes: Vec<Note>) {
     notes.retain(|n| !note_overlaps_range(n, range_start, range_end));
     dedupe_notes(&mut new_notes);
@@ -1048,11 +1223,20 @@ fn chord_block_at<'a>(blocks: &'a [ChordBlock], beat: f64) -> Option<&'a ChordBl
         })
 }
 
+fn syncopation_window_len(block_dur: f64) -> f64 {
+    SYNCOPATION_WINDOW_BEATS
+        .min(block_dur - SYNCOPATION_MIN_REFILL_BEATS)
+        .max(0.5)
+}
+
 fn syncopation_windows(proj: &Project, s: f64, e: f64) -> Vec<(f64, f64)> {
     proj.chord_blocks
         .iter()
         .filter(|b| b.syncopation_fill && b.end() > s && b.start < e)
-        .map(|b| (b.start, (b.start + SYNCOPATION_WINDOW_BEATS).min(e)))
+        .map(|b| {
+            let win_len = syncopation_window_len(b.dur);
+            (b.start, (b.start + win_len).min(e))
+        })
         .collect()
 }
 
@@ -1063,19 +1247,14 @@ fn apply_melodic_pattern(
     range_end: f64,
 ) -> Vec<Note> {
     let mut notes = Vec::new();
-    let ref_octave = match pattern.category {
-        PatternCategory::Piano => 3,
-        PatternCategory::Bass => 3,
-        PatternCategory::Drum => 3,
-    };
+    let dur_scale = pattern_time_scale(pattern, proj);
+    let pat_len = pattern.length_beats.max(0.25);
 
     for block in &proj.chord_blocks {
         if block.end() <= range_start || block.start >= range_end {
             continue;
         }
-        let target_root = proj.degree_root(block.degree, ref_octave);
         let block_end = block.end().min(range_end);
-        let pat_len = pattern.length_beats.max(0.25);
         let mut tile = pattern_tile_at(range_start, block.start, pat_len);
         while tile < block_end {
             for pn in &pattern.notes {
@@ -1084,8 +1263,8 @@ fn apply_melodic_pattern(
                     notes.push(Note {
                         id: NoteId(0),
                         start: t,
-                        pitch: melodic_pitch(pn.pitch, pattern.template_root, target_root),
-                        dur: pn.dur_beats,
+                        pitch: melodic_mapped_pitch(pattern, pn.pitch, proj, block),
+                        dur: (pn.dur_beats * dur_scale).max(0.05),
                         vel: pn.vel,
                     });
                 }
@@ -1096,8 +1275,14 @@ fn apply_melodic_pattern(
     notes
 }
 
-fn apply_drum_pattern(pattern: &LoadedPattern, range_start: f64, range_end: f64) -> Vec<Note> {
+fn apply_drum_pattern(
+    pattern: &LoadedPattern,
+    proj: &Project,
+    range_start: f64,
+    range_end: f64,
+) -> Vec<Note> {
     let mut notes = Vec::new();
+    let dur_scale = pattern_time_scale(pattern, proj);
     let len = pattern.length_beats.max(0.25);
     let mut tile = (range_start / len).floor() * len;
     while tile < range_end {
@@ -1108,7 +1293,7 @@ fn apply_drum_pattern(pattern: &LoadedPattern, range_start: f64, range_end: f64)
                     id: NoteId(0),
                     start: t,
                     pitch: pn.pitch,
-                    dur: pn.dur_beats,
+                    dur: (pn.dur_beats * dur_scale).max(0.05),
                     vel: pn.vel,
                 });
             }
@@ -1137,12 +1322,7 @@ fn apply_melodic_block_range(
     range_end: f64,
 ) -> Vec<Note> {
     let mut notes = Vec::new();
-    let ref_octave = match pattern.category {
-        PatternCategory::Piano => 3,
-        PatternCategory::Bass => 3,
-        PatternCategory::Drum => 3,
-    };
-    let target_root = proj.degree_root(block.degree, ref_octave);
+    let dur_scale = pattern_time_scale(pattern, proj);
     let block_end = block.end().min(range_end);
     let pat_len = pattern.length_beats.max(0.25);
     let mut tile = pattern_tile_at(range_start, block.start, pat_len);
@@ -1153,8 +1333,8 @@ fn apply_melodic_block_range(
                 notes.push(Note {
                     id: NoteId(0),
                     start: t,
-                    pitch: melodic_pitch(pn.pitch, pattern.template_root, target_root),
-                    dur: pn.dur_beats,
+                    pitch: melodic_mapped_pitch(pattern, pn.pitch, proj, block),
+                    dur: (pn.dur_beats * dur_scale).max(0.05),
                     vel: pn.vel,
                 });
             }
@@ -1184,7 +1364,7 @@ fn refill_after_sync_windows(
         }
         notes.retain(|n| !note_overlaps_range(n, fill_start, fill_end));
         let added = match pattern.category {
-            PatternCategory::Drum => apply_drum_pattern(pattern, fill_start, fill_end),
+            PatternCategory::Drum => apply_drum_pattern(pattern, proj, fill_start, fill_end),
             _ => apply_melodic_block_range(pattern, proj, block, fill_start, fill_end),
         };
         notes.extend(added);
@@ -1197,30 +1377,25 @@ fn apply_syncopation_splice(
     proj: &Project,
     windows: &[(f64, f64)],
 ) {
+    let dur_scale = pattern_time_scale(sync_pattern, proj);
     for &(win_start, win_end) in windows {
         let block = chord_block_at(&proj.chord_blocks, win_start);
-        let ref_octave = match sync_pattern.category {
-            PatternCategory::Piano => 3,
-            PatternCategory::Bass => 3,
-            _ => 3,
-        };
-        let target_root = block.map(|b| proj.degree_root(b.degree, ref_octave));
 
         for pn in &sync_pattern.notes {
             let t = win_start + pn.start_beats;
             if t >= win_end {
                 continue;
             }
-            let pitch = match (sync_pattern.category, target_root) {
+            let pitch = match (sync_pattern.category, block) {
                 (PatternCategory::Drum, _) => pn.pitch,
-                (_, Some(root)) => melodic_pitch(pn.pitch, sync_pattern.template_root, root),
+                (_, Some(b)) => melodic_mapped_pitch(sync_pattern, pn.pitch, proj, b),
                 _ => pn.pitch,
             };
             notes.push(Note {
                 id: NoteId(0),
                 start: t,
                 pitch,
-                dur: pn.dur_beats.min(win_end - t).max(0.05),
+                dur: (pn.dur_beats * dur_scale).min(win_end - t).max(0.05),
                 vel: pn.vel,
             });
         }
@@ -1248,7 +1423,7 @@ fn generate_from_patterns(
         .map(|p| apply_melodic_pattern(p, proj, range_start, range_end))
         .unwrap_or_default();
     let mut drums = drum_pat
-        .map(|p| apply_drum_pattern(p, range_start, range_end))
+        .map(|p| apply_drum_pattern(p, proj, range_start, range_end))
         .unwrap_or_default();
 
     if syncopation_fill {
@@ -1299,6 +1474,10 @@ fn generate_from_patterns(
         }
     }
 
+    trim_piano_pitch_class_dupes(&mut piano);
+    dedupe_notes(&mut piano);
+    dedupe_notes(&mut bass);
+    dedupe_notes(&mut drums);
     (piano, bass, drums)
 }
 
@@ -1371,6 +1550,42 @@ enum ChordDragKind { None, Move, Resize }
 
 /// Trackpad taps often register as micro-drags; slop in pixels for tap-vs-drag.
 const POINTER_SLOP_PX: f32 = 8.0;
+
+/// Windows often sends logical `Key::Copy` / `Paste` instead of `Key::C` / `Key::V`.
+fn edit_clipboard_shortcut(i: &egui::InputState, letter: egui::Key, action: egui::Key) -> bool {
+    let from_events = i.events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.ctrl && (key == &letter || key == &action)
+        )
+    });
+    if from_events {
+        return true;
+    }
+    i.modifiers.ctrl && (i.key_pressed(letter) || i.key_pressed(action))
+}
+
+fn consume_edit_clipboard_shortcut(i: &mut egui::InputState, letter: egui::Key, action: egui::Key) {
+    if !i.modifiers.ctrl {
+        return;
+    }
+    let letter_sc = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, letter);
+    let action_sc = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, action);
+    i.consume_shortcut(&letter_sc);
+    i.consume_shortcut(&action_sc);
+    let ctrl = egui::Modifiers::CTRL;
+    if i.key_pressed(letter) {
+        i.consume_key(ctrl, letter);
+    }
+    if i.key_pressed(action) {
+        i.consume_key(ctrl, action);
+    }
+}
 
 #[derive(Clone, Debug)]
 struct ClipboardNotes {
@@ -1556,6 +1771,8 @@ struct JpoApp {
     bass_pattern_id: String,
     drum_pattern_id: String,
     syncopation_fill: bool,
+    /// Dry-run output from Preview (Tab2); cleared on Generate All.
+    gen_preview: Option<(Vec<Note>, Vec<Note>, Vec<Note>)>,
 
     // Phase C — arrange
     active_tab: AppTab,
@@ -1564,6 +1781,8 @@ struct JpoApp {
     /// Short UI feedback (copy/paste etc.)
     status_toast: Option<String>,
     status_toast_until: f64,
+    /// Persistent last edit action (Tab3) — also echoed to stderr for cargo run debugging.
+    edit_status: String,
 
     /// True after interacting with the piano roll (Edit tab only).
     piano_roll_focused: bool,
@@ -1634,10 +1853,12 @@ impl Default for JpoApp {
             bass_pattern_id: "Bass8beat01".to_string(),
             drum_pattern_id: "Drum8beat_01".to_string(),
             syncopation_fill: true,
+            gen_preview: None,
             active_tab: AppTab::Chord,
             arrange_sequence: vec![ArrangeSlot { bank_idx: 0, repeats: 1 }],
             status_toast: None,
             status_toast_until: 0.0,
+            edit_status: String::new(),
             piano_roll_focused: false,
             grok_import_mode: GrokImportMode::NaturalLanguage,
             grok_paste_text: String::new(),
@@ -1661,11 +1882,12 @@ impl JpoApp {
         self.drag_sel_offsets.clear();
     }
 
-    fn switch_tab(&mut self, tab: AppTab) {
+    fn switch_tab(&mut self, ctx: &egui::Context, tab: AppTab) {
         self.active_tab = tab;
         self.piano_roll_focused = false;
         self.clear_interaction_state();
         if tab == AppTab::Edit {
+            ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("grok_nl_text")));
             self.edit_mode = EditMode::Select;
             if self.selected_ch == 1 {
                 self.selected_ch = 2;
@@ -1741,7 +1963,7 @@ impl JpoApp {
         }
     }
 
-    fn show_grok_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn show_grok_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, allow_nl_text_input: bool) {
         ui.label(egui::RichText::new("Grok import").strong());
         ui.horizontal(|ui| {
             ui.selectable_value(
@@ -1758,11 +1980,21 @@ impl JpoApp {
                         .small()
                         .weak(),
                 );
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.grok_paste_text)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY),
-                );
+                if allow_nl_text_input {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.grok_paste_text)
+                            .id(egui::Id::new("grok_nl_text"))
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("NL editor is on Tab1 only — Ctrl+C/V here edits MIDI notes")
+                            .small()
+                            .weak(),
+                    );
+                }
+                if allow_nl_text_input {
                 ui.horizontal(|ui| {
                     if ui.button("Apply at playhead").clicked() {
                         self.apply_grok_natural_language(ctx);
@@ -1780,6 +2012,7 @@ impl JpoApp {
                         self.show_toast(ctx, "Prompt copied");
                     }
                 });
+                }
             }
             GrokImportMode::MidiFile => {
                 ui.label(
@@ -1957,10 +2190,41 @@ impl JpoApp {
         self.end_gesture_undo();
     }
 
-    /// Tab3 (Ch2–16) only — clipboard and nudge shortcuts.
-    fn handle_edit_shortcuts(&mut self, ctx: &egui::Context, i: &mut egui::InputState) {
+    fn try_paste_notes(&mut self, ctx: &egui::Context) -> bool {
         if self.active_tab != AppTab::Edit || self.selected_ch == 1 {
-            return;
+            self.show_edit_feedback(
+                ctx,
+                format!("Paste blocked — select Ch2–16 (now Ch{})", self.selected_ch),
+            );
+            return false;
+        }
+        let Some(cb) = self.clipboard.as_ref() else {
+            self.show_edit_feedback(ctx, "Paste blocked — copy notes first (Ctrl+C)");
+            return false;
+        };
+        let count = cb.notes.len();
+        let beat = self.snap_beat(self.current_beat.max(0.0));
+        let ch = self.selected_ch;
+        let t_idx = self.track_idx();
+        let before = self.proj.tracks[t_idx].notes.len();
+        if !self.paste_clipboard() {
+            self.show_edit_feedback(ctx, "Paste failed");
+            return false;
+        }
+        let after = self.proj.tracks[t_idx].notes.len();
+        self.show_edit_feedback(
+            ctx,
+            format!(
+                "Pasted {count} note(s) at beat {beat:.2} on Ch{ch} ({before}→{after} notes)"
+            ),
+        );
+        true
+    }
+
+    /// Tab3 (Ch2–16) only — clipboard and nudge shortcuts. Returns true if a shortcut fired.
+    fn handle_edit_shortcuts(&mut self, ctx: &egui::Context, i: &mut egui::InputState) -> bool {
+        if self.active_tab != AppTab::Edit || self.selected_ch == 1 {
+            return false;
         }
 
         let ctrl = i.modifiers.ctrl;
@@ -1968,65 +2232,65 @@ impl JpoApp {
         if ctrl && i.key_pressed(egui::Key::A) {
             self.select_all_notes_in_track(self.track_idx());
             i.consume_key(egui::Modifiers::CTRL, egui::Key::A);
-            return;
+            return true;
         }
 
-        if ctrl && i.key_pressed(egui::Key::C) {
+        if edit_clipboard_shortcut(i, egui::Key::C, egui::Key::Copy) {
             if self.has_note_selection() {
                 if self.copy_selection() {
-                    self.show_toast(ctx, "Copied notes");
+                    let n = self.clipboard.as_ref().map(|c| c.notes.len()).unwrap_or(0);
+                    self.show_edit_feedback(ctx, format!("Copied {n} note(s)"));
                 } else {
-                    self.show_toast(ctx, "Nothing to copy");
+                    self.show_edit_feedback(ctx, "Copy failed");
                 }
             } else {
-                self.show_toast(ctx, "Select notes first");
+                self.show_edit_feedback(ctx, "Copy — select notes first");
             }
-            i.consume_key(egui::Modifiers::CTRL, egui::Key::C);
-            return;
+            consume_edit_clipboard_shortcut(i, egui::Key::C, egui::Key::Copy);
+            return true;
         }
 
-        if ctrl && i.key_pressed(egui::Key::X) {
+        if edit_clipboard_shortcut(i, egui::Key::X, egui::Key::Cut) {
             if self.cut_selection() {
-                self.show_toast(ctx, "Cut notes");
+                self.show_edit_feedback(ctx, "Cut notes");
             } else {
-                self.show_toast(ctx, "Nothing to cut");
+                self.show_edit_feedback(ctx, "Cut — nothing selected");
             }
-            i.consume_key(egui::Modifiers::CTRL, egui::Key::X);
-            return;
+            consume_edit_clipboard_shortcut(i, egui::Key::X, egui::Key::Cut);
+            return true;
         }
 
-        if ctrl && i.key_pressed(egui::Key::V) {
-            if self.clipboard.is_some() {
-                if self.paste_clipboard() {
-                    self.show_toast(ctx, "Pasted notes at playhead");
-                }
-            } else {
-                self.show_toast(ctx, "Note clipboard empty — Ctrl+C first");
-            }
-            i.consume_key(egui::Modifiers::CTRL, egui::Key::V);
-            return;
+        if edit_clipboard_shortcut(i, egui::Key::V, egui::Key::Paste) {
+            self.try_paste_notes(ctx);
+            consume_edit_clipboard_shortcut(i, egui::Key::V, egui::Key::Paste);
+            return true;
         }
 
         if ctrl && i.key_pressed(egui::Key::D) {
             if self.duplicate_selection() {
-                self.show_toast(ctx, "Duplicated notes");
+                self.show_edit_feedback(ctx, "Duplicated notes");
             }
             i.consume_key(egui::Modifiers::CTRL, egui::Key::D);
-            return;
+            return true;
         }
 
         if self.has_note_selection() {
             let step = if i.modifiers.shift { self.note_len } else { 0.25 };
             if i.key_pressed(egui::Key::ArrowLeft) {
                 self.nudge_selection(-step, 0);
+                return true;
             } else if i.key_pressed(egui::Key::ArrowRight) {
                 self.nudge_selection(step, 0);
+                return true;
             } else if i.key_pressed(egui::Key::ArrowUp) {
                 self.nudge_selection(0.0, 1);
+                return true;
             } else if i.key_pressed(egui::Key::ArrowDown) {
                 self.nudge_selection(0.0, -1);
+                return true;
             }
         }
+        false
     }
 
     fn select_chord_block(&mut self, idx: usize, shift: bool) {
@@ -2131,45 +2395,44 @@ impl JpoApp {
         }
     }
 
-    /// Guarantee chord blocks never overlap (truncate dur to next block start).
-    fn enforce_chord_timeline_no_overlap(&mut self) {
+    /// Clamp move target so [start, start+dur) does not overlap any other block.
+    fn clamp_chord_start(&self, idx: usize, want_start: f64, dur: f64) -> f64 {
         let min_dur = self.snap_dur(self.note_len.max(0.0625));
-        if self.proj.chord_blocks.len() < 2 {
-            if let Some(b) = self.proj.chord_blocks.first_mut() {
-                b.dur = b.dur.max(min_dur);
+        let dur = dur.max(min_dur);
+        let mut lo: f64 = 0.0;
+        let mut hi: f64 = f64::INFINITY;
+        for (j, b) in self.proj.chord_blocks.iter().enumerate() {
+            if j == idx {
+                continue;
             }
-            return;
+            if b.end() <= want_start + 0.001 {
+                lo = lo.max(b.end());
+            } else if b.start >= want_start - 0.001 {
+                hi = hi.min(b.start - dur);
+            } else {
+                lo = lo.max(b.end());
+            }
         }
-        let selected_starts: Vec<f64> = self
-            .selected_chord_indices()
-            .iter()
-            .filter_map(|&i| self.proj.chord_blocks.get(i).map(|b| b.start))
-            .collect();
-        let active_start = self.active_chord_beat;
-        self.proj
-            .chord_blocks
-            .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
-        let mut i = 0;
-        while i < self.proj.chord_blocks.len() {
-            let start_i = self.proj.chord_blocks[i].start;
-            let mut j = i + 1;
-            while j < self.proj.chord_blocks.len() {
-                let next_start = self.proj.chord_blocks[j].start;
-                if next_start <= start_i + 0.001 {
-                    self.proj.chord_blocks.remove(j);
-                    continue;
-                }
-                let new_dur = (next_start - start_i).max(min_dur);
-                if self.proj.chord_blocks[i].end() > next_start + 0.001 {
-                    self.proj.chord_blocks[i].dur = new_dur;
-                }
-                break;
+        let clamped = if hi < lo { lo } else { want_start.clamp(lo, hi) };
+        self.snap_beat(clamped.max(0.0))
+    }
+
+    /// Latest end beat allowed when resizing (next block start, if any).
+    fn chord_resize_max_end(&self, idx: usize) -> f64 {
+        let start = self.proj.chord_blocks[idx].start;
+        let mut max_end = f64::INFINITY;
+        for (j, b) in self.proj.chord_blocks.iter().enumerate() {
+            if j == idx {
+                continue;
             }
-            if self.proj.chord_blocks[i].dur < min_dur {
-                self.proj.chord_blocks[i].dur = min_dur;
+            if b.start > start + 0.001 {
+                max_end = max_end.min(b.start);
             }
-            i += 1;
         }
+        max_end
+    }
+
+    fn restore_chord_selection_by_starts(&mut self, selected_starts: &[f64], active_start: Option<f64>) {
         self.selection.blocks.clear();
         for start in selected_starts {
             if let Some(idx) = self
@@ -2189,10 +2452,51 @@ impl JpoApp {
                 .position(|b| (b.start - start).abs() < 0.001)
             {
                 self.set_active_chord_idx(idx);
+                return;
             }
-        } else if let Some(&last) = self.selection.blocks.iter().max() {
+        }
+        if let Some(&last) = self.selection.blocks.iter().max() {
             self.set_active_chord_idx(last);
         }
+    }
+
+    /// Guarantee chord blocks never overlap (push starts, truncate durs; never delete blocks).
+    fn enforce_chord_timeline_no_overlap(&mut self) {
+        let min_dur = self.snap_dur(self.note_len.max(0.0625));
+        if self.proj.chord_blocks.is_empty() {
+            return;
+        }
+        let selected_starts: Vec<f64> = self
+            .selected_chord_indices()
+            .iter()
+            .filter_map(|&i| self.proj.chord_blocks.get(i).map(|b| b.start))
+            .collect();
+        let active_start = self.active_chord_beat;
+
+        self.proj
+            .chord_blocks
+            .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+
+        for i in 0..self.proj.chord_blocks.len() {
+            if i > 0 {
+                let prev_end = self.proj.chord_blocks[i - 1].end();
+                if self.proj.chord_blocks[i].start < prev_end - 0.001 {
+                    self.proj.chord_blocks[i].start = self.snap_beat(prev_end);
+                }
+            }
+            if self.proj.chord_blocks[i].dur < min_dur {
+                self.proj.chord_blocks[i].dur = min_dur;
+            }
+            if i + 1 < self.proj.chord_blocks.len() {
+                let next_start = self.proj.chord_blocks[i + 1].start;
+                if self.proj.chord_blocks[i].end() > next_start + 0.001 {
+                    let new_dur = (next_start - self.proj.chord_blocks[i].start).max(min_dur);
+                    self.proj.chord_blocks[i].dur = self.snap_dur(new_dur);
+                }
+            }
+        }
+
+        self.restore_chord_selection_by_starts(&selected_starts, active_start);
     }
 
     fn has_note_selection(&self) -> bool {
@@ -2209,6 +2513,15 @@ impl JpoApp {
     fn show_toast(&mut self, ctx: &egui::Context, msg: impl Into<String>) {
         self.status_toast = Some(msg.into());
         self.status_toast_until = ctx.input(|i| i.time) + 2.0;
+        ctx.request_repaint();
+    }
+
+    fn show_edit_feedback(&mut self, ctx: &egui::Context, msg: impl Into<String>) {
+        let msg = msg.into();
+        eprintln!("[JPO] {msg}");
+        self.edit_status = msg.clone();
+        self.status_toast = Some(msg);
+        self.status_toast_until = ctx.input(|i| i.time) + 5.0;
         ctx.request_repaint();
     }
 
@@ -2323,6 +2636,7 @@ impl JpoApp {
             }
         }
         self.clear_chord_selection();
+        self.enforce_chord_timeline_no_overlap();
         self.end_gesture_undo();
     }
 
@@ -2452,6 +2766,20 @@ impl JpoApp {
         self.gen_end = self.loop_beats();
         self.fit_loop_view();
         self.sync_active_bank_from_proj();
+    }
+
+    fn ensure_beat_visible(&mut self, beat: f64) {
+        let margin = 1.0;
+        if beat < self.visible_start + margin {
+            self.visible_start = (beat - margin).max(0.0);
+        }
+        let visible_end = self.visible_start + self.visible_beats;
+        if beat > visible_end - margin {
+            self.visible_start =
+                (beat - self.visible_beats + margin).max(0.0);
+        }
+        let max_scroll = (self.loop_beats() - 4.0).max(0.0);
+        self.visible_start = self.visible_start.min(max_scroll);
     }
 
     fn fit_loop_view(&mut self) {
@@ -3155,15 +3483,15 @@ impl JpoApp {
         let Some(cb) = self.clipboard.clone() else {
             return false;
         };
-        if self.selected_ch == 1 {
+        if self.selected_ch == 1 || cb.notes.is_empty() {
             return false;
         }
         let t_idx = self.track_idx();
         self.begin_gesture_undo();
         let paste_at = self.snap_beat(self.current_beat.max(0.0));
-        let pitch_base = self.last_mouse_pitch;
-        let pitch_shift = pitch_base as i32 - cb.anchor_pitch as i32;
-        let pasted = build_pasted_notes(&cb, paste_at, pitch_shift, self.next_note_id());
+        // Standard MIDI paste: move in time only; keep source pitches.
+        let pasted = build_pasted_notes(&cb, paste_at, 0, self.next_note_id());
+        let pasted_ids: Vec<NoteId> = pasted.iter().map(|n| n.id).collect();
         self.selection.notes.clear();
         for new_n in pasted {
             self.proj.tracks[t_idx].notes.push(new_n);
@@ -3174,11 +3502,13 @@ impl JpoApp {
                 .unwrap()
                 .then(a.pitch.cmp(&b.pitch))
         });
-        let start_len = self.proj.tracks[t_idx].notes.len() - cb.notes.len();
-        for i in start_len..self.proj.tracks[t_idx].notes.len() {
-            self.selection.notes.insert((t_idx, self.proj.tracks[t_idx].notes[i].id));
+        for id in pasted_ids {
+            if self.proj.tracks[t_idx].notes.iter().any(|n| n.id == id) {
+                self.selection.notes.insert((t_idx, id));
+            }
         }
         self.selected_note = self.selection.notes.iter().find(|&&(t, _)| t == t_idx).copied();
+        self.ensure_beat_visible(paste_at);
         self.end_gesture_undo();
         true
     }
@@ -3533,6 +3863,84 @@ mod tests {
         assert_eq!(pasted[1].start, 9.0);
         assert_eq!(pasted[1].pitch, 67);
     }
+
+    #[test]
+    fn paste_selection_ids_survive_sort_with_existing_notes() {
+        let cb = ClipboardNotes {
+            notes: vec![
+                Note { id: NoteId(1), start: 0.0, pitch: 60, dur: 1.0, vel: 90 },
+                Note { id: NoteId(2), start: 1.0, pitch: 62, dur: 1.0, vel: 90 },
+            ],
+            min_start: 0.0,
+            anchor_pitch: 60,
+        };
+        let pasted = build_pasted_notes(&cb, 2.0, 0, NoteId(100));
+        let pasted_ids: Vec<NoteId> = pasted.iter().map(|n| n.id).collect();
+
+        let mut notes = vec![
+            Note { id: NoteId(1), start: 0.0, pitch: 60, dur: 1.0, vel: 90 },
+            Note { id: NoteId(2), start: 8.0, pitch: 62, dur: 1.0, vel: 90 },
+        ];
+        for new_n in pasted {
+            notes.push(new_n);
+        }
+        notes.sort_by(|a, b| {
+            a.start
+                .partial_cmp(&b.start)
+                .unwrap()
+                .then(a.pitch.cmp(&b.pitch))
+        });
+
+        let wrong_tail: Vec<NoteId> = notes[notes.len() - cb.notes.len()..]
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_ne!(wrong_tail, pasted_ids);
+        assert_eq!(pasted_ids, vec![NoteId(100), NoteId(101)]);
+        for id in pasted_ids {
+            assert!(notes.iter().any(|n| n.id == id && n.start >= 2.0));
+        }
+    }
+
+    fn sample_chord(start: f64, dur: f64, degree: u8) -> ChordBlock {
+        ChordBlock {
+            start,
+            dur,
+            degree,
+            quality: if degree == 1 { String::new() } else { "m".into() },
+            octave: 4,
+            syncopation_fill: false,
+        }
+    }
+
+    #[test]
+    fn enforce_chord_blocks_never_delete_on_overlap() {
+        let mut app = JpoApp::default();
+        app.note_len = 1.0;
+        app.proj.chord_blocks = vec![
+            sample_chord(0.0, 4.0, 1),
+            sample_chord(2.0, 4.0, 2),
+        ];
+        app.enforce_chord_timeline_no_overlap();
+        assert_eq!(app.proj.chord_blocks.len(), 2);
+        assert!(
+            app.proj.chord_blocks[0].end() <= app.proj.chord_blocks[1].start + 0.001,
+            "blocks still overlap: {:?}",
+            app.proj.chord_blocks
+        );
+    }
+
+    #[test]
+    fn clamp_chord_start_pushes_out_of_previous_block() {
+        let mut app = JpoApp::default();
+        app.note_len = 1.0;
+        app.proj.chord_blocks = vec![
+            sample_chord(0.0, 4.0, 1),
+            sample_chord(8.0, 4.0, 2),
+        ];
+        let clamped = app.clamp_chord_start(1, 2.0, 4.0);
+        assert!(clamped >= 4.0 - 0.001, "clamped to {clamped}");
+    }
 }
 
 impl eframe::App for JpoApp {
@@ -3545,6 +3953,7 @@ impl eframe::App for JpoApp {
                 }
             });
         }
+        let mut edit_shortcuts_handled = false;
         ctx.input_mut(|i| {
             if i.key_pressed(egui::Key::Delete) {
                 if self.active_tab == AppTab::Chord && !self.selected_chord_indices().is_empty() {
@@ -3566,7 +3975,7 @@ impl eframe::App for JpoApp {
                 self.do_redo();
                 i.consume_key(egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT), egui::Key::Z);
             }
-            self.handle_edit_shortcuts(ctx, i);
+            edit_shortcuts_handled = self.handle_edit_shortcuts(ctx, i);
         });
 
         if let Some(ref msg) = self.status_toast {
@@ -3598,7 +4007,7 @@ impl eframe::App for JpoApp {
                         .selectable_label(self.active_tab == tab, label)
                         .clicked()
                     {
-                        self.switch_tab(tab);
+                        self.switch_tab(ctx, tab);
                     }
                 }
 
@@ -3681,6 +4090,25 @@ impl eframe::App for JpoApp {
                     {
                         self.snap_enabled = !self.snap_enabled;
                     }
+                    ui.separator();
+                    if ui.button("Copy").on_hover_text("Ctrl+C").clicked() {
+                        if self.has_note_selection() && self.copy_selection() {
+                            let n = self.clipboard.as_ref().map(|c| c.notes.len()).unwrap_or(0);
+                            self.show_edit_feedback(ui.ctx(), format!("Copied {n} note(s)"));
+                        } else {
+                            self.show_edit_feedback(ui.ctx(), "Copy — select notes first");
+                        }
+                    }
+                    if ui.button("Paste").on_hover_text("Ctrl+V").clicked() {
+                        self.try_paste_notes(ui.ctx());
+                    }
+                    if !self.edit_status.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&self.edit_status)
+                                .size(11.0)
+                                .color(Color32::from_rgb(140, 200, 255)),
+                        );
+                    }
                 }
 
                 ui.separator();
@@ -3738,7 +4166,7 @@ impl eframe::App for JpoApp {
 
             match self.active_tab {
                 AppTab::Chord => {
-                    self.show_grok_panel(ui, ctx);
+                    self.show_grok_panel(ui, ctx, true);
                     ui.label("Tip: Tab1 — click empty = place chord (Len) • right edge = stretch • Space=play");
                 }
                 AppTab::Generate => {
@@ -3787,6 +4215,21 @@ impl eframe::App for JpoApp {
                                 }
                             });
                         ui.checkbox(&mut self.syncopation_fill, "Syncopation fill");
+                        if ui.button("Preview").clicked() {
+                            let s = self.gen_start;
+                            let e = self.gen_end.max(s + 0.25);
+                            self.gen_preview = Some(generate_from_patterns(
+                                &self.pattern_lib,
+                                &self.proj,
+                                s,
+                                e,
+                                &self.piano_pattern_id,
+                                &self.bass_pattern_id,
+                                &self.drum_pattern_id,
+                                self.syncopation_fill,
+                            ));
+                            self.show_toast(ctx, "Preview ready (Tab2 lanes)");
+                        }
                         if ui.button("Generate All").clicked() {
                             self.begin_gesture_undo();
                             let s = self.gen_start;
@@ -3804,6 +4247,7 @@ impl eframe::App for JpoApp {
                             replace_notes_in_range(&mut self.proj.tracks[1].notes, s, e, p);
                             replace_notes_in_range(&mut self.proj.tracks[2].notes, s, e, b);
                             replace_notes_in_range(&mut self.proj.tracks[9].notes, s, e, d);
+                            self.gen_preview = None;
                             self.end_gesture_undo();
                             self.show_toast(ctx, "Generated Ch2/3/10");
                         }
@@ -3831,8 +4275,12 @@ impl eframe::App for JpoApp {
                             }
                         }
                     });
-                    self.show_grok_panel(ui, ctx);
-                    ui.label("Tip: Tab3 — Select=marquee • Ctrl+click add • Draw=place • Ctrl+C/V/X/D/A • Del");
+                    ui.label(
+                        egui::RichText::new("MIDI note clipboard: toolbar Copy/Paste or Ctrl+C/V (not OS clipboard)")
+                            .small()
+                            .weak(),
+                    );
+                    ui.label("Tip: Tab3 — click empty/timeline=playhead • Select=marquee • Ctrl+C/V paste at playhead");
                 }
                 AppTab::Arrange => {
                     ui.label("Tip: Tab4 — sequence loops • Space plays full arrange timeline");
@@ -3865,15 +4313,10 @@ impl eframe::App for JpoApp {
                             .strong(),
                     );
                     let _chord_response = self.draw_chord_timeline(ui);
-                    ui.add_space(8.0);
-                    ui.label(format!(
-                        "Ch2 Piano: {} notes • Ch3 Bass: {} • Ch10 Drum: {}",
-                        self.proj.tracks[1].notes.len(),
-                        self.proj.tracks[2].notes.len(),
-                        self.proj.tracks[9].notes.len(),
-                    ));
+                    ui.add_space(6.0);
+                    self.show_gen_preview_lanes(ui);
                     ui.label(
-                        egui::RichText::new("Use bottom panel to Generate All. Edit notes in Tab 3.")
+                        egui::RichText::new("Preview = dry-run • Generate All = write Ch2/3/10 • Edit in Tab 3")
                             .weak(),
                     );
                 }
@@ -3976,12 +4419,13 @@ impl eframe::App for JpoApp {
                         });
 
                     ui.label(
-                        egui::RichText::new("TAB 3 EDIT — piano roll • chord onion background • Ctrl+C/V")
+                        egui::RichText::new("TAB 3 EDIT — timeline/playhead • piano roll • Ctrl+C/V")
                             .strong(),
                     );
                     if self.selected_ch == 1 {
                         ui.label("Select Ch2–16 in the track list to edit generated/hand parts.");
                     }
+                    let _timeline_response = self.draw_chord_timeline(ui);
                     let roll_h = ui.available_height().clamp(220.0, 520.0);
                     let _roll_response = self.draw_piano_roll_with_keyboard(ui, roll_h);
                 }
@@ -3990,6 +4434,13 @@ impl eframe::App for JpoApp {
                 }
             }
         });
+
+        // Tab3: retry clipboard shortcuts after UI (widgets can swallow key_pressed early).
+        if !edit_shortcuts_handled && self.active_tab == AppTab::Edit && self.selected_ch != 1 {
+            ctx.input_mut(|i| {
+                self.handle_edit_shortcuts(ctx, i);
+            });
+        }
 
         // Drive playhead from the audio thread while playing.
         if self.audio_stream.is_some() && self.synth_sample_rate > 0 {
@@ -4006,12 +4457,133 @@ impl eframe::App for JpoApp {
 }
 
 impl JpoApp {
+    fn track_notes_in_gen_range(&self, track_idx: usize) -> Vec<Note> {
+        let s = self.gen_start;
+        let e = self.gen_end;
+        self.proj.tracks[track_idx]
+            .notes
+            .iter()
+            .filter(|n| n.start < e && n.end() > s)
+            .cloned()
+            .collect()
+    }
+
+    fn draw_gen_preview_lane(
+        &self,
+        ui: &mut egui::Ui,
+        label: &str,
+        notes: &[Note],
+        min_pitch: u8,
+        max_pitch: u8,
+        fill: Color32,
+        height: f32,
+    ) {
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                Vec2::new(52.0, height),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.add_space(height * 0.35);
+                    ui.label(egui::RichText::new(label).small().strong());
+                },
+            );
+            let desired = Vec2::new(ui.available_width().min(928.0), height);
+            let (resp, painter) = ui.allocate_painter(desired, Sense::hover());
+            let rect = resp.rect;
+            painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 22, 28));
+
+            let start_b = self.visible_start;
+            let end_b = start_b + self.visible_beats;
+            let px_per_beat = rect.width() as f64 / self.visible_beats;
+
+            let gx0 = rect.min.x + ((self.gen_start - start_b) * px_per_beat) as f32;
+            let gx1 = rect.min.x + ((self.gen_end - start_b) * px_per_beat) as f32;
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(gx0.max(rect.min.x), rect.min.y),
+                    Pos2::new(gx1.min(rect.max.x), rect.max.y),
+                ),
+                0.0,
+                Color32::from_rgba_unmultiplied(80, 100, 140, 40),
+            );
+
+            let span = (max_pitch.saturating_sub(min_pitch)).max(1) as f64;
+            let h = rect.height() as f64;
+            for n in notes {
+                if n.end() < start_b || n.start > end_b {
+                    continue;
+                }
+                let x0 = rect.min.x + ((n.start - start_b) * px_per_beat) as f32;
+                let x1 = rect.min.x + ((n.end() - start_b) * px_per_beat) as f32;
+                let pitch = n.pitch.clamp(min_pitch, max_pitch);
+                let norm_top = (max_pitch as f64 - pitch as f64 - 0.5) / span;
+                let norm_bot = (max_pitch as f64 - pitch as f64 + 0.5) / span;
+                let y0 = rect.min.y + (norm_top * h) as f32;
+                let y1 = rect.min.y + (norm_bot * h) as f32;
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1.max(x0 + 1.0), y1)),
+                    1.0,
+                    fill,
+                );
+            }
+
+            self.draw_playhead_line(&painter, rect, start_b, px_per_beat);
+        });
+    }
+
+    fn show_gen_preview_lanes(&self, ui: &mut egui::Ui) {
+        let (piano, bass, drum, source) = match &self.gen_preview {
+            Some((p, b, d)) => (p.as_slice(), b.as_slice(), d.as_slice(), "preview"),
+            None => {
+                // Borrowed slices from track data are not possible without storing;
+                // clone only when showing live tracks (no preview buffer).
+                let p = self.track_notes_in_gen_range(1);
+                let b = self.track_notes_in_gen_range(2);
+                let d = self.track_notes_in_gen_range(9);
+                self.draw_gen_preview_lane(ui, "Piano", &p, 48, 72, Color32::from_rgb(72, 145, 110), 44.0);
+                self.draw_gen_preview_lane(ui, "Bass", &b, 28, 52, Color32::from_rgb(95, 125, 185), 44.0);
+                self.draw_gen_preview_lane(ui, "Drum", &d, 35, 60, Color32::from_rgb(175, 130, 75), 36.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Ch2 {} • Ch3 {} • Ch10 {} notes in gen range ({:.1}–{:.1}) — tracks",
+                        p.len(),
+                        b.len(),
+                        d.len(),
+                        self.gen_start,
+                        self.gen_end,
+                    ))
+                    .small()
+                    .weak(),
+                );
+                return;
+            }
+        };
+        self.draw_gen_preview_lane(ui, "Piano", piano, 48, 72, Color32::from_rgb(72, 145, 110), 44.0);
+        self.draw_gen_preview_lane(ui, "Bass", bass, 28, 52, Color32::from_rgb(95, 125, 185), 44.0);
+        self.draw_gen_preview_lane(ui, "Drum", drum, 35, 60, Color32::from_rgb(175, 130, 75), 36.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "Ch2 {} • Ch3 {} • Ch10 {} notes — {source} ({:.1}–{:.1})",
+                piano.len(),
+                bass.len(),
+                drum.len(),
+                self.gen_start,
+                self.gen_end,
+            ))
+            .small()
+            .weak(),
+        );
+    }
+
     // ===== Chord Timeline drawing + interaction =====
     fn draw_chord_timeline(&mut self, ui: &mut egui::Ui) -> egui::Response {
         let editable = self.active_tab == AppTab::Chord;
+        let playhead_ruler = self.active_tab == AppTab::Edit;
         let desired = Vec2::new(ui.available_width().min(980.0), 92.0);
         let sense = if editable {
             Sense::click_and_drag()
+        } else if playhead_ruler {
+            Sense::click()
         } else {
             Sense::hover()
         };
@@ -4188,15 +4760,19 @@ impl JpoApp {
                         if i < self.proj.chord_blocks.len() {
                             let (orig_start, _orig_dur) = self.block_drag_orig;
                             let db = beat - self.drag_start_beat;
+                            let min_dur = self.snap_dur(self.note_len.max(0.0625));
                             match self.chord_drag_kind {
                                 ChordDragKind::Resize => {
-                                    let snapped_end = self.snap_beat(beat);
-                                    let new_end = snapped_end.max(orig_start + 0.0625);
+                                    let max_end = self.chord_resize_max_end(i);
+                                    let snapped_end = self.snap_beat(beat).min(max_end);
+                                    let new_end = snapped_end.max(orig_start + min_dur);
                                     let new_dur = self.snap_dur(new_end - orig_start);
-                                    self.proj.chord_blocks[i].dur = new_dur;
+                                    self.proj.chord_blocks[i].dur = new_dur.max(min_dur);
                                 }
                                 ChordDragKind::Move => {
-                                    let new_start = self.snap_beat((orig_start + db).max(0.0));
+                                    let raw = self.snap_beat((orig_start + db).max(0.0));
+                                    let dur = self.proj.chord_blocks[i].dur;
+                                    let new_start = self.clamp_chord_start(i, raw, dur);
                                     self.proj.chord_blocks[i].start = new_start;
                                     self.active_chord_beat = Some(new_start);
                                 }
@@ -4228,6 +4804,15 @@ impl JpoApp {
             }
             self.chord_drag_kind = ChordDragKind::None;
             self.chord_drag_block_idx = None;
+        }
+
+        // Tab3: chord timeline acts as a playhead ruler (no chord editing here).
+        if playhead_ruler && resp.clicked() {
+            if let Some(ptr) = resp.interact_pointer_pos() {
+                let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
+                self.set_playhead(beat);
+                self.piano_roll_focused = false;
+            }
         }
 
         resp
@@ -4325,7 +4910,7 @@ impl JpoApp {
     fn draw_piano_roll_grid(&mut self, ui: &mut egui::Ui, width: f32, height: f32) -> egui::Response {
         let desired = Vec2::new(width, height);
         let (resp, painter) = ui.allocate_painter(desired, Sense::click_and_drag());
-        if self.active_tab == AppTab::Edit {
+        if self.active_tab == AppTab::Edit && (resp.clicked() || resp.drag_started() || resp.dragged()) {
             resp.request_focus();
         }
         if resp.clicked() || resp.dragged() || resp.drag_started() || resp.hovered() {
@@ -4588,6 +5173,7 @@ impl JpoApp {
                                     })
                                     .collect();
                             } else {
+                                self.set_playhead(beat);
                                 self.box_select_start_beat = Some(beat);
                                 self.box_select_start_pitch = Some(pitch);
                                 self.gesture_undo_saved = false;
@@ -4668,6 +5254,7 @@ impl JpoApp {
                                 let id = self.proj.tracks[track_idx].notes[i].id;
                                 self.select_note_toggle(track_idx, id, ctrl);
                             } else if !ctrl {
+                                self.set_playhead(beat);
                                 self.selection.notes.clear();
                                 self.selected_note = None;
                             }
@@ -5076,17 +5663,91 @@ mod generate_tests {
     use super::*;
 
     #[test]
-    fn melodic_pitch_c_major_degree_i_is_near_c4() {
-        let pitch = melodic_pitch(72, 60, 60);
-        assert!(pitch >= 48 && pitch <= 84, "pitch {pitch} out of expected range");
+    fn pitch_map_e_folds_to_e2_near_40() {
+        let pitch = map_pattern_pitch(52, 48, 48, 28, 72);
+        assert_eq!(pitch, 40, "E above C3 should fold to E2 (40)");
     }
 
     #[test]
-    fn melodic_pitch_transposes_by_degree() {
-        let proj = Project::default();
-        let root_iv = proj.degree_root(4, 4);
-        let pitch = melodic_pitch(72, 60, root_iv);
-        assert_eq!(pitch as i32, 72 + (root_iv as i32 - 60));
+    fn pitch_map_d_stays_near_50() {
+        let pitch = map_pattern_pitch(50, 48, 48, 28, 72);
+        assert_eq!(pitch, 50, "D above C3 should stay D3 (50)");
+    }
+
+    #[test]
+    fn pitch_map_bass_c2_root_folds_e_down() {
+        let pitch = map_pattern_pitch(52, 48, 36, 28, 52);
+        assert_eq!(pitch, 28, "E above C3 folds to E1 (28) at C2 root");
+    }
+
+    #[test]
+    fn pitch_map_bass_c2_root_keeps_d_up() {
+        let pitch = map_pattern_pitch(50, 48, 36, 28, 52);
+        assert_eq!(pitch, 38, "D above C3 stays D2 (38) at C2 root");
+    }
+
+    #[test]
+    fn syncopation_window_shrinks_for_short_block() {
+        assert!((syncopation_window_len(2.5) - 1.0).abs() < 0.001);
+        assert!((syncopation_window_len(4.0) - 2.0).abs() < 0.001);
+        assert!((syncopation_window_len(1.8) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn trim_piano_pitch_class_dupes_keeps_loudest() {
+        let mut notes = vec![
+            Note { id: NoteId(1), start: 0.0, pitch: 60, dur: 1.0, vel: 80 },
+            Note { id: NoteId(2), start: 0.0, pitch: 72, dur: 1.0, vel: 90 },
+            Note { id: NoteId(3), start: 0.0, pitch: 48, dur: 1.0, vel: 70 },
+        ];
+        trim_piano_pitch_class_dupes(&mut notes);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].pitch, 72);
+        assert_eq!(notes[0].vel, 90);
+    }
+
+    #[test]
+    fn bpm_does_not_rescale_beat_grid_durations() {
+        let mut pattern = LoadedPattern {
+            id: "test".into(),
+            category: PatternCategory::Piano,
+            length_beats: 4.0,
+            template_root: 60,
+            reference_bpm: 120.0,
+            notes: vec![
+                PatternNote {
+                    start_beats: 0.0,
+                    dur_beats: 1.0,
+                    pitch: 60,
+                    vel: 90,
+                },
+                PatternNote {
+                    start_beats: 0.5,
+                    dur_beats: 0.5,
+                    pitch: 64,
+                    vel: 80,
+                },
+            ],
+        };
+        let mut proj = Project::default();
+        proj.bpm = 120.0;
+        proj.chord_blocks.push(ChordBlock {
+            degree: 1,
+            octave: 3,
+            quality: "maj".into(),
+            start: 0.0,
+            dur: 4.0,
+            syncopation_fill: false,
+        });
+        let at_120 = apply_melodic_pattern(&pattern, &proj, 0.0, 4.0);
+        proj.bpm = 180.0;
+        let at_180 = apply_melodic_pattern(&pattern, &proj, 0.0, 4.0);
+        assert_eq!(at_120.len(), at_180.len());
+        assert_eq!(at_120.len(), at_180.len());
+        for (a, b) in at_120.iter().zip(at_180.iter()) {
+            assert!((a.start - b.start).abs() < 0.001);
+            assert!((a.dur - b.dur).abs() < 0.001, "beat-grid dur is BPM-independent");
+        }
     }
 
     #[test]
@@ -5110,5 +5771,345 @@ mod generate_tests {
     fn pattern_tile_at_keeps_phase_for_mid_bar_fill() {
         let tile = pattern_tile_at(2.0, 0.0, 8.0);
         assert!((tile - 0.0).abs() < 0.001);
+    }
+}
+
+#[cfg(test)]
+mod golden_tests {
+    use super::*;
+    use serde::Deserialize;
+    use std::path::Path;
+
+    fn golden_case_dir(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("golden")
+            .join(name)
+    }
+
+    fn load_golden_tracks(path: &Path) -> Option<(Vec<Note>, Vec<Note>, Vec<Note>)> {
+        let data = std::fs::read(path).ok()?;
+        let piano = parse_midi_channel_notes(&data, 2).ok()?;
+        let bass = parse_midi_channel_notes(&data, 3).ok()?;
+        let drum = parse_midi_channel_notes(&data, 10).ok()?;
+        Some((piano, bass, drum))
+    }
+
+    fn load_miditest_project(dir: &Path) -> Option<Project> {
+        #[derive(Deserialize)]
+        struct JpoFile {
+            project: Project,
+        }
+        let path = dir.join("MidiTest.jpo");
+        let data = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str::<JpoFile>(&data).ok().map(|f| f.project)
+    }
+
+    fn start_pitch_match_ratio(goal: &[(i64, u8)], gen: &[(i64, u8)]) -> f64 {
+        if goal.is_empty() {
+            return 1.0;
+        }
+        let gset: std::collections::HashSet<_> = goal.iter().copied().collect();
+        let matched = gen.iter().filter(|g| gset.contains(*g)).count();
+        matched as f64 / gset.len() as f64
+    }
+
+    fn notes_match_pitch_and_time(a: &[Note], b: &[Note], tol: f64) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut sa: Vec<_> = a
+            .iter()
+            .map(|n| ((n.start * 100.0).round() as i64, n.pitch, (n.dur * 100.0).round() as i64))
+            .collect();
+        let mut sb: Vec<_> = b
+            .iter()
+            .map(|n| ((n.start * 100.0).round() as i64, n.pitch, (n.dur * 100.0).round() as i64))
+            .collect();
+        sa.sort();
+        sb.sort();
+        sa == sb || time_events_match(a, b, tol)
+    }
+
+    #[test]
+    fn golden_case01_broken_differs_from_fixed() {
+        let dir = golden_case_dir("case01");
+        let fixed = dir.join("fixed.mid");
+        let broken = dir.join("broken.mid");
+        if !fixed.exists() || !broken.exists() {
+            eprintln!("skip: need broken.mid + fixed.mid");
+            return;
+        }
+        let (exp_p, exp_b, exp_d) = load_golden_tracks(&fixed).expect("fixed.mid");
+        let (bro_p, bro_b, bro_d) = load_golden_tracks(&broken).expect("broken.mid");
+        eprintln!(
+            "counts: broken ch2={} ch3={} ch10={} | fixed ch2={} ch3={} ch10={}",
+            bro_p.len(),
+            bro_b.len(),
+            bro_d.len(),
+            exp_p.len(),
+            exp_b.len(),
+            exp_d.len()
+        );
+        eprintln!(
+            "temporal overlaps: broken ch2={} fixed ch2={}",
+            count_temporal_overlaps(&bro_p),
+            count_temporal_overlaps(&exp_p)
+        );
+        assert!(
+            !notes_match_pitch_and_time(&bro_p, &exp_p, 0.03)
+                || !notes_match_pitch_and_time(&bro_b, &exp_b, 0.03)
+                || !notes_match_pitch_and_time(&bro_d, &exp_d, 0.03),
+            "broken.mid should differ from fixed.mid"
+        );
+    }
+
+    #[test]
+    fn diagnose_miditest_sync_and_dur() {
+        let dir = golden_case_dir("case01");
+        let Some(proj) = load_miditest_project(&dir) else {
+            return;
+        };
+        let lib = PatternLibrary::load();
+        let fixed_path = dir.join("fixed.mid");
+        let exp_p = load_golden_tracks(&fixed_path).map(|t| t.0).unwrap_or_default();
+        for sync in [false, true] {
+            let (gen_p, _, _) = generate_from_patterns(
+                &lib, &proj, 0.0, 16.0, "Piano01", "Bass8beat01", "Drum8beat_01", sync,
+            );
+            let goal_sp: std::collections::HashSet<(i64, u8)> = exp_p
+                .iter()
+                .map(|n| ((n.start * 100.0).round() as i64, n.pitch))
+                .collect();
+            let gen_sp: std::collections::HashSet<(i64, u8)> = gen_p
+                .iter()
+                .map(|n| ((n.start * 100.0).round() as i64, n.pitch))
+                .collect();
+            let missing = goal_sp.difference(&gen_sp).count();
+            let extra = gen_sp.difference(&goal_sp).count();
+            eprintln!(
+                "sync={sync} start+pitch: goal={} gen={} missing={} extra={}",
+                goal_sp.len(),
+                gen_sp.len(),
+                missing,
+                extra
+            );
+            if sync == false {
+                if let Some(pat) = lib.get("Piano01") {
+                    let p0: Vec<_> = pat
+                        .notes
+                        .iter()
+                        .filter(|n| n.start_beats < 0.01)
+                        .map(|n| n.pitch)
+                        .collect();
+                    eprintln!("  Piano01@0 pattern pitches: {p0:?}");
+                }
+                eprintln!(
+                    "  gen@0: {:?}",
+                    gen_p
+                        .iter()
+                        .filter(|n| n.start < 0.01)
+                        .map(|n| n.pitch)
+                        .collect::<Vec<_>>()
+                );
+                eprintln!(
+                    "  goal@0: {:?}",
+                    exp_p
+                        .iter()
+                        .filter(|n| n.start < 0.01)
+                        .map(|n| n.pitch)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn golden_case01_regenerate_matches_fixed_mid() {
+        let dir = golden_case_dir("case01");
+        let fixed_path = dir.join("fixed.mid");
+        let jpo_path = dir.join("MidiTest.jpo");
+        if !fixed_path.exists() || !jpo_path.exists() {
+            eprintln!("skip: need fixed.mid + MidiTest.jpo");
+            return;
+        }
+        let proj = load_miditest_project(&dir).expect("MidiTest.jpo");
+        let lib = PatternLibrary::load();
+        let (gen_p, gen_b, gen_d) = generate_from_patterns(
+            &lib,
+            &proj,
+            0.0,
+            16.0,
+            "Piano01",
+            "Bass8beat01",
+            "Drum8beat_01",
+            false, // goal MIDI matches base tiling; sync block differs
+        );
+        let (exp_p, exp_b, exp_d) = load_golden_tracks(&fixed_path).expect("fixed.mid");
+        eprintln!(
+            "regen counts: ch2={} ch3={} ch10={} | goal ch2={} ch3={} ch10={}",
+            gen_p.len(),
+            gen_b.len(),
+            gen_d.len(),
+            exp_p.len(),
+            exp_b.len(),
+            exp_d.len()
+        );
+        let open_tuple = |notes: &[Note]| -> Vec<(i64, u8, i64)> {
+            notes
+                .iter()
+                .filter(|n| n.start < 0.01)
+                .map(|n| {
+                    (
+                        (n.start * 100.0).round() as i64,
+                        n.pitch,
+                        (n.dur * 100.0).round() as i64,
+                    )
+                })
+                .collect()
+        };
+        let mut goal_open: Vec<Note> = exp_p
+            .iter()
+            .filter(|n| n.start < 0.01)
+            .cloned()
+            .collect();
+        trim_piano_pitch_class_dupes(&mut goal_open);
+        assert_eq!(
+            open_tuple(&goal_open),
+            open_tuple(&gen_p),
+            "opening voicing must match goal (after pitch-class trim)"
+        );
+
+        let mut trimmed_goal = exp_p.clone();
+        trim_piano_pitch_class_dupes(&mut trimmed_goal);
+        let goal_sp: Vec<(i64, u8)> = trimmed_goal
+            .iter()
+            .map(|n| ((n.start * 100.0).round() as i64, n.pitch))
+            .collect();
+        let gen_sp: Vec<(i64, u8)> = gen_p
+            .iter()
+            .map(|n| ((n.start * 100.0).round() as i64, n.pitch))
+            .collect();
+        let ratio = start_pitch_match_ratio(&goal_sp, &gen_sp);
+        eprintln!(
+            "Ch2 start+pitch match ratio (trimmed goal): {:.1}%",
+            ratio * 100.0
+        );
+        assert!(
+            ratio >= 0.85,
+            "Ch2 should match >=85% of trimmed goal (got {:.1}%)",
+            ratio * 100.0
+        );
+
+        let broken_path = dir.join("broken.mid");
+        if let Some((bro_p, _, _)) = load_golden_tracks(&broken_path) {
+            let bro_sp: Vec<(i64, u8)> = bro_p
+                .iter()
+                .map(|n| ((n.start * 100.0).round() as i64, n.pitch))
+                .collect();
+            let bro_ratio = start_pitch_match_ratio(&goal_sp, &bro_sp);
+            eprintln!("broken.mid match ratio: {:.1}%", bro_ratio * 100.0);
+            assert!(
+                ratio > bro_ratio,
+                "regen ({ratio:.1}%) should be closer to goal than broken ({bro_ratio:.1}%)"
+            );
+        }
+    }
+
+    #[test]
+    fn golden_case02_sync_refill_covers_short_block() {
+        let dir = golden_case_dir("case02");
+        let jpo_path = dir.join("MidiTest.jpo");
+        if !jpo_path.exists() {
+            let fallback = golden_case_dir("case01").join("MidiTest.jpo");
+            if !fallback.exists() {
+                eprintln!("skip: need case02 or case01 MidiTest.jpo");
+                return;
+            }
+        }
+        let proj_dir = if jpo_path.exists() {
+            dir
+        } else {
+            golden_case_dir("case01")
+        };
+        let proj = load_miditest_project(&proj_dir).expect("MidiTest.jpo");
+        let lib = PatternLibrary::load();
+
+        let windows = syncopation_windows(&proj, 0.0, 16.0);
+        let sync_block = proj
+            .chord_blocks
+            .iter()
+            .find(|b| b.syncopation_fill)
+            .expect("sync block");
+        let win_len = syncopation_window_len(sync_block.dur);
+        assert!(
+            (win_len - 1.0).abs() < 0.001,
+            "2.5-beat G block should use 1-beat sync window"
+        );
+        assert_eq!(windows.len(), 1);
+        let (win_start, win_end) = windows[0];
+        assert!((win_start - 5.5).abs() < 0.001);
+        assert!((win_end - 6.5).abs() < 0.001);
+
+        let refill_start = win_end;
+        let refill_end = sync_block.end();
+        assert!((refill_end - refill_start - 1.5).abs() < 0.001);
+
+        let (gen_p, gen_b, _) = generate_from_patterns(
+            &lib,
+            &proj,
+            0.0,
+            16.0,
+            "Piano01",
+            "Bass8beat01",
+            "Drum8beat_01",
+            true,
+        );
+
+        let piano_in_refill: Vec<_> = gen_p
+            .iter()
+            .filter(|n| n.start >= refill_start - 0.02 && n.start < refill_end - 0.02)
+            .collect();
+        let bass_in_refill: Vec<_> = gen_b
+            .iter()
+            .filter(|n| n.start >= refill_start - 0.02 && n.start < refill_end - 0.02)
+            .collect();
+        eprintln!(
+            "refill {:.1}-{:.1}: piano={} bass={}",
+            refill_start,
+            refill_end,
+            piano_in_refill.len(),
+            bass_in_refill.len()
+        );
+        assert!(
+            !piano_in_refill.is_empty(),
+            "piano should refill after 1-beat sync window"
+        );
+        assert!(
+            !bass_in_refill.is_empty(),
+            "bass should refill after 1-beat sync window"
+        );
+
+        let (_, gen_b_off, _) = generate_from_patterns(
+            &lib,
+            &proj,
+            0.0,
+            16.0,
+            "Piano01",
+            "Bass8beat01",
+            "Drum8beat_01",
+            false,
+        );
+        let bass_at_0: Vec<_> = gen_b_off
+            .iter()
+            .filter(|n| n.start < 0.02)
+            .map(|n| n.pitch)
+            .collect();
+        let bass_folded: Vec<_> = gen_b
+            .iter()
+            .filter(|n| n.start < 0.02)
+            .map(|n| n.pitch)
+            .collect();
+        assert_eq!(bass_at_0, bass_folded, "bass fold should match sync-off at beat 0");
     }
 }
