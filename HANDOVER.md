@@ -3,7 +3,8 @@
 **最終更新:** 2026-07-10  
 **方針:** v2 凍結 → **v1 を 4タブ方式に再設計（v0.3.0）**  
 **リポジトリ:** https://github.com/OptimalNotes/JpoProducer  
-**ローカル:** `C:\Users\user\JpoProducer\`
+**開発環境:** [`ENV.md`](ENV.md) — **WSL2 `~/JpoProducer` がメイン**、Windows は配布用  
+**ローカル (Win):** `C:\Users\user\JpoProducer\`
 
 > **実装リマインド:** 下記 Phase 表・未解決バグ・golden ケースを順に潰す。  
 > コード内マーカー: `src/main.rs` の `// UPDATE-ROADMAP:` を検索。

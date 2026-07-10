@@ -2,7 +2,8 @@
 
 **公式・唯一サポート対象のバージョン** — このフォルダが Git リポジトリのルートです。
 
-**開発引継ぎ:** [`HANDOVER.md`](HANDOVER.md)（次セッション用・実装状態の真実）
+**開発引継ぎ:** [`HANDOVER.md`](HANDOVER.md)（次セッション用・実装状態の真実）  
+**環境構築:** [`ENV.md`](ENV.md)（WSL2 + Grok Build ショートカット）
 
 ## フォルダ構成（2026-07 整理後）
 
@@ -20,7 +21,7 @@ JpoProducer/                 ← ここが全部。GitHub もこのルート
     └── jpo-v2/              ← 凍結した v2 試作（参考のみ）
 ```
 
-**いつもの作業ディレクトリ:** `C:\Users\user\JpoProducer`（`jpo\` サブフォルダは廃止）
+**いつもの作業ディレクトリ:** WSL `~/JpoProducer`（Grok Build 推奨）／Windows `C:\Users\user\JpoProducer`（配布ビルド用）
 
 J-Pop / J-Rock 向けの**爆速スケッチ専用** MIDI ツール。  
 単一 `jpo.exe` + 同梱 `FluidR3 GM.SF2` で完結（FluidSynth DLL 不要）。

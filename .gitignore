@@ -16,3 +16,6 @@ FluidR3 GM.SF2
 *.swp
 Thumbs.db
 Desktop.ini
+
+# Local scratch
+_tmp_*.rs
