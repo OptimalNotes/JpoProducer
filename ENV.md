@@ -38,9 +38,16 @@ grok               # 初回のみブラウザ認証
 デスクトップの **Grok Build** / **Grok Build (resume)** は Windows Terminal 経由で:
 
 - `~/JpoProducer` に cd
-- `grok` または `grok -c`（前回セッション再開）
+- `bash -lc` で `$HOME/.grok/bin/grok`（または `grok -c` で前回セッション再開）
 
-再生成: `pwsh -File scripts/update-grok-shortcuts.ps1`
+> **注意:** `wsl ... -- grok` のままだと非ログインシェルになり `~/.bashrc` の PATH が載らず  
+> `grok: command not found`（終了コード 127）になる。絶対パス + `bash -lc` が必要。
+
+再生成（ショートカット + WT プロファイル修正）:
+
+```powershell
+pwsh -File C:\Users\user\JpoProducer\scripts\update-grok-shortcuts.ps1
+```
 
 ---
 
