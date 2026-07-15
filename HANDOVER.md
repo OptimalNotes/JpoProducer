@@ -68,24 +68,40 @@
 
 共同作業: ケースごとに `broken.mid` + `fixed.mid` + スクショ（Ch2/3/10 入り1ファイル）。
 
-### #1 Piano ノート重なり（生成）
+### #1 Piano ノート重なり（生成）— **partial (2026-07-11)**
 
 - **症状:** コードトーンが時間的に重なって聴こえる / 見える。
-- **現状:** `trim_piano_pitch_class_dupes` は **同一 onset・同一 pitch class** のみ間引き。テンプレ側の長い dur やオクターブ違いの C は残る。
-- **次:** `Piano01.mid` を Domino で短 dur（≤1.5拍）に手編集 + 時間 overlap の post-process 検討。
+- **コード対応:** `trim_same_pitch_temporal_overlap` — 同一 pitch の時間 overlap を前ノート短縮で解消。テスト `generate_piano_no_same_pitch_temporal_overlap`。
+- **残り:** テンプレ長 Gate による **異音高** の聴感重なり → `Piano01.mid` Domino 短縮（明日以降）。
 
-### #2 Bass 帯域が E1〜D#2 に入っていない
+### #1b Piano コード品質（Em 等）— **done (2026-07-11)**
 
-- **症状:** ベースが C2 基準の平行移動のままに聞こえる。目標帯域 **MIDI 28〜51（E1〜D#2）**。
-- **仕様（fold）:** パターン基準 C3(48)。C/C#/D/D# は上側、E〜B は -12 fold。`degree_root(degree, 2)` + clamp 28〜52。
-- **参照:** `bass0710.png`（`OneDrive\画像\Screenshots\`）、Domino（`Desktop\Domino\` — UI/仕組みのお手本、自動化なし）。
-- **次:** `Bass8beat01.mid` の contour を Domino 準拠で編集。生成後に Ch3 の min/max pitch を golden で assert。
+- **症状:** Em が E G# D… になる（正: **E G B**）。`melodic_pitch` が quality 無視。
+- **修正:** `piano_pitch_from_pattern` — テンプレ interval → `chord_pitches(block)` スロット（quality 反映）。
+- **テスト:** `piano_em_block_uses_minor_third_not_g_sharp`, `piano_quality_matrix_pitch_classes`。
+- **他 quality:** maj / m / 7 / m7 を PC 集合で回帰。dim・sus は未テスト（必要時追加）。
 
-### #3 Tab3 選択ハイライトが全ノートに付く
+### #2 Bass 帯域 — **register map (2026-07-11)**
+
+- **目標:** エレキベース正規チューニング **E1..=D#2 = MIDI 28..=51**（C2 基準・octave=2 は使わない）。
+- **モデル:**
+  - テンプレから取る: **リズム** (start/dur/vel) + **レジスタ slot**（template_root より ≥12 上なら high）
+  - コードから取る: `root_pitch_class(degree)` → 帯域内の **low/high 2音**（各 PC ちょうど2つ）
+  - `bass_pitch_from_pattern` = (相対 pitch class) + slot → 最終 MIDI
+- **オクターブ交互:** 潰さない。`BassDance01` の 48/60 → C なら 36/48 を維持（4分ルート化しない）。
+- **V が上に逃げる問題:** low slot の G は **G1(31)**（旧 C2 基準では G2=43）。
+- **テスト:** `bass_register_*`, `bass_c_major_v_is_g1_*`, `generate_bass_dance_keeps_octave_slots`, `generate_bass_stays_in_e1_ds2_band`
+
+### #3 Tab3 選択ハイライトが全ノートに付く — **done (2026-07-11)**
 
 - **症状:** 1ノート選択で **画面上の全ノートがハイライト**。操作（移動・削除等）は先頭1件だけ。
-- **原因（ほぼ確定）:** Tab2「Generate All」経由のノートがすべて **`NoteId(0)`** のまま `replace_notes_in_range` に入る。描画は `n.id == selected_id` で判定するため id=0 が全件マッチ。
-- **修正方針:** Generate 適用時に `next_note_id()` でユニーク ID を付与。`generate_from_patterns` 出力にも同様。
+- **原因:** Tab2「Generate All」経由のノートがすべて **`NoteId(0)`** のまま project tracks に入っていた。描画が id 一致でハイライトするため全件マッチ。
+- **修正:** Project のノート（Tab3 の編集 SoT）へ書くときだけユニーク ID を採番。
+  - `assign_unique_note_ids` + `replace_notes_in_range(..., next_id)`
+  - Generate All / MIDI import で採番
+  - ハイライト判定を `(track_idx, id)` 一致に修正
+  - テスト: `assign_unique_note_ids_rewrites_zeros`, `generate_then_replace_yields_unique_ids_across_tracks`
+- Preview（dry-run）は id=0 のままでよい（project に書かない）。
 
 ---
 
@@ -93,16 +109,11 @@
 
 | トラック | 方式 | chord_root | clamp |
 |---------|------|------------|-------|
-| **Bass Ch3** | `map_pattern_pitch`（fold） | `degree_root(degree, 2)` | 28〜52 |
-| **Piano Ch2** | `melodic_pitch`（平行移動・ボイシング保持） | `degree_root(degree, 3)` | 36〜96 |
+| **Bass Ch3** | `bass_pitch_from_pattern`（register + slot） | `root_pitch_class` | 28〜51 |
+| **Piano Ch2** | `piano_pitch_from_pattern`（quality 反映 + オクターブ層） | `chord_pitches(block)` | 36〜96 |
 | **Drum Ch10** | 転調なし | — | — |
 
-**Fold ルール（Bass）** — template_root = 48:
-
-| 音名（基準 C から） | rel mod 12 | オクターブ |
-|--------------------|------------|-----------|
-| C, C#, D, D# | 0〜3 | **上側** |
-| E, F, F#, G, G#, A, A#, B | 4〜11 | **下側**（-12） |
+**Bass レジスタ:** 各 pitch class は [28,51] に low/high の2音。slot0=low、pattern≥template+12 で slot1=high。
 
 **BPM:** beat-grid の `start` / `dur` は BPM 非依存（`pattern_time_scale = 1.0`）。
 
@@ -140,6 +151,18 @@ cargo test
 
 ## Grok 連携
 
+**エージェント:** プロジェクトスキル `/jpo-producer`（`.grok/skills/jpo-producer/`）+ ルート `AGENTS.md`。
+
+| 参照 | 内容 |
+|------|------|
+| `references/bug-reduction-plan.md` | バグ削減ロードマップ（#3→cleanup→分割） |
+| `references/domino-lessons.md` | デスクトップ Domino の UX/設定から得た基準 |
+| `references/midi-industry.md` | 編集モデル vs SMF、ID、重なり |
+| `references/invariants.md` | データ不変条件 |
+
+**Domino（お手本・パターン手編集）:** `C:\Users\user\OneDrive\Desktop\Domino\`  
+自動操作しない。生成テンプレの Gate/帯域掃除に使う。
+
 下部パネル **Grok import**:
 - **Natural language** — Tab1 で進行配置
 - **MIDI file** — Tab3 の選択トラックへ import（playhead 位置）
@@ -151,7 +174,7 @@ cargo test
 ```powershell
 cd "C:\Users\user\JpoProducer"
 cargo run      # Tab2: Syncopation fill ON で G◆ 短ブロック確認
-cargo test     # 18 tests（2026-07-10 時点）
+cargo test     # 28 tests（2026-07-11 時点）
 cargo build --release
 ```
 
@@ -162,10 +185,12 @@ cargo build --release
 - [x] Tab1: 空きクリック即配置、伸張は右端のみ、ブロック非重複
 - [x] Tab1: Ctrl+C/V・Shift 不要
 - [x] Tab2: 3レーン preview、シンコ適応窓（手動確認済み）
-- [ ] Tab2: ベース E1〜D#2、ピアノ重なりなし（**未達**）
+- [x] Tab2: ベース E1〜E2 帯域 clamp + 回帰（**2026-07-11**；walking contour はパターン次第）
+- [x] Tab2: Em 等 minor の 3 度（**#1b done 2026-07-11**）
+- [ ] Tab2: ピアノ重なり聴感（**#1 partial** — same-pitch overlap done、テンプレ Gate 残）
 - [x] Tab3: Select 空きクリック / タイムラインで playhead
 - [x] Tab3: Ctrl+C/V で貼り付け位置が playhead
-- [ ] Tab3: 選択ハイライトが選択ノートのみ（**NoteId バグ**）
+- [x] Tab3: 選択ハイライトが選択ノートのみ（**NoteId ユニーク化 2026-07-11**）
 - [x] Tab2/4: 編集ショートカット無効
 - [x] 全タブ: Space 再生
 
@@ -173,10 +198,22 @@ cargo build --release
 
 ## 次セッションの推奨順
 
-1. **Tab3:** Generate 適用時の `NoteId` ユニーク化（即効・小変更）
-2. **Bass:** 生成結果の pitch range assert + `Bass8beat01.mid` Domino 編集
-3. **Piano:** overlap 検出テスト + `Piano01.mid` 短 dur 化
-4. **Golden:** case03 に `fixed.mid` が揃ったら Ch2/Ch3 range/overlap assert 追加
+1. **テンプレ（Domino）:** `Piano01.mid` Gate 短縮、`Bass8beat01.mid` contour
+2. **Golden case03:** `fixed.mid` 到着後、Em PC + overlap + bass band assert
+3. **品質拡張:** dim / sus4 piano テスト（必要時）
+4. **Phase F:** キーバインド、Tab3 snap 分離、薄い Undo
+5. **`main.rs` 分割:** pitch/cleanup モジュール（テスト緑のまま）
+
+## 完成までの行程（全体）
+
+| 段階 | 内容 | 状態 |
+|------|------|------|
+| **0 止血** | NoteId ユニーク、選択ハイライト | done |
+| **1 生成 cleanup** | bass 帯域、sync、piano same-pitch overlap、**piano quality** | **ほぼ done**（テンプレ残） |
+| **2 テンプレ品質** | Domino Piano/Bass 手編集 + golden | **次（明日以降）** |
+| **3 Tab3 仕上げ** | Gate/Vel、snap 分離、Undo | pending |
+| **4 構造** | main.rs 分割 | pending |
+| **5 プロダクト** | Arrange、プリセット、配布 | pending |
 
 ---
 
