@@ -20,32 +20,28 @@
 
 ---
 
-## 受け入れ ❌ 修正（2026-07-15 再実施待ち）
+## 受け入れフォロー（2026-07-15）
 
-| ID | 症状 | 修正 |
+| ID | 状態 | メモ |
 |----|------|------|
-| **1.1** | 短いブロックが重複 | enforce の snap-down 禁止 + place が gap で dur 制限 |
-| **1.3** | ◆2つ目無音、Clear→Bed で両方無音 | sync wrap + melodic fill 位相 + refill 一括 |
-| **3.2** | ペーストが playhead に乗らない | `snap_playhead`（1/16）を Len から分離 |
-| **4.3** | 2ループ目 1/4 重なり・つなぎシンコ感 | `clip_note_to_loop` で export/再生 |
-| UX | 先頭へ戻したい | ツールバー **`|◀`** |
+| 1.1 / 1.3 / 4.3 / \|◀ | **OK（ユーザー確認）** | |
+| **3.2 Ctrl+C/V** | 修正再投入 | Windows は `Event::Paste` + **OS テキスト** (`JPO_NOTES_V1`) が本命。ツールバー Copy/Paste も OS 経由 |
+| **Loop bars 同期** | 修正 | `loop_beats()` は **`self.loop_bars` のみ**（Bank の古い値を見ない）。長さ UI は **Progress/Bed のみ** |
+| **長いピアノ跨ぎ** | 修正 | **開始コードの終わりで truncate**（分割+移調より簡単・v1 採用） |
 
-**tests:** 33 passed（dense place / dual sync / clip / paste playhead を追加）
-
-詳細ログ: [`tests/golden/ACCEPTANCE.md`](tests/golden/ACCEPTANCE.md)
+**tests:** 36 passed
 
 ### 次
 
-1. **ユーザー再受け入れ**（上記 ID を中心に）  
-2. まだ ❌ なら最小修正のみ  
-3. v1.0.0 タグ + pack  
+1. Ctrl+C/V・ループ小節・長いノート跨ぎを再確認  
+2. OK なら v1.0.0 タグ + pack  
 
 ### 残ギャップ（DoD 外・任意）
 
 | ID | 内容 |
 |----|------|
 | G-P2b | Piano01 Gate 短縮（assets） |
-| G-UX | Sketch 統合、つなぎ目からの再生選択 |
+| G-UX | Sketch 統合、つなぎ目からの再生選択、split+transpose 方針 |
 | G-struct | main.rs 分割 |
 
 ---
