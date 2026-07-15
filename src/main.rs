@@ -1993,7 +1993,7 @@ impl Default for JpoApp {
             visible_beats: 16.0,
             current_beat: 0.0,
             edit_mode: EditMode::Select,
-            note_len: 0.5, // 1/8 note default (beat units)
+            note_len: 0.25, // 1/16 default — dense J-Pop chord placement (SPEC-v1)
             snap_enabled: true,
             active_chord_beat: None,
             selected_note: None,
@@ -2159,19 +2159,24 @@ impl JpoApp {
     }
 
     fn show_grok_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, allow_nl_text_input: bool) {
-        ui.label(egui::RichText::new("Grok import").strong());
+        ui.label(egui::RichText::new("Grok Parts").strong());
+        ui.label(
+            egui::RichText::new("P5: pass chord timeline to Grok → import MIDI parts (not full auto-arrange)")
+                .small()
+                .weak(),
+        );
         ui.horizontal(|ui| {
             ui.selectable_value(
                 &mut self.grok_import_mode,
                 GrokImportMode::NaturalLanguage,
-                "Natural language",
+                "Progression text",
             );
-            ui.selectable_value(&mut self.grok_import_mode, GrokImportMode::MidiFile, "MIDI file");
+            ui.selectable_value(&mut self.grok_import_mode, GrokImportMode::MidiFile, "MIDI part");
         });
         match self.grok_import_mode {
             GrokImportMode::NaturalLanguage => {
                 ui.label(
-                    egui::RichText::new("Paste Grok response (C | Am | F | G or I-vi-IV-V)")
+                    egui::RichText::new("Paste progression (C | Am | F | G or I-vi-IV-V) → place at playhead")
                         .small()
                         .weak(),
                 );
@@ -2182,47 +2187,52 @@ impl JpoApp {
                             .desired_rows(3)
                             .desired_width(f32::INFINITY),
                     );
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply at playhead").clicked() {
+                            self.apply_grok_natural_language(ctx);
+                        }
+                        if ui.button("Copy progression prompt").clicked() {
+                            let prompt = self.build_grok_progression_prompt();
+                            ui.ctx().output_mut(|o| o.copied_text = prompt);
+                            self.show_toast(ctx, "Progression prompt copied");
+                        }
+                    });
                 } else {
                     ui.label(
-                        egui::RichText::new("NL editor is on Tab1 only — Ctrl+C/V here edits MIDI notes")
+                        egui::RichText::new("Progression paste is on Progress tab (keeps Ctrl+C/V free for notes)")
                             .small()
                             .weak(),
                     );
                 }
-                if allow_nl_text_input {
-                ui.horizontal(|ui| {
-                    if ui.button("Apply at playhead").clicked() {
-                        self.apply_grok_natural_language(ctx);
-                    }
-                    if ui.button("Copy Grok prompt").clicked() {
-                        let roots = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-                        let prompt = format!(
-                            "J-Popコード進行提案\nKey: {} {}\nBPM: {}\nLoop: {} bars\n細かいコード割り（1/8拍単位可）で4-8小節の進行を、ローマ数字と実コード名で提案して。例: C | Am | F | G",
-                            roots[self.proj.key_root as usize],
-                            if self.proj.is_minor { "minor" } else { "major" },
-                            self.proj.bpm as i32,
-                            self.loop_bars,
-                        );
-                        ui.ctx().output_mut(|o| o.copied_text = prompt);
-                        self.show_toast(ctx, "Prompt copied");
-                    }
-                });
-                }
             }
             GrokImportMode::MidiFile => {
                 ui.label(
-                    egui::RichText::new("Import Grok-exported .mid to selected track at playhead (Edit tab)")
-                        .small()
-                        .weak(),
+                    egui::RichText::new(format!(
+                        "Import .mid → Ch{} at playhead ({:.2}). Prefer Edit tab for parts.",
+                        self.selected_ch, self.current_beat
+                    ))
+                    .small()
+                    .weak(),
                 );
-                if ui.button("Import MIDI file…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("MIDI", &["mid", "midi"])
-                        .pick_file()
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Copy Grok part context")
+                        .on_hover_text("Key, BPM, chord timeline, range, track — paste into Grok")
+                        .clicked()
                     {
-                        self.import_midi_to_selected_track(&path, ctx);
+                        let ctx_text = self.build_grok_parts_context("");
+                        ui.ctx().output_mut(|o| o.copied_text = ctx_text);
+                        self.show_toast(ctx, "Grok part context copied");
                     }
-                }
+                    if ui.button("Import MIDI…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("MIDI", &["mid", "midi"])
+                            .pick_file()
+                        {
+                            self.import_midi_to_selected_track(&path, ctx);
+                        }
+                    }
+                });
             }
         }
     }
@@ -3216,16 +3226,261 @@ impl JpoApp {
     }
 
     fn apply_chord_progression_odori(&mut self) {
+        // 1 bar per chord — classic 王道 (8 bars total when loop is 8).
+        self.apply_chord_stamp(&[
+            (0.0, 4.0, 1, ""),
+            (4.0, 4.0, 5, ""),
+            (8.0, 4.0, 6, "m"),
+            (12.0, 4.0, 4, ""),
+        ]);
+    }
+
+    /// Replace project chord blocks with a stamp starting at beat 0.
+    /// Each entry: (start, dur, degree, quality).
+    fn apply_chord_stamp(&mut self, stamp: &[(f64, f64, u8, &str)]) {
         self.begin_gesture_undo();
-        let bar = 4.0;
-        self.proj.chord_blocks = vec![
-            ChordBlock { start: 0.0, dur: bar, degree: 1, quality: "".into(), octave: 4, syncopation_fill: false },
-            ChordBlock { start: bar, dur: bar, degree: 5, quality: "".into(), octave: 4, syncopation_fill: false },
-            ChordBlock { start: bar * 2.0, dur: bar, degree: 6, quality: "m".into(), octave: 4, syncopation_fill: false },
-            ChordBlock { start: bar * 3.0, dur: bar, degree: 4, quality: "".into(), octave: 4, syncopation_fill: false },
-        ];
+        self.proj.chord_blocks = stamp
+            .iter()
+            .map(|(start, dur, degree, quality)| ChordBlock {
+                start: *start,
+                dur: *dur,
+                degree: *degree,
+                quality: (*quality).into(),
+                octave: 4,
+                syncopation_fill: false,
+            })
+            .collect();
+        self.proj
+            .chord_blocks
+            .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+        self.enforce_chord_timeline_no_overlap();
+        self.clear_chord_selection();
         self.end_gesture_undo();
         self.sync_active_bank_from_proj();
+    }
+
+    /// 半割り: 2 beats each — denser than bar-long tools.
+    fn apply_chord_stamp_half_odori(&mut self) {
+        self.apply_chord_stamp(&[
+            (0.0, 2.0, 1, ""),
+            (2.0, 2.0, 5, ""),
+            (4.0, 2.0, 6, "m"),
+            (6.0, 2.0, 4, ""),
+            (8.0, 2.0, 1, ""),
+            (10.0, 2.0, 5, ""),
+            (12.0, 2.0, 6, "m"),
+            (14.0, 2.0, 4, ""),
+        ]);
+    }
+
+    /// Dense demo: mixed 1-beat / 0.5-beat cells + one syncopated anticipation.
+    fn apply_chord_stamp_dense_demo(&mut self) {
+        self.begin_gesture_undo();
+        self.proj.chord_blocks = vec![
+            ChordBlock {
+                start: 0.0,
+                dur: 1.0,
+                degree: 1,
+                quality: "".into(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+            ChordBlock {
+                start: 1.0,
+                dur: 0.5,
+                degree: 5,
+                quality: "".into(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+            ChordBlock {
+                start: 1.5,
+                dur: 0.5,
+                degree: 6,
+                quality: "m".into(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+            ChordBlock {
+                start: 2.0,
+                dur: 1.0,
+                degree: 4,
+                quality: "".into(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+            // Anticipation into bar 2 (beat 4) — classic J-Pop push.
+            ChordBlock {
+                start: 3.5,
+                dur: 0.5,
+                degree: 5,
+                quality: "7".into(),
+                octave: 4,
+                syncopation_fill: true,
+            },
+            ChordBlock {
+                start: 4.0,
+                dur: 2.0,
+                degree: 1,
+                quality: "".into(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+            ChordBlock {
+                start: 6.0,
+                dur: 1.0,
+                degree: 6,
+                quality: "m".into(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+            ChordBlock {
+                start: 7.0,
+                dur: 1.0,
+                degree: 4,
+                quality: "".into(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+        ];
+        self.enforce_chord_timeline_no_overlap();
+        self.clear_chord_selection();
+        self.end_gesture_undo();
+        self.sync_active_bank_from_proj();
+    }
+
+    fn nudge_selected_chords(&mut self, delta_beats: f64) {
+        let targets: HashSet<usize> = if self.selection.blocks.is_empty() {
+            self.active_chord_idx().into_iter().collect()
+        } else {
+            self.selection.blocks.iter().copied().collect()
+        };
+        if targets.is_empty() {
+            return;
+        }
+        self.begin_gesture_undo();
+        for (i, b) in self.proj.chord_blocks.iter_mut().enumerate() {
+            if targets.contains(&i) {
+                b.start = (b.start + delta_beats).max(0.0);
+            }
+        }
+        self.proj
+            .chord_blocks
+            .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+        self.enforce_chord_timeline_no_overlap();
+        // Indices invalidated by sort — clear selection.
+        self.clear_chord_selection();
+        self.end_gesture_undo();
+    }
+
+    fn clear_bed_in_range(&mut self, start: f64, end: f64) {
+        let end = end.max(start + 0.25);
+        for t_idx in [1usize, 2, 9] {
+            self.proj.tracks[t_idx]
+                .notes
+                .retain(|n| n.start + n.dur <= start || n.start >= end);
+        }
+    }
+
+    fn apply_simple_bed(&mut self, ctx: &egui::Context) {
+        self.begin_gesture_undo();
+        let s = self.gen_start;
+        let e = self.gen_end.max(s + 0.25);
+        let (p, b, d) = generate_from_patterns(
+            &self.pattern_lib,
+            &self.proj,
+            s,
+            e,
+            &self.piano_pattern_id,
+            &self.bass_pattern_id,
+            &self.drum_pattern_id,
+            self.syncopation_fill,
+        );
+        let mut next_id = self.next_note_id().0;
+        replace_notes_in_range(&mut self.proj.tracks[1].notes, s, e, p, &mut next_id);
+        replace_notes_in_range(&mut self.proj.tracks[2].notes, s, e, b, &mut next_id);
+        replace_notes_in_range(&mut self.proj.tracks[9].notes, s, e, d, &mut next_id);
+        self.selection.notes.clear();
+        self.selected_note = None;
+        self.gen_preview = None;
+        self.end_gesture_undo();
+        self.show_toast(ctx, "Simple Bed → Ch2/3/10");
+    }
+
+    /// Rich context for Grok part generation (SPEC P5).
+    fn build_grok_parts_context(&self, user_instruction: &str) -> String {
+        let roots = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+        let key = format!(
+            "{} {}",
+            roots[self.proj.key_root as usize],
+            if self.proj.is_minor { "minor" } else { "major" }
+        );
+        let s = self.gen_start;
+        let e = self.gen_end.max(s + 0.25);
+        let mut lines = Vec::new();
+        lines.push(
+            "You are helping write MIDI parts for JpoProducer (J-Pop/J-Rock loop sketch tool)."
+                .to_string(),
+        );
+        lines.push(format!("Key: {key}"));
+        lines.push(format!("BPM: {}", self.proj.bpm as i32));
+        lines.push(format!(
+            "Loop: {} bars ({} beats)",
+            self.loop_bars,
+            self.loop_beats()
+        ));
+        lines.push(format!("Target range (beats): {s:.2} – {e:.2}"));
+        lines.push(format!(
+            "Target track: Ch{} ({})",
+            self.selected_ch,
+            track_short_label(self.selected_ch)
+        ));
+        lines.push("Chord timeline (start, duration, name):".to_string());
+        let mut any = false;
+        for blk in &self.proj.chord_blocks {
+            if blk.end() > s && blk.start < e {
+                any = true;
+                let sync = if blk.syncopation_fill { " ◆sync" } else { "" };
+                lines.push(format!(
+                    "  {:.2}\t{:.2}\t{}{}",
+                    blk.start,
+                    blk.dur,
+                    self.proj.chord_name(blk),
+                    sync
+                ));
+            }
+        }
+        if !any {
+            lines.push("  (no chord blocks in range)".to_string());
+        }
+        let instr = user_instruction.trim();
+        if instr.is_empty() {
+            lines.push(
+                "Request: Add a simple part that fits the chords (e.g. strings pad or light melody). Keep it sketch-level, not full arrangement."
+                    .to_string(),
+            );
+        } else {
+            lines.push(format!("Request: {instr}"));
+        }
+        lines.push(
+            "Reply with either (1) a .mid the user can Import, or (2) note lines: start_beat,duration_beats,midi_pitch,velocity"
+                .to_string(),
+        );
+        lines.join("\n")
+    }
+
+    fn build_grok_progression_prompt(&self) -> String {
+        let roots = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+        format!(
+            "J-Popコード進行提案\nKey: {} {}\nBPM: {}\nLoop: {} bars\n\
+細かいコード割り（1/16〜1/8 拍単位可・前ノリ可）で4-8小節の進行を、ローマ数字と実コード名で提案して。\n\
+1小節1コードだけでなく、1小節に2〜4コードやシンコも歓迎。\n\
+出力例: C | Am | F | G  または  I | V | vi | IV  を | 区切りで。",
+            roots[self.proj.key_root as usize],
+            if self.proj.is_minor { "minor" } else { "major" },
+            self.proj.bpm as i32,
+            self.loop_bars,
+        )
     }
 
     fn export_arrange_midi(&self, path: &str) -> Result<(), String> {
@@ -3554,16 +3809,13 @@ impl JpoApp {
             }
 
             ui.separator();
-            if ui.button("Grok (ideas) — copy prompt").clicked() {
-                let prompt = format!(
-                    "J-Pop/J-Rockコード進行提案\nKey: {} {}\nBPM: {}\n現在のブロック数: {}\n範囲: {:.1}-{:.1}\nこの部分の良い進行をローマ数字と実際のコード名で4-8小節提案して",
-                    roots[self.proj.key_root as usize],
-                    if self.proj.is_minor { "minor" } else { "major" },
-                    self.proj.bpm as i32,
-                    self.proj.chord_blocks.len(),
-                    self.gen_start,
-                    self.gen_end
-                );
+            if ui.button("Grok part context — copy").clicked() {
+                let prompt = self.build_grok_parts_context("");
+                ui.ctx().output_mut(|o| o.copied_text = prompt);
+                ui.close_menu();
+            }
+            if ui.button("Grok progression prompt — copy").clicked() {
+                let prompt = self.build_grok_progression_prompt();
                 ui.ctx().output_mut(|o| o.copied_text = prompt);
                 ui.close_menu();
             }
@@ -4193,8 +4445,8 @@ impl eframe::App for JpoApp {
             let roots = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
             ui.horizontal(|ui| {
                 for (tab, label) in [
-                    (AppTab::Chord, "1 Chord"),
-                    (AppTab::Generate, "2 Generate"),
+                    (AppTab::Chord, "1 Progress"),
+                    (AppTab::Generate, "2 Bed"),
                     (AppTab::Edit, "3 Edit"),
                     (AppTab::Arrange, "4 Arrange"),
                 ] {
@@ -4361,19 +4613,98 @@ impl eframe::App for JpoApp {
 
             match self.active_tab {
                 AppTab::Chord => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Stamps").strong());
+                        if ui
+                            .button("王道 1bar")
+                            .on_hover_text("I–V–vi–IV · 1 bar each (16 beats)")
+                            .clicked()
+                        {
+                            self.apply_chord_progression_odori();
+                            self.show_toast(ctx, "Stamp: 王道 1bar");
+                        }
+                        if ui
+                            .button("王道 ½bar")
+                            .on_hover_text("I–V–vi–IV · 2 beats each ×2 cycles")
+                            .clicked()
+                        {
+                            self.apply_chord_stamp_half_odori();
+                            self.show_toast(ctx, "Stamp: 王道 half-bar");
+                        }
+                        if ui
+                            .button("Dense demo")
+                            .on_hover_text("Mixed 1-beat / ½-beat + anticipation (J-Pop density)")
+                            .clicked()
+                        {
+                            self.apply_chord_stamp_dense_demo();
+                            self.show_toast(ctx, "Stamp: dense demo");
+                        }
+                        ui.separator();
+                        if ui.button("−1/16").on_hover_text("Nudge selection earlier (anticipation)").clicked()
+                        {
+                            self.nudge_selected_chords(-0.25);
+                        }
+                        if ui.button("−1/8").on_hover_text("Nudge selection earlier").clicked() {
+                            self.nudge_selected_chords(-0.5);
+                        }
+                        if ui.button("+1/16").clicked() {
+                            self.nudge_selected_chords(0.25);
+                        }
+                    });
                     self.show_grok_panel(ui, ctx, true);
-                    ui.label("Tip: Tab1 — click empty = place chord (Len) • right edge = stretch • Space=play");
+                    ui.label(
+                        "Tip: Progress — Len 1/16 default • click empty = place • right edge = stretch • Space=play",
+                    );
                 }
                 AppTab::Generate => {
                     ui.horizontal(|ui| {
-                        ui.label("Generate range (beats)");
+                        ui.label("Bed range (beats)");
                         ui.add(egui::DragValue::new(&mut self.gen_start).speed(0.5).range(0.0..=128.0));
                         ui.label("→");
                         ui.add(egui::DragValue::new(&mut self.gen_end).speed(0.5).range(0.0..=128.0));
-                        if ui.button("Gen=Loop").clicked() {
+                        if ui.button("Range=Loop").clicked() {
                             self.gen_start = 0.0;
                             self.gen_end = self.loop_beats();
                         }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Button::new(
+                                egui::RichText::new("Simple Bed").strong(),
+                            ))
+                            .on_hover_text("Write simple Piano+Bass+Drum bed into Ch2/3/10 (melody-friendly, not full arrange)")
+                            .clicked()
+                        {
+                            self.apply_simple_bed(ctx);
+                        }
+                        if ui.button("Preview").clicked() {
+                            let s = self.gen_start;
+                            let e = self.gen_end.max(s + 0.25);
+                            self.gen_preview = Some(generate_from_patterns(
+                                &self.pattern_lib,
+                                &self.proj,
+                                s,
+                                e,
+                                &self.piano_pattern_id,
+                                &self.bass_pattern_id,
+                                &self.drum_pattern_id,
+                                self.syncopation_fill,
+                            ));
+                            self.show_toast(ctx, "Preview ready (Bed lanes)");
+                        }
+                        if ui
+                            .button("Clear Bed")
+                            .on_hover_text("Remove Ch2/3/10 notes only in bed range")
+                            .clicked()
+                        {
+                            self.begin_gesture_undo();
+                            let s = self.gen_start;
+                            let e = self.gen_end.max(s + 0.25);
+                            self.clear_bed_in_range(s, e);
+                            self.end_gesture_undo();
+                            self.show_toast(ctx, "Cleared bed in range");
+                        }
+                        ui.checkbox(&mut self.syncopation_fill, "Syncopation fill");
                     });
                     ui.horizontal(|ui| {
                         ui.label("Piano");
@@ -4409,52 +4740,6 @@ impl eframe::App for JpoApp {
                                     }
                                 }
                             });
-                        ui.checkbox(&mut self.syncopation_fill, "Syncopation fill");
-                        if ui.button("Preview").clicked() {
-                            let s = self.gen_start;
-                            let e = self.gen_end.max(s + 0.25);
-                            self.gen_preview = Some(generate_from_patterns(
-                                &self.pattern_lib,
-                                &self.proj,
-                                s,
-                                e,
-                                &self.piano_pattern_id,
-                                &self.bass_pattern_id,
-                                &self.drum_pattern_id,
-                                self.syncopation_fill,
-                            ));
-                            self.show_toast(ctx, "Preview ready (Tab2 lanes)");
-                        }
-                        if ui.button("Generate All").clicked() {
-                            self.begin_gesture_undo();
-                            let s = self.gen_start;
-                            let e = self.gen_end.max(s + 0.25);
-                            let (p, b, d) = generate_from_patterns(
-                                &self.pattern_lib,
-                                &self.proj,
-                                s,
-                                e,
-                                &self.piano_pattern_id,
-                                &self.bass_pattern_id,
-                                &self.drum_pattern_id,
-                                self.syncopation_fill,
-                            );
-                            // Project notes are Tab3's source of truth — unique NoteId required for selection.
-                            let mut next_id = self.next_note_id().0;
-                            replace_notes_in_range(&mut self.proj.tracks[1].notes, s, e, p, &mut next_id);
-                            replace_notes_in_range(&mut self.proj.tracks[2].notes, s, e, b, &mut next_id);
-                            replace_notes_in_range(&mut self.proj.tracks[9].notes, s, e, d, &mut next_id);
-                            self.selection.notes.clear();
-                            self.selected_note = None;
-                            self.gen_preview = None;
-                            self.end_gesture_undo();
-                            self.show_toast(ctx, "Generated Ch2/3/10");
-                        }
-                        if ui.button("Clear Ch2,3,10").clicked() {
-                            self.proj.tracks[1].notes.clear();
-                            self.proj.tracks[2].notes.clear();
-                            self.proj.tracks[9].notes.clear();
-                        }
                     });
                 }
                 AppTab::Edit => {
@@ -4465,24 +4750,16 @@ impl eframe::App for JpoApp {
                         }
                         ui.label("Onion Chord");
                         ui.add(egui::Slider::new(&mut self.chord_opacity, 0.0..=1.0).step_by(0.02));
-                        if ui.button("Import MIDI…").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("MIDI", &["mid", "midi"])
-                                .pick_file()
-                            {
-                                self.import_midi_to_selected_track(&path, ctx);
-                            }
-                        }
                     });
+                    self.show_grok_panel(ui, ctx, false);
                     ui.label(
-                        egui::RichText::new("MIDI note clipboard: toolbar Copy/Paste or Ctrl+C/V (not OS clipboard)")
+                        egui::RichText::new("MIDI clipboard: toolbar or Ctrl+C/V • paste at playhead")
                             .small()
                             .weak(),
                     );
-                    ui.label("Tip: Tab3 — click empty/timeline=playhead • Select=marquee • Ctrl+C/V paste at playhead");
                 }
                 AppTab::Arrange => {
-                    ui.label("Tip: Tab4 — sequence loops • Space plays full arrange timeline");
+                    ui.label("Tip: Arrange — sequence loops • Space plays full arrange timeline");
                 }
             }
         });
@@ -4500,23 +4777,29 @@ impl eframe::App for JpoApp {
             match self.active_tab {
                 AppTab::Chord => {
                     ui.label(
-                        egui::RichText::new("TAB 1 CHORD — click place • drag move • right edge stretch")
-                            .strong(),
+                        egui::RichText::new(
+                            "1 PROGRESS — dense J-Pop chords (1/16 grid) • stamps • anticipation nudge",
+                        )
+                        .strong(),
                     );
                     let _chord_response = self.draw_chord_timeline(ui);
                     self.show_chord_strip(ui);
                 }
                 AppTab::Generate => {
                     ui.label(
-                        egui::RichText::new("TAB 2 GENERATE — preview chords + pattern accompaniment")
-                            .strong(),
+                        egui::RichText::new(
+                            "2 BED — Simple Bed = thin P+B+D under chords (not full arrange)",
+                        )
+                        .strong(),
                     );
                     let _chord_response = self.draw_chord_timeline(ui);
                     ui.add_space(6.0);
                     self.show_gen_preview_lanes(ui);
                     ui.label(
-                        egui::RichText::new("Preview = dry-run • Generate All = write Ch2/3/10 • Edit in Tab 3")
-                            .weak(),
+                        egui::RichText::new(
+                            "Preview = dry-run • Simple Bed = write Ch2/3/10 • polish in Edit",
+                        )
+                        .weak(),
                     );
                 }
                 AppTab::Edit => {
@@ -4802,20 +5085,35 @@ impl JpoApp {
         let start_b = self.visible_start;
         let end_b = start_b + self.visible_beats;
 
-        // grid + bar numbers - improved subdivisions
-        let mut b = start_b.floor();
-        while b <= end_b + 0.1 {
+        // grid: bar / beat / half / 16th — dense Progress readability (SPEC P1)
+        let mut b = (start_b * 4.0).floor() / 4.0;
+        while b <= end_b + 0.01 {
             let x = rect.min.x + ((b - start_b) * px_per_beat) as f32;
-            let is_bar = (b % 4.0).abs() < 0.01;
-            let is_beat = (b % 1.0).abs() < 0.01;
-            let width = if is_bar { 2.8 } else if is_beat { 1.7 } else { 0.9 };
-            let color = if is_bar { Color32::from_rgb(100,100,115) } else if is_beat { Color32::from_rgb(70,70,85) } else { Color32::from_rgb(48,48,60) };
+            let is_bar = (b % 4.0).abs() < 0.001;
+            let is_beat = (b % 1.0).abs() < 0.001;
+            let is_half = (b % 0.5).abs() < 0.001;
+            let (width, color) = if is_bar {
+                (2.6, Color32::from_rgb(118, 120, 138))
+            } else if is_beat {
+                (1.5, Color32::from_rgb(78, 80, 98))
+            } else if is_half {
+                (1.0, Color32::from_rgb(55, 56, 70))
+            } else {
+                // 16th — visible enough for sub-bar placement
+                (0.7, Color32::from_rgb(40, 41, 52))
+            };
             painter.line_segment(
                 [Pos2::new(x, rect.min.y + 4.0), Pos2::new(x, rect.max.y - 4.0)],
                 Stroke::new(width, color),
             );
             if is_bar {
-                painter.text(Pos2::new(x + 3.0, rect.max.y - 16.0), egui::Align2::LEFT_BOTTOM, format!("{}", (b/4.0).floor() as i32 + 1), egui::FontId::proportional(11.0), Color32::from_rgb(140,145,155));
+                painter.text(
+                    Pos2::new(x + 3.0, rect.max.y - 16.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("{}", (b / 4.0).floor() as i32 + 1),
+                    egui::FontId::proportional(11.0),
+                    Color32::from_rgb(140, 145, 155),
+                );
             }
             b += 0.25;
         }
@@ -4847,12 +5145,31 @@ impl JpoApp {
             };
             painter.rect_filled(Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)), 3.0, col);
 
+            // Short blocks: smaller font + compact name so dense J-Pop grids stay readable.
+            let width_px = (x1 - x0).max(1.0);
             let mut label = self.proj.chord_name(blk);
             if blk.syncopation_fill {
-                label.push(' ');
                 label.push('◆');
             }
-            painter.text(Pos2::new(x0 + 6.0, y0 + 6.0), egui::Align2::LEFT_TOP, label, egui::FontId::proportional(13.0), Color32::WHITE);
+            let font_size = if width_px < 22.0 {
+                9.0
+            } else if width_px < 40.0 {
+                10.5
+            } else {
+                13.0
+            };
+            if width_px < 18.0 && label.len() > 3 {
+                // Extremely narrow: first letter + quality hint
+                label = label.chars().take(2).collect();
+            }
+            let pad = if width_px < 28.0 { 2.0 } else { 6.0 };
+            painter.text(
+                Pos2::new(x0 + pad, y0 + 6.0),
+                egui::Align2::LEFT_TOP,
+                label,
+                egui::FontId::proportional(font_size),
+                Color32::WHITE,
+            );
 
             if primary {
                 painter.rect_stroke(Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)), 3.0, Stroke::new(2.0, Color32::from_rgb(255, 180, 80)));
@@ -4884,7 +5201,7 @@ impl JpoApp {
             painter.text(
                 rect.min + Vec2::new(16.0, 28.0),
                 egui::Align2::LEFT_TOP,
-                "click empty = place chord block (Len setting)",
+                "click empty = place (Len, default 1/16) • stamps above for dense J-Pop starts",
                 egui::FontId::proportional(12.0),
                 Color32::from_rgb(90, 95, 105),
             );
