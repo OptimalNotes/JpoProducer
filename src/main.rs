@@ -1513,22 +1513,38 @@ fn apply_melodic_block_range(
     let mut notes = Vec::new();
     let dur_scale = pattern_time_scale(pattern, proj);
     let block_end = block.end().min(range_end);
+    let fill_end = range_end.min(block_end);
+    let fill_start = range_start.max(block.start);
+    if fill_start >= fill_end - 0.001 {
+        return notes;
+    }
     let pat_len = pattern.length_beats.max(0.25);
-    let mut tile = pattern_tile_at(range_start, block.start, pat_len);
-    while tile < block_end {
-        for pn in &pattern.notes {
-            let t = tile + pn.start_beats;
-            if t >= range_start && t < range_end && t < block_end {
+    // Emit every pattern-note occurrence whose absolute time falls in [fill_start, fill_end).
+    // (Old tile walk missed mid-block fills when early offsets never reached fill_start
+    // before the next tile jumped past block_end — second sync window often went silent.)
+    for pn in &pattern.notes {
+        let mut k: i32 = 0;
+        loop {
+            let t = block.start + (k as f64) * pat_len + pn.start_beats;
+            if t >= fill_end - 0.001 {
+                break;
+            }
+            if t >= fill_start - 0.001 && t < block_end {
+                let raw_dur = (pn.dur_beats * dur_scale).max(0.05);
+                let dur = raw_dur.min((fill_end - t).max(0.05));
                 notes.push(Note {
                     id: NoteId(0),
                     start: t,
                     pitch: melodic_mapped_pitch(pattern, pn.pitch, proj, block),
-                    dur: (pn.dur_beats * dur_scale).max(0.05),
+                    dur,
                     vel: pn.vel,
                 });
             }
+            k += 1;
+            if k > 512 {
+                break;
+            }
         }
-        tile += pat_len;
     }
     notes
 }
@@ -1542,6 +1558,9 @@ fn refill_after_sync_windows(
     _range_start: f64,
     range_end: f64,
 ) {
+    // Collect fills first so later windows do not wipe earlier refill/sync notes mid-loop.
+    let mut to_add: Vec<Note> = Vec::new();
+    let mut clear_ranges: Vec<(f64, f64)> = Vec::new();
     for &(win_start, win_end) in windows {
         let Some(block) = chord_block_at(&proj.chord_blocks, win_start) else {
             continue;
@@ -1551,13 +1570,17 @@ fn refill_after_sync_windows(
         if fill_start >= fill_end - 0.001 {
             continue;
         }
-        notes.retain(|n| !note_overlaps_range(n, fill_start, fill_end));
+        clear_ranges.push((fill_start, fill_end));
         let added = match pattern.category {
             PatternCategory::Drum => apply_drum_pattern(pattern, proj, fill_start, fill_end),
             _ => apply_melodic_block_range(pattern, proj, block, fill_start, fill_end),
         };
-        notes.extend(added);
+        to_add.extend(added);
     }
+    for &(s, e) in &clear_ranges {
+        notes.retain(|n| !note_overlaps_range(n, s, e));
+    }
+    notes.extend(to_add);
 }
 
 fn apply_syncopation_splice(
@@ -1568,11 +1591,14 @@ fn apply_syncopation_splice(
 ) {
     let dur_scale = pattern_time_scale(sync_pattern, proj);
     for &(win_start, win_end) in windows {
+        let win_len = (win_end - win_start).max(0.05);
         let block = chord_block_at(&proj.chord_blocks, win_start);
+        let mut placed = 0usize;
 
         for pn in &sync_pattern.notes {
+            // Keep notes whose onset falls inside this (possibly short) window.
             let t = win_start + pn.start_beats;
-            if t >= win_end {
+            if t >= win_end - 0.001 {
                 continue;
             }
             let pitch = match (sync_pattern.category, block) {
@@ -1587,6 +1613,34 @@ fn apply_syncopation_splice(
                 dur: (pn.dur_beats * dur_scale).min(win_end - t).max(0.05),
                 vel: pn.vel,
             });
+            placed += 1;
+        }
+
+        // Short windows: pattern may only have hits after beat 1.0 — wrap onsets into the window
+        // so a second ◆ in the loop is never left empty.
+        if placed == 0 && !sync_pattern.notes.is_empty() {
+            for pn in &sync_pattern.notes {
+                let t_rel = pn.start_beats.rem_euclid(win_len);
+                let t = win_start + t_rel;
+                if t >= win_end - 0.001 {
+                    continue;
+                }
+                let pitch = match (sync_pattern.category, block) {
+                    (PatternCategory::Drum, _) => pn.pitch,
+                    (_, Some(b)) => melodic_mapped_pitch(sync_pattern, pn.pitch, proj, b),
+                    _ => pn.pitch,
+                };
+                notes.push(Note {
+                    id: NoteId(0),
+                    start: t,
+                    pitch,
+                    dur: (pn.dur_beats * dur_scale)
+                        .min(win_end - t)
+                        .min(win_len)
+                        .max(0.05),
+                    vel: pn.vel,
+                });
+            }
         }
     }
 }
@@ -2408,7 +2462,7 @@ impl JpoApp {
             return false;
         };
         let count = cb.notes.len();
-        let beat = self.snap_beat(self.current_beat.max(0.0));
+        let beat = self.snap_playhead(self.current_beat);
         let ch = self.selected_ch;
         let t_idx = self.track_idx();
         let before = self.proj.tracks[t_idx].notes.len();
@@ -2520,10 +2574,25 @@ impl JpoApp {
         }
     }
 
+    /// Playhead uses a fine 1/16 grid, independent of Draw Len (so paste/import stay precise).
+    fn snap_playhead(&self, beat: f64) -> f64 {
+        const STEP: f64 = 0.25;
+        let beat = beat.max(0.0);
+        if !self.snap_enabled {
+            return beat;
+        }
+        (beat / STEP).round() * STEP
+    }
+
     fn set_playhead(&mut self, beat: f64) {
-        let beat = self.snap_beat(beat.max(0.0));
+        let beat = self.snap_playhead(beat);
+        let loop_len = if self.active_tab == AppTab::Arrange {
+            self.arrange_total_beats().max(0.25)
+        } else {
+            self.loop_beats().max(0.25)
+        };
         self.current_beat = if self.loop_playback {
-            beat % self.loop_beats()
+            beat % loop_len
         } else {
             beat
         };
@@ -2533,6 +2602,10 @@ impl JpoApp {
             self.current_beat = seek_to;
             self.start_playback();
         }
+    }
+
+    fn seek_playhead_start(&mut self) {
+        self.set_playhead(0.0);
     }
 
     fn toggle_playback(&mut self) {
@@ -2666,8 +2739,12 @@ impl JpoApp {
     }
 
     /// Guarantee chord blocks never overlap (push starts, truncate durs; never delete blocks).
+    ///
+    /// Important: never snap a pushed start *downward* (that re-creates overlap when
+    /// `prev_end` falls between grid lines). Prefer exact `prev_end`, then optional snap-up.
     fn enforce_chord_timeline_no_overlap(&mut self) {
         let min_dur = self.snap_dur(self.note_len.max(0.0625));
+        let abs_min = 0.0625;
         if self.proj.chord_blocks.is_empty() {
             return;
         }
@@ -2682,21 +2759,58 @@ impl JpoApp {
             .chord_blocks
             .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
 
-        for i in 0..self.proj.chord_blocks.len() {
-            if i > 0 {
-                let prev_end = self.proj.chord_blocks[i - 1].end();
-                if self.proj.chord_blocks[i].start < prev_end - 0.001 {
-                    self.proj.chord_blocks[i].start = self.snap_beat(prev_end);
+        // Pass 1: starts must be >= previous end (no snap-down).
+        for i in 1..self.proj.chord_blocks.len() {
+            let prev_end = self.proj.chord_blocks[i - 1].end();
+            if self.proj.chord_blocks[i].start < prev_end - 0.001 {
+                let mut start = prev_end;
+                if self.snap_enabled {
+                    let step = self.note_len.max(abs_min);
+                    let snapped_up = (start / step).ceil() * step;
+                    // Only snap up when it does not re-enter the previous block.
+                    if snapped_up + 0.001 >= prev_end {
+                        start = snapped_up;
+                    }
                 }
+                self.proj.chord_blocks[i].start = start.max(0.0);
             }
+        }
+
+        // Pass 2: prefer min_dur, but never expand into the next block.
+        for i in 0..self.proj.chord_blocks.len() {
             if self.proj.chord_blocks[i].dur < min_dur {
                 self.proj.chord_blocks[i].dur = min_dur;
             }
             if i + 1 < self.proj.chord_blocks.len() {
                 let next_start = self.proj.chord_blocks[i + 1].start;
-                if self.proj.chord_blocks[i].end() > next_start + 0.001 {
-                    let new_dur = (next_start - self.proj.chord_blocks[i].start).max(min_dur);
-                    self.proj.chord_blocks[i].dur = self.snap_dur(new_dur);
+                let max_dur = next_start - self.proj.chord_blocks[i].start;
+                if max_dur < abs_min {
+                    // Zero-width gap: collapse this block to abs_min and push the rest.
+                    self.proj.chord_blocks[i].dur = abs_min;
+                    let need_end = self.proj.chord_blocks[i].end();
+                    let push = need_end - next_start;
+                    if push > 0.001 {
+                        for j in (i + 1)..self.proj.chord_blocks.len() {
+                            self.proj.chord_blocks[j].start += push;
+                        }
+                    }
+                } else if self.proj.chord_blocks[i].dur > max_dur + 0.001 {
+                    self.proj.chord_blocks[i].dur = max_dur.max(abs_min);
+                }
+            }
+        }
+
+        // Pass 3: re-check starts after any pushes from pass 2.
+        for i in 1..self.proj.chord_blocks.len() {
+            let prev_end = self.proj.chord_blocks[i - 1].end();
+            if self.proj.chord_blocks[i].start < prev_end - 0.001 {
+                self.proj.chord_blocks[i].start = prev_end;
+            }
+            if i + 1 < self.proj.chord_blocks.len() {
+                let next_start = self.proj.chord_blocks[i + 1].start;
+                let max_dur = next_start - self.proj.chord_blocks[i].start;
+                if self.proj.chord_blocks[i].dur > max_dur + 0.001 {
+                    self.proj.chord_blocks[i].dur = max_dur.max(abs_min);
                 }
             }
         }
@@ -2731,32 +2845,54 @@ impl JpoApp {
     }
 
     fn place_chord_block_at(&mut self, snapped: f64) {
-        if self
+        let want_dur = self.snap_dur(self.note_len.max(0.0625));
+        // If click lands inside a block, place just after it (dense packing).
+        let mut start = snapped.max(0.0);
+        if let Some(b) = self
             .proj
             .chord_blocks
             .iter()
-            .any(|b| snapped >= b.start - 0.001 && snapped < b.end() - 0.001)
+            .find(|b| start >= b.start - 0.001 && start < b.end() - 0.001)
         {
-            return;
+            start = b.end();
+        }
+        // Cap duration so we do not intentionally spawn an overlap.
+        let next_start = self
+            .proj
+            .chord_blocks
+            .iter()
+            .filter(|b| b.start > start + 0.001)
+            .map(|b| b.start)
+            .fold(f64::INFINITY, f64::min);
+        let mut dur = want_dur;
+        if next_start.is_finite() {
+            let gap = next_start - start;
+            if gap < 0.0625 {
+                // No room — skip rather than pile up.
+                return;
+            }
+            dur = dur.min(gap);
         }
         self.begin_gesture_undo();
         let q = self.proj.default_quality(1).to_string();
         let new = ChordBlock {
-            start: snapped,
-            dur: self.snap_dur(self.note_len.max(0.0625)),
+            start,
+            dur,
             degree: 1,
             quality: q,
             octave: 4,
             syncopation_fill: false,
         };
         self.proj.chord_blocks.push(new);
-        self.proj.chord_blocks.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+        self.proj
+            .chord_blocks
+            .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
         self.enforce_chord_timeline_no_overlap();
         if let Some(idx) = self
             .proj
             .chord_blocks
             .iter()
-            .position(|b| (b.start - snapped).abs() < 0.001)
+            .position(|b| (b.start - start).abs() < 0.001)
         {
             self.selection.blocks.clear();
             self.selection.blocks.insert(idx);
@@ -3483,6 +3619,22 @@ impl JpoApp {
         )
     }
 
+    /// Clip a note to the half-open loop range [0, loop_len). Drops notes that start at/after end.
+    fn clip_note_to_loop(n: &Note, loop_len: f64) -> Option<Note> {
+        if n.start >= loop_len - 0.001 {
+            return None;
+        }
+        let end = n.end().min(loop_len);
+        let dur = (end - n.start).max(0.05);
+        Some(Note {
+            id: n.id,
+            start: n.start.max(0.0),
+            pitch: n.pitch,
+            dur,
+            vel: n.vel,
+        })
+    }
+
     fn export_arrange_midi(&self, path: &str) -> Result<(), String> {
         let header = midly::Header::new(Format::Parallel, midly::Timing::Metrical(PPQ.into()));
         let mut smf = Smf::new(header);
@@ -3506,30 +3658,35 @@ impl JpoApp {
             let Some(sketch) = self.loop_bank.get(slot.bank_idx) else {
                 continue;
             };
+            let loop_len = sketch.beats();
             for _ in 0..slot.repeats.max(1) {
                 let chords = Self::expand_sketch_chords(sketch);
                 for n in chords {
-                    track_notes[0].push(Note {
-                        id: NoteId(0),
-                        start: beat_offset + n.start,
-                        pitch: n.pitch,
-                        dur: n.dur,
-                        vel: n.vel,
-                    });
+                    if let Some(c) = Self::clip_note_to_loop(&n, loop_len) {
+                        track_notes[0].push(Note {
+                            id: NoteId(0),
+                            start: beat_offset + c.start,
+                            pitch: c.pitch,
+                            dur: c.dur,
+                            vel: c.vel,
+                        });
+                    }
                 }
                 for tr in sketch.tracks.iter().skip(1) {
                     let ti = (tr.ch.saturating_sub(1)) as usize;
                     for n in &tr.notes {
-                        track_notes[ti].push(Note {
-                            id: NoteId(0),
-                            start: beat_offset + n.start,
-                            pitch: n.pitch,
-                            dur: n.dur,
-                            vel: n.vel,
-                        });
+                        if let Some(c) = Self::clip_note_to_loop(n, loop_len) {
+                            track_notes[ti].push(Note {
+                                id: NoteId(0),
+                                start: beat_offset + c.start,
+                                pitch: c.pitch,
+                                dur: c.dur,
+                                vel: c.vel,
+                            });
+                        }
                     }
                 }
-                beat_offset += sketch.beats();
+                beat_offset += loop_len;
             }
         }
 
@@ -3935,7 +4092,8 @@ impl JpoApp {
         }
         let t_idx = self.track_idx();
         self.begin_gesture_undo();
-        let paste_at = self.snap_beat(self.current_beat.max(0.0));
+        // Use playhead grid (1/16), not Draw Len — otherwise paste lands on the wrong beat.
+        let paste_at = self.snap_playhead(self.current_beat);
         // Standard MIDI paste: move in time only; keep source pitches.
         let pasted = build_pasted_notes(&cb, paste_at, 0, self.next_note_id());
         let pasted_ids: Vec<NoteId> = pasted.iter().map(|n| n.id).collect();
@@ -4361,6 +4519,76 @@ mod tests {
     }
 
     #[test]
+    fn dense_sixteenth_place_three_in_one_bar_no_overlap() {
+        // Acceptance 1.1: three short blocks in one bar must not pile up.
+        let mut app = JpoApp::default();
+        app.note_len = 0.25;
+        app.snap_enabled = true;
+        app.place_chord_block_at(0.0);
+        app.place_chord_block_at(0.25);
+        app.place_chord_block_at(0.5);
+        assert_eq!(app.proj.chord_blocks.len(), 3);
+        for i in 0..app.proj.chord_blocks.len() {
+            for j in (i + 1)..app.proj.chord_blocks.len() {
+                let a = &app.proj.chord_blocks[i];
+                let b = &app.proj.chord_blocks[j];
+                assert!(
+                    a.end() <= b.start + 0.001 || b.end() <= a.start + 0.001,
+                    "overlap {i}/{j}: a={:?} b={:?}",
+                    a,
+                    b
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enforce_after_off_grid_prev_end_does_not_snap_down_into_overlap() {
+        let mut app = JpoApp::default();
+        app.note_len = 0.25;
+        app.snap_enabled = true;
+        // prev ends at 0.3 — old code snapped next start down to 0.25 → overlap.
+        app.proj.chord_blocks = vec![
+            sample_chord(0.0, 0.3, 1),
+            sample_chord(0.25, 0.25, 2),
+        ];
+        app.enforce_chord_timeline_no_overlap();
+        assert!(
+            app.proj.chord_blocks[0].end() <= app.proj.chord_blocks[1].start + 0.001,
+            "snap-down overlap: {:?}",
+            app.proj.chord_blocks
+        );
+    }
+
+    #[test]
+    fn paste_uses_playhead_not_draw_len_grid() {
+        let mut app = JpoApp::default();
+        app.selected_ch = 2;
+        app.note_len = 2.0; // Draw Len coarse — must NOT force paste to even beats only.
+        app.snap_enabled = true;
+        app.proj.tracks[1].notes = vec![Note {
+            id: NoteId(1),
+            start: 0.0,
+            pitch: 60,
+            dur: 0.5,
+            vel: 90,
+        }];
+        app.selection.notes.insert((1, NoteId(1)));
+        assert!(app.copy_selection());
+        app.current_beat = 3.25; // fine playhead
+        assert!(app.paste_clipboard());
+        let pasted = app.proj.tracks[1]
+            .notes
+            .iter()
+            .find(|n| (n.start - 3.25).abs() < 0.001);
+        assert!(
+            pasted.is_some(),
+            "expected paste at 3.25, notes={:?}",
+            app.proj.tracks[1].notes
+        );
+    }
+
+    #[test]
     fn enforce_chord_blocks_never_delete_on_overlap() {
         let mut app = JpoApp::default();
         app.note_len = 1.0;
@@ -4574,6 +4802,13 @@ impl eframe::App for JpoApp {
                     .clicked()
                 {
                     self.toggle_playback();
+                }
+                if ui
+                    .button("|◀")
+                    .on_hover_text("Seek playhead to start (0)")
+                    .clicked()
+                {
+                    self.seek_playhead_start();
                 }
                 ui.monospace(format!("▸ {:.2}", self.current_beat));
             });
@@ -4929,7 +5164,12 @@ impl eframe::App for JpoApp {
             let samples = self.play_position_samples.load(Ordering::Relaxed);
             let beat = samples as f64 * self.proj.bpm / (60.0 * self.synth_sample_rate as f64);
             self.current_beat = if self.loop_playback {
-                beat % self.loop_beats()
+                let len = if self.active_tab == AppTab::Arrange {
+                    self.arrange_total_beats().max(0.25)
+                } else {
+                    self.loop_beats().max(0.25)
+                };
+                beat % len
             } else {
                 beat
             };
@@ -6009,14 +6249,17 @@ impl JpoApp {
                 let loop_len = sketch.beats();
                 for _ in 0..slot.repeats.max(1) {
                     for n in Self::expand_sketch_chords(sketch) {
-                        let start = beat_offset + n.start;
-                        let end = beat_offset + n.end();
+                        let Some(c) = Self::clip_note_to_loop(&n, loop_len) else {
+                            continue;
+                        };
+                        let start = beat_offset + c.start;
+                        let end = beat_offset + c.end();
                         let start_samp = (start * samples_per_beat) as u64;
                         let end_samp = (end * samples_per_beat) as u64;
                         let ch = 0u8;
                         let vol = self.proj.tracks[0].track_vol;
-                        let vel = scaled_velocity(n.vel, vol);
-                        Self::push_note_events(&mut events, start_samp, end_samp, ch, n.pitch, vel);
+                        let vel = scaled_velocity(c.vel, vol);
+                        Self::push_note_events(&mut events, start_samp, end_samp, ch, c.pitch, vel);
                     }
                     for (ti, tr) in sketch.tracks.iter().enumerate().skip(1) {
                         if !track_is_audible(&sketch.tracks, ti) {
@@ -6024,12 +6267,22 @@ impl JpoApp {
                         }
                         let ch = (tr.ch.saturating_sub(1)) as u8;
                         for n in &tr.notes {
-                            let start = beat_offset + n.start;
-                            let end = beat_offset + n.end();
+                            let Some(c) = Self::clip_note_to_loop(n, loop_len) else {
+                                continue;
+                            };
+                            let start = beat_offset + c.start;
+                            let end = beat_offset + c.end();
                             let start_samp = (start * samples_per_beat) as u64;
                             let end_samp = (end * samples_per_beat) as u64;
-                            let vel = scaled_velocity(n.vel, tr.track_vol);
-                            Self::push_note_events(&mut events, start_samp, end_samp, ch, n.pitch, vel);
+                            let vel = scaled_velocity(c.vel, tr.track_vol);
+                            Self::push_note_events(
+                                &mut events,
+                                start_samp,
+                                end_samp,
+                                ch,
+                                c.pitch,
+                                vel,
+                            );
                         }
                     }
                     beat_offset += loop_len;
@@ -6478,6 +6731,118 @@ mod generate_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn two_sync_windows_each_have_notes_after_bed() {
+        // Acceptance 1.3: two ◆ marks in 4 bars must not leave the second (or both) silent.
+        let lib = PatternLibrary::load();
+        let mut proj = Project::default();
+        proj.chord_blocks = vec![
+            ChordBlock {
+                start: 0.0,
+                dur: 4.0,
+                degree: 1,
+                quality: "".into(),
+                octave: 4,
+                syncopation_fill: true,
+            },
+            ChordBlock {
+                start: 4.0,
+                dur: 4.0,
+                degree: 5,
+                quality: "".into(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+            ChordBlock {
+                start: 8.0,
+                dur: 4.0,
+                degree: 6,
+                quality: "m".into(),
+                octave: 4,
+                syncopation_fill: true,
+            },
+            ChordBlock {
+                start: 12.0,
+                dur: 4.0,
+                degree: 4,
+                quality: "".into(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+        ];
+        let (piano, bass, drums) = generate_from_patterns(
+            &lib,
+            &proj,
+            0.0,
+            16.0,
+            "Piano01",
+            "Bass8beat01",
+            "Drum8beat_01",
+            true,
+        );
+        let wins = syncopation_windows(&proj, 0.0, 16.0);
+        assert_eq!(wins.len(), 2, "expected two sync windows, got {wins:?}");
+        for (i, &(ws, we)) in wins.iter().enumerate() {
+            let p_n = piano.iter().filter(|n| n.start >= ws - 0.01 && n.start < we).count();
+            let b_n = bass.iter().filter(|n| n.start >= ws - 0.01 && n.start < we).count();
+            let d_n = drums.iter().filter(|n| n.start >= ws - 0.01 && n.start < we).count();
+            assert!(
+                p_n + b_n + d_n > 0,
+                "sync window {i} [{ws}, {we}) is silent (p={p_n} b={b_n} d={d_n})"
+            );
+            // Remainder of the sync block should also have material (refill).
+            let block = chord_block_at(&proj.chord_blocks, ws).unwrap();
+            let fill_s = we;
+            let fill_e = block.end();
+            if fill_e > fill_s + 0.25 {
+                let fill_n = piano
+                    .iter()
+                    .chain(bass.iter())
+                    .chain(drums.iter())
+                    .filter(|n| n.start >= fill_s - 0.01 && n.start < fill_e)
+                    .count();
+                assert!(
+                    fill_n > 0,
+                    "refill after window {i} [{fill_s}, {fill_e}) is silent"
+                );
+            }
+        }
+        // Clear-Bed + Simple Bed equivalent: regenerate again still non-empty.
+        let (p2, b2, d2) = generate_from_patterns(
+            &lib,
+            &proj,
+            0.0,
+            16.0,
+            "Piano01",
+            "Bass8beat01",
+            "Drum8beat_01",
+            true,
+        );
+        assert!(!p2.is_empty() && !b2.is_empty() && !d2.is_empty());
+    }
+
+    #[test]
+    fn clip_note_to_loop_prevents_bleed_into_next_loop() {
+        let n = Note {
+            id: NoteId(1),
+            start: 15.0,
+            pitch: 60,
+            dur: 2.0,
+            vel: 90,
+        };
+        let c = JpoApp::clip_note_to_loop(&n, 16.0).expect("note should keep");
+        assert!((c.start - 15.0).abs() < 0.001);
+        assert!(c.end() <= 16.0 + 0.001);
+        let past = Note {
+            id: NoteId(2),
+            start: 16.0,
+            pitch: 60,
+            dur: 1.0,
+            vel: 90,
+        };
+        assert!(JpoApp::clip_note_to_loop(&past, 16.0).is_none());
     }
 
     #[test]

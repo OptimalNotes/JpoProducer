@@ -16,36 +16,37 @@
 4. **4/8/16 ループを繋いで骨格**  
 5. **Grok に進行を渡して MIDI パート追加**
 
-**ターゲット UI:** Progress / Sketch / Arrange（3WS）。  
-**現行:** 4 タブラベル = **1 Progress / 2 Bed / 3 Edit / 4 Arrange**（入力隔離は維持）。
+**現行タブ:** **1 Progress / 2 Bed / 3 Edit / 4 Arrange**
 
 ---
 
-## 2026-07-15 実装（SPEC 初回スライス）
+## 受け入れ ❌ 修正（2026-07-15 再実施待ち）
 
-| 項目 | 内容 | 状態 |
-|------|------|------|
-| タブラベル | Progress / Bed / Edit / Arrange | done |
-| P1 グリッド | bar/beat/half/16th 視認、短ブロック小フォント | done |
-| P1 既定 Len | **1/16 (0.25 beat)** | done |
-| P1 スタンプ | 王道1bar / 王道½bar / Dense demo | done |
-| P1 前ノリ | −1/16 −1/8 +1/16 ナッジ | done |
-| P2 Simple Bed | 主ボタン + Preview + **Clear Bed（範囲のみ）** | done |
-| P5 Grok Parts | 進行プロンプト / **part context（コード表付き）** / MIDI import | done |
-| Edit に Grok | MIDI part モードを Edit でも表示 | done |
-| tests | 28 passed | done |
+| ID | 症状 | 修正 |
+|----|------|------|
+| **1.1** | 短いブロックが重複 | enforce の snap-down 禁止 + place が gap で dur 制限 |
+| **1.3** | ◆2つ目無音、Clear→Bed で両方無音 | sync wrap + melodic fill 位相 + refill 一括 |
+| **3.2** | ペーストが playhead に乗らない | `snap_playhead`（1/16）を Len から分離 |
+| **4.3** | 2ループ目 1/4 重なり・つなぎシンコ感 | `clip_note_to_loop` で export/再生 |
+| UX | 先頭へ戻したい | ツールバー **`|◀`** |
 
-### まだ残るギャップ
+**tests:** 33 passed（dense place / dual sync / clip / paste playhead を追加）
 
-| ID | 柱 | 内容 | 優先 |
-|----|-----|------|------|
-| G-accept | 全体 | ユーザーが `ACCEPTANCE.md` を1周 | **次** |
-| G-P2b | P2 | Piano01 Gate 短縮（Domino assets） | 耳で必要なら |
-| G-UX | — | Tab2+3 → Sketch 統合 | v1.0 任意 |
-| G-struct | — | `main.rs` 分割 | 推奨・DoD 外 |
-| G-P3 | P3 | 受け入れ ❌ が出たらだけ修正 | 受け入れ後 |
+詳細ログ: [`tests/golden/ACCEPTANCE.md`](tests/golden/ACCEPTANCE.md)
 
-生成 cleanup（NoteId / Bass 帯域 / Piano quality / same-pitch overlap / シンコ窓）は **回帰済み・維持**。
+### 次
+
+1. **ユーザー再受け入れ**（上記 ID を中心に）  
+2. まだ ❌ なら最小修正のみ  
+3. v1.0.0 タグ + pack  
+
+### 残ギャップ（DoD 外・任意）
+
+| ID | 内容 |
+|----|------|
+| G-P2b | Piano01 Gate 短縮（assets） |
+| G-UX | Sketch 統合、つなぎ目からの再生選択 |
+| G-struct | main.rs 分割 |
 
 ---
 
