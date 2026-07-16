@@ -1848,52 +1848,36 @@ fn notes_from_clip_text(s: &str) -> Option<ClipboardNotes> {
     })
 }
 
-/// Ctrl/Cmd + letter, logical Copy/Paste keys, and raw events (Windows IME-safe).
-fn edit_clipboard_shortcut(i: &egui::InputState, letter: egui::Key, action: egui::Key) -> bool {
-    let ctrl = i.modifiers.ctrl || i.modifiers.command;
-    let from_events = i.events.iter().any(|event| {
-        matches!(
-            event,
-            egui::Event::Key {
-                key,
-                pressed: true,
-                modifiers,
-                ..
-            } if (modifiers.ctrl || modifiers.command) && (key == &letter || key == &action)
-        )
-    });
-    if from_events {
-        return true;
-    }
-    // Logical clipboard events (esp. Windows).
-    let logical = i.events.iter().any(|event| match (event, action) {
-        (egui::Event::Copy, egui::Key::Copy) => true,
-        (egui::Event::Cut, egui::Key::Cut) => true,
-        (egui::Event::Paste(_), egui::Key::Paste) => true,
-        _ => false,
-    });
-    if logical {
-        return true;
-    }
-    ctrl && (i.key_pressed(letter) || i.key_pressed(action))
+/// True if Ctrl or Cmd is held (logical match — Windows / IME friendly).
+fn ctrl_or_cmd(m: &egui::Modifiers) -> bool {
+    m.matches_logically(egui::Modifiers::CTRL) || m.command || m.ctrl
 }
 
-fn consume_edit_clipboard_shortcut(i: &mut egui::InputState, letter: egui::Key, action: egui::Key) {
-    let mods = if i.modifiers.command {
-        egui::Modifiers::COMMAND
-    } else {
-        egui::Modifiers::CTRL
-    };
-    let letter_sc = egui::KeyboardShortcut::new(mods, letter);
-    let action_sc = egui::KeyboardShortcut::new(mods, action);
-    i.consume_shortcut(&letter_sc);
-    i.consume_shortcut(&action_sc);
-    if i.key_pressed(letter) {
-        i.consume_key(mods, letter);
+/// Detect Ctrl/Cmd+letter from raw key events and key_pressed (buttons already work; keys need this).
+fn pressed_ctrl_letter(i: &egui::InputState, letter: egui::Key) -> bool {
+    for event in &i.events {
+        if let egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } = event
+        {
+            if *key == letter && ctrl_or_cmd(modifiers) {
+                return true;
+            }
+        }
     }
-    if i.key_pressed(action) {
-        i.consume_key(mods, action);
-    }
+    ctrl_or_cmd(&i.modifiers) && i.key_pressed(letter)
+}
+
+fn consume_ctrl_letter(i: &mut egui::InputState, letter: egui::Key) {
+    let sc_ctrl = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, letter);
+    let sc_cmd = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, letter);
+    let _ = i.consume_shortcut(&sc_ctrl);
+    let _ = i.consume_shortcut(&sc_cmd);
+    i.consume_key(egui::Modifiers::CTRL, letter);
+    i.consume_key(egui::Modifiers::COMMAND, letter);
 }
 
 /// A note lives under the chord it *starts* in. Longer tails that cross a chord change
@@ -2565,15 +2549,13 @@ impl JpoApp {
             return false;
         }
 
-        let ctrl = i.modifiers.ctrl;
-
-        if ctrl && i.key_pressed(egui::Key::A) {
+        if pressed_ctrl_letter(i, egui::Key::A) {
             self.select_all_notes_in_track(self.track_idx());
-            i.consume_key(egui::Modifiers::CTRL, egui::Key::A);
+            consume_ctrl_letter(i, egui::Key::A);
             return true;
         }
 
-        if edit_clipboard_shortcut(i, egui::Key::C, egui::Key::Copy) {
+        if pressed_ctrl_letter(i, egui::Key::C) {
             if self.has_note_selection() {
                 if self.copy_selection_to(Some(ctx)) {
                     let n = self.clipboard.as_ref().map(|c| c.notes.len()).unwrap_or(0);
@@ -2584,11 +2566,11 @@ impl JpoApp {
             } else {
                 self.show_edit_feedback(ctx, "Copy — select notes first");
             }
-            consume_edit_clipboard_shortcut(i, egui::Key::C, egui::Key::Copy);
+            consume_ctrl_letter(i, egui::Key::C);
             return true;
         }
 
-        if edit_clipboard_shortcut(i, egui::Key::X, egui::Key::Cut) {
+        if pressed_ctrl_letter(i, egui::Key::X) {
             if self.cut_selection() {
                 if let Some(cb) = self.clipboard.as_ref() {
                     ctx.copy_text(notes_to_clip_text(&cb.notes, cb.min_start));
@@ -2597,27 +2579,30 @@ impl JpoApp {
             } else {
                 self.show_edit_feedback(ctx, "Cut — nothing selected");
             }
-            consume_edit_clipboard_shortcut(i, egui::Key::X, egui::Key::Cut);
+            consume_ctrl_letter(i, egui::Key::X);
             return true;
         }
 
-        if edit_clipboard_shortcut(i, egui::Key::V, egui::Key::Paste) {
-            // Prefer OS text if present (handled in handle_os_clipboard_events); key path uses internal.
+        if pressed_ctrl_letter(i, egui::Key::V) {
             self.try_paste_notes(ctx);
-            consume_edit_clipboard_shortcut(i, egui::Key::V, egui::Key::Paste);
+            consume_ctrl_letter(i, egui::Key::V);
             return true;
         }
 
-        if ctrl && i.key_pressed(egui::Key::D) {
+        if pressed_ctrl_letter(i, egui::Key::D) {
             if self.duplicate_selection() {
                 self.show_edit_feedback(ctx, "Duplicated notes");
             }
-            i.consume_key(egui::Modifiers::CTRL, egui::Key::D);
+            consume_ctrl_letter(i, egui::Key::D);
             return true;
         }
 
         if self.has_note_selection() {
-            let step = if i.modifiers.shift { self.note_len } else { 0.25 };
+            let step = if i.modifiers.shift {
+                self.note_len
+            } else {
+                0.25
+            };
             if i.key_pressed(egui::Key::ArrowLeft) {
                 self.nudge_selection(-step, 0);
                 return true;
@@ -2674,21 +2659,39 @@ impl JpoApp {
         } else {
             self.loop_beats().max(0.25)
         };
-        self.current_beat = if self.loop_playback {
-            beat % loop_len
+        // Avoid % 0 and NaN if loop length is broken.
+        let loop_len = if loop_len.is_finite() && loop_len > 0.0 {
+            loop_len
         } else {
-            beat
+            16.0
+        };
+        let beat = if beat.is_finite() { beat } else { 0.0 };
+        self.current_beat = if self.loop_playback {
+            beat.rem_euclid(loop_len)
+        } else {
+            beat.max(0.0)
         };
         if self.audio_stream.is_some() {
             let seek_to = self.current_beat;
             self.stop_playback();
             self.current_beat = seek_to;
+            // Don't restart audio on pure seek-to-zero unless user hits Play again —
+            // restarting mid-frame has crashed on some Windows/cpal setups.
+            // Only restart if we were playing and seek is not to start from the 0 button
+            // while stopped… actually was-playing case: restart to apply seek.
             self.start_playback();
         }
     }
 
     fn seek_playhead_start(&mut self) {
-        self.set_playhead(0.0);
+        let was_playing = self.audio_stream.is_some();
+        if was_playing {
+            self.stop_playback();
+        }
+        self.current_beat = 0.0;
+        if was_playing {
+            self.start_playback();
+        }
     }
 
     fn toggle_playback(&mut self) {
@@ -2740,14 +2743,14 @@ impl JpoApp {
         dist_right >= -POINTER_SLOP_PX && dist_right <= resize_px
     }
 
-    /// Right-edge pixel zone = stretch; everything else on the block = move. No modifier key.
-    /// resize_px: min(32, width*0.4), floor 16px. Slop: 12px outside right edge still counts as resize.
+    /// Right-edge pixel zone = stretch; everything else on the block = move.
+    /// Wide grip so 1/16 blocks stay stretchable (operability closer to 1/4 feel).
     fn chord_hit_at(ptr_x: f32, block_x0: f32, block_x1: f32, beat: f64, blk: &ChordBlock) -> ChordDragKind {
         if beat < blk.start || beat > blk.end() {
             return ChordDragKind::None;
         }
         let width = (block_x1 - block_x0).max(1.0);
-        let resize_px = 32.0f32.min(width * 0.4).max(20.0);
+        let resize_px = 28.0f32.min(width * 0.55).max(14.0);
         let dist_right = block_x1 - ptr_x;
         if dist_right >= -POINTER_SLOP_PX && dist_right <= resize_px {
             ChordDragKind::Resize
@@ -4110,6 +4113,17 @@ impl JpoApp {
         ((dur / step).round() * step).max(step)
     }
 
+    /// Progress: grid may be 1/16, but stretch/hit targets stay usable at ≥1/4 beat
+    /// (unless Len is coarser, e.g. 1/2 → use 1/2). Placement can still use fine Len.
+    fn chord_resize_min_dur(&self) -> f64 {
+        let grid = if self.snap_enabled {
+            self.note_len.max(0.0625)
+        } else {
+            0.0625
+        };
+        self.snap_dur(grid.max(0.25))
+    }
+
     fn begin_gesture_undo(&mut self) {
         if !self.gesture_undo_saved {
             self.undo.push(&self.proj);
@@ -4206,22 +4220,28 @@ impl JpoApp {
             return false;
         }
         let t_idx = self.track_idx();
+        // Cross-track paste (e.g. Ch2 → Ch4): guard against bad indices / empty track table.
+        if t_idx >= self.proj.tracks.len() {
+            return false;
+        }
         self.begin_gesture_undo();
         // Use playhead grid (1/16), not Draw Len — otherwise paste lands on the wrong beat.
         let paste_at = self.snap_playhead(self.current_beat);
-        // Standard MIDI paste: move in time only; keep source pitches.
+        // Standard MIDI paste: move in time only; keep source pitches. Target track may differ.
         let mut pasted = build_pasted_notes(&cb, paste_at, 0, self.next_note_id());
         // Long notes that land across a chord change: truncate at starting chord end.
         clip_notes_to_starting_chord(&mut pasted, &self.proj.chord_blocks);
         let pasted_ids: Vec<NoteId> = pasted.iter().map(|n| n.id).collect();
+        // Clear selection from source track so UI doesn't keep ghost highlights.
         self.selection.notes.clear();
+        self.selected_note = None;
         for new_n in pasted {
             self.proj.tracks[t_idx].notes.push(new_n);
         }
         self.proj.tracks[t_idx].notes.sort_by(|a, b| {
             a.start
                 .partial_cmp(&b.start)
-                .unwrap()
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.pitch.cmp(&b.pitch))
         });
         for id in pasted_ids {
@@ -4229,21 +4249,28 @@ impl JpoApp {
                 self.selection.notes.insert((t_idx, id));
             }
         }
-        self.selected_note = self.selection.notes.iter().find(|&&(t, _)| t == t_idx).copied();
+        self.selected_note = self
+            .selection
+            .notes
+            .iter()
+            .filter(|&&(t, _)| t == t_idx)
+            .min_by_key(|(_, id)| id.0)
+            .copied();
         self.ensure_beat_visible(paste_at);
         self.end_gesture_undo();
         true
     }
 
     /// Handle OS / egui clipboard events (Copy, Cut, Paste text). Call once per frame on Edit.
+    ///
+    /// Important: do **not** gate on `wants_keyboard_input()` for Copy — a focused text field
+    /// on another tab left focus and blocked Ctrl entirely. For Paste, only skip non-JPO text
+    /// when a text field wants input.
     fn handle_os_clipboard_events(&mut self, ctx: &egui::Context) -> bool {
         if self.active_tab != AppTab::Edit || self.selected_ch == 1 {
             return false;
         }
-        if ctx.wants_keyboard_input() {
-            // Don't steal paste from text fields (Grok NL on other tabs, etc.).
-            return false;
-        }
+        let text_focus = ctx.wants_keyboard_input();
         let mut did = false;
         let mut paste_payload: Option<String> = None;
         let mut want_copy = false;
@@ -4262,7 +4289,7 @@ impl JpoApp {
             if self.has_note_selection() {
                 if self.copy_selection_to(Some(ctx)) {
                     let n = self.clipboard.as_ref().map(|c| c.notes.len()).unwrap_or(0);
-                    self.show_edit_feedback(ctx, format!("Copied {n} note(s) [OS clipboard]"));
+                    self.show_edit_feedback(ctx, format!("Copied {n} note(s)"));
                 }
             } else {
                 self.show_edit_feedback(ctx, "Copy — select notes first");
@@ -4271,7 +4298,6 @@ impl JpoApp {
         }
         if want_cut {
             if self.cut_selection() {
-                // cut_selection calls copy then delete — ensure OS text is set
                 if let Some(cb) = self.clipboard.as_ref() {
                     ctx.copy_text(notes_to_clip_text(&cb.notes, cb.min_start));
                 }
@@ -4286,17 +4312,18 @@ impl JpoApp {
                 self.clipboard = Some(cb);
                 self.try_paste_notes(ctx);
                 did = true;
-            } else if self.clipboard.is_some() {
-                // Fallback: internal clipboard if OS text is unrelated.
+            } else if !text_focus && self.clipboard.is_some() {
+                // OS paste fired (Ctrl+V) but text isn't ours — use internal note clipboard.
                 self.try_paste_notes(ctx);
                 did = true;
-            } else {
+            } else if !text_focus {
                 self.show_edit_feedback(
                     ctx,
                     "Paste — no Jpo notes on clipboard (select + Copy first)",
                 );
                 did = true;
             }
+            // If text_focus and non-JPO paste: leave for the text field.
         }
         did
     }
@@ -4772,6 +4799,34 @@ mod tests {
     }
 
     #[test]
+    fn paste_cross_track_ch2_to_ch4_does_not_panic() {
+        let mut app = JpoApp::default();
+        app.active_tab = AppTab::Edit;
+        app.selected_ch = 2;
+        // Many generated-like notes (repro for crash reports).
+        app.proj.tracks[1].notes = (0..64)
+            .map(|i| Note {
+                id: NoteId(i + 1),
+                start: i as f64 * 0.25,
+                pitch: 60 + (i % 12) as u8,
+                dur: 0.5,
+                vel: 90,
+            })
+            .collect();
+        app.selection.notes = app.proj.tracks[1]
+            .notes
+            .iter()
+            .map(|n| (1usize, n.id))
+            .collect();
+        assert!(app.copy_selection());
+        app.selected_ch = 4;
+        app.current_beat = 0.0;
+        assert!(app.paste_clipboard());
+        assert_eq!(app.proj.tracks[3].notes.len(), 64);
+        assert!(app.proj.tracks[3].notes.iter().all(|n| n.id.0 != 0));
+    }
+
+    #[test]
     fn notes_clip_text_roundtrip() {
         let notes = vec![
             Note {
@@ -4874,8 +4929,9 @@ impl eframe::App for JpoApp {
                 }
             });
         }
-        // OS clipboard events first (Windows: Ctrl+V → Event::Paste(text)).
-        let mut edit_shortcuts_handled = self.handle_os_clipboard_events(ctx);
+        // Clipboard: OS events (Event::Copy/Paste) + Ctrl+letter. Run again after UI
+        // because widgets can swallow keys on the first pass (buttons work; keys need retry).
+        let _ = self.handle_os_clipboard_events(ctx);
         ctx.input_mut(|i| {
             if i.key_pressed(egui::Key::Delete) {
                 if self.active_tab == AppTab::Chord && !self.selected_chord_indices().is_empty() {
@@ -4897,9 +4953,7 @@ impl eframe::App for JpoApp {
                 self.do_redo();
                 i.consume_key(egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT), egui::Key::Z);
             }
-            if !edit_shortcuts_handled {
-                edit_shortcuts_handled = self.handle_edit_shortcuts(ctx, i);
-            }
+            let _ = self.handle_edit_shortcuts(ctx, i);
         });
 
         if let Some(ref msg) = self.status_toast {
@@ -4917,9 +4971,13 @@ impl eframe::App for JpoApp {
             }
         }
 
-        // Top toolbar — compact: play always visible; extras live in Tools menu
+        // Top toolbar — horizontal scroll so Play / |◀ never clip off-screen (click crash risk).
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             let roots = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+            egui::ScrollArea::horizontal()
+                .id_salt("toolbar_scroll")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
             ui.horizontal(|ui| {
                 for (tab, label) in [
                     (AppTab::Chord, "1 Progress"),
@@ -5044,23 +5102,25 @@ impl eframe::App for JpoApp {
                 );
 
                 ui.separator();
-                let play_label = if self.audio_stream.is_some() { "■ Stop" } else { "▶ Play" };
+                // Keep transport compact and always inside the scroll strip.
+                let play_label = if self.audio_stream.is_some() { "■" } else { "▶" };
                 if ui
-                    .add(egui::Button::new(play_label).min_size(egui::vec2(72.0, 0.0)))
-                    .on_hover_text("Space")
+                    .add(egui::Button::new(play_label).min_size(egui::vec2(36.0, 0.0)))
+                    .on_hover_text("Play / Stop (Space)")
                     .clicked()
                 {
                     self.toggle_playback();
                 }
                 if ui
-                    .button("|◀")
-                    .on_hover_text("Seek playhead to start (0)")
+                    .add(egui::Button::new("0").min_size(egui::vec2(28.0, 0.0)))
+                    .on_hover_text("Seek playhead to start")
                     .clicked()
                 {
                     self.seek_playhead_start();
                 }
-                ui.monospace(format!("▸ {:.2}", self.current_beat));
+                ui.monospace(format!("▸{:.1}", self.current_beat));
             });
+            }); // ScrollArea
         });
 
         // Bottom controls — loop *length* is only on Progress/Bed (SoT). Playback loop toggle here.
@@ -5411,10 +5471,11 @@ impl eframe::App for JpoApp {
             }
         });
 
-        // Tab3: retry clipboard shortcuts after UI (widgets can swallow key_pressed early).
-        if !edit_shortcuts_handled && self.active_tab == AppTab::Edit && self.selected_ch != 1 {
+        // Tab3: retry clipboard after UI (widgets can swallow key_pressed on first pass).
+        if self.active_tab == AppTab::Edit && self.selected_ch != 1 {
+            let _ = self.handle_os_clipboard_events(ctx);
             ctx.input_mut(|i| {
-                self.handle_edit_shortcuts(ctx, i);
+                let _ = self.handle_edit_shortcuts(ctx, i);
             });
         }
 
@@ -5642,6 +5703,7 @@ impl JpoApp {
             } else {
                 Color32::from_rgb(70, 95, 125)
             };
+            // Draw true time range; hit/resize uses wider edge (chord_hit_at) for short blocks.
             painter.rect_filled(Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)), 3.0, col);
 
             // Short blocks: smaller font + compact name so dense J-Pop grids stay readable.
@@ -5673,7 +5735,8 @@ impl JpoApp {
             if primary {
                 painter.rect_stroke(Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)), 3.0, Stroke::new(2.0, Color32::from_rgb(255, 180, 80)));
                 let width = (x1 - x0).max(1.0);
-                let resize_px = 16.0f32.min(width * 0.35).max(8.0);
+                // Wide resize grip so 1/16 blocks stay stretchable (operability ≥ ~1/4 feel).
+                let resize_px = 28.0f32.min(width.max(12.0) * 0.55).max(14.0);
                 let hx0 = x1 - resize_px;
                 painter.rect_filled(
                     Rect::from_min_max(Pos2::new(hx0, y0 + 3.0), Pos2::new(x1, y1 - 3.0)),
@@ -5775,7 +5838,7 @@ impl JpoApp {
                         if i < self.proj.chord_blocks.len() {
                             let (orig_start, _orig_dur) = self.block_drag_orig;
                             let db = beat - self.drag_start_beat;
-                            let min_dur = self.snap_dur(self.note_len.max(0.0625));
+                            let min_dur = self.chord_resize_min_dur();
                             match self.chord_drag_kind {
                                 ChordDragKind::Resize => {
                                     let max_end = self.chord_resize_max_end(i);
