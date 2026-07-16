@@ -551,9 +551,15 @@ impl Default for Project {
     fn default() -> Self {
         let mut tracks = Vec::new();
         for ch in 1..=16 {
+            // GM: 0 Acoustic Grand, 34 Electric Bass (pick)
             let default_patch = match ch {
-                3 => 33, // Finger Bass for track 3 (Root Basist)
+                3 => 34, // Pick bass (Ch3 / track 03)
                 _ => 0,
+            };
+            // Ch2 piano default a bit quieter so bed sits under melody writing
+            let track_vol = match ch {
+                2 => 0.75, // V75
+                _ => 1.0,
             };
             tracks.push(TrackData {
                 ch,
@@ -561,7 +567,7 @@ impl Default for Project {
                 patch: default_patch,
                 muted: false,
                 solo: false,
-                track_vol: 1.0,
+                track_vol,
             });
         }
         Self {
