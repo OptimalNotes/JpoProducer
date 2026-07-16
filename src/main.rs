@@ -2743,19 +2743,52 @@ impl JpoApp {
         dist_right >= -POINTER_SLOP_PX && dist_right <= resize_px
     }
 
-    /// Right-edge pixel zone = stretch; everything else on the block = move.
-    /// Wide grip so 1/16 blocks stay stretchable (operability closer to 1/4 feel).
-    fn chord_hit_at(ptr_x: f32, block_x0: f32, block_x1: f32, beat: f64, blk: &ChordBlock) -> ChordDragKind {
-        if beat < blk.start || beat > blk.end() {
-            return ChordDragKind::None;
-        }
-        let width = (block_x1 - block_x0).max(1.0);
-        let resize_px = 28.0f32.min(width * 0.55).max(14.0);
-        let dist_right = block_x1 - ptr_x;
-        if dist_right >= -POINTER_SLOP_PX && dist_right <= resize_px {
-            ChordDragKind::Resize
+    /// Minimum interactive / visual chord width in beats for Progress (Len may be 1/16).
+    /// Coarser Len (e.g. 1/2) keeps that coarser size.
+    fn chord_ui_min_beats(&self) -> f64 {
+        let grid = if self.snap_enabled {
+            self.note_len.max(0.0625)
         } else {
+            0.25
+        };
+        grid.max(0.25)
+    }
+
+    /// Hit-test chord strip. Resize is **pixel-based** from the right edge so short 1/16
+    /// blocks remain stretchable (beat-in-block tests fail on a ~4px sliver).
+    fn chord_hit_at(
+        ptr_x: f32,
+        block_x0: f32,
+        block_x1: f32,
+        beat: f64,
+        blk: &ChordBlock,
+        px_per_beat: f64,
+        ui_min_beats: f64,
+    ) -> ChordDragKind {
+        // Expand hit box to at least ui_min_beats (visual 1/4 floor) without changing data.
+        let min_w = (ui_min_beats * px_per_beat) as f32;
+        let hit_x1 = block_x1.max(block_x0 + min_w);
+        let pad = POINTER_SLOP_PX;
+        if ptr_x < block_x0 - pad || ptr_x > hit_x1 + pad {
+            // Also allow a little past true end for resize grab.
+            if ptr_x < block_x0 - pad || ptr_x > block_x1 + 20.0 {
+                return ChordDragKind::None;
+            }
+        }
+        // Resize: near right edge of *expanded* box (or true end if wider).
+        let grip = 20.0f32.max(min_w * 0.35).min(36.0);
+        let edge = hit_x1.max(block_x1);
+        let dist_right = edge - ptr_x;
+        if dist_right >= -pad && dist_right <= grip {
+            return ChordDragKind::Resize;
+        }
+        // Move: pointer over true block body (beat or x).
+        let in_x = ptr_x >= block_x0 - pad && ptr_x <= block_x1 + pad;
+        let in_beat = beat >= blk.start - 0.02 && beat <= blk.end() + 0.02;
+        if in_x || in_beat {
             ChordDragKind::Move
+        } else {
+            ChordDragKind::None
         }
     }
 
@@ -4113,15 +4146,9 @@ impl JpoApp {
         ((dur / step).round() * step).max(step)
     }
 
-    /// Progress: grid may be 1/16, but stretch/hit targets stay usable at ≥1/4 beat
-    /// (unless Len is coarser, e.g. 1/2 → use 1/2). Placement can still use fine Len.
+    /// Progress: while resizing, snap length to grid but never force below ui min (1/4).
     fn chord_resize_min_dur(&self) -> f64 {
-        let grid = if self.snap_enabled {
-            self.note_len.max(0.0625)
-        } else {
-            0.0625
-        };
-        self.snap_dur(grid.max(0.25))
+        self.snap_dur(self.chord_ui_min_beats())
     }
 
     fn begin_gesture_undo(&mut self) {
@@ -5685,11 +5712,16 @@ impl JpoApp {
             self.chord_timeline_mouse_beat = beat;
         }
 
-        // blocks
+        // blocks — true duration in data; draw ≥ ui_min beats so stretch stays usable
+        let ui_min_draw = self.chord_ui_min_beats();
+        let min_w_px = (ui_min_draw * px_per_beat) as f32;
         for (i, blk) in self.proj.chord_blocks.iter().enumerate() {
-            if blk.end() < start_b || blk.start > end_b { continue; }
+            if blk.end() < start_b || blk.start > end_b {
+                continue;
+            }
             let x0 = rect.min.x + ((blk.start - start_b) * px_per_beat) as f32;
-            let x1 = rect.min.x + ((blk.end() - start_b) * px_per_beat) as f32;
+            let x1_true = rect.min.x + ((blk.end() - start_b) * px_per_beat) as f32;
+            let x1 = x1_true.max(x0 + min_w_px);
             let y0 = rect.min.y + 8.0;
             let y1 = rect.max.y - 8.0;
 
@@ -5703,51 +5735,57 @@ impl JpoApp {
             } else {
                 Color32::from_rgb(70, 95, 125)
             };
-            // Draw true time range; hit/resize uses wider edge (chord_hit_at) for short blocks.
-            painter.rect_filled(Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)), 3.0, col);
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)),
+                3.0,
+                col,
+            );
+            if x1 > x1_true + 1.0 {
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(x1_true, y0), Pos2::new(x1, y1)),
+                    0.0,
+                    Color32::from_rgba_unmultiplied(40, 40, 50, 100),
+                );
+                painter.line_segment(
+                    [Pos2::new(x1_true, y0), Pos2::new(x1_true, y1)],
+                    Stroke::new(1.0, Color32::from_rgb(120, 130, 150)),
+                );
+            }
 
-            // Short blocks: smaller font + compact name so dense J-Pop grids stay readable.
             let width_px = (x1 - x0).max(1.0);
             let mut label = self.proj.chord_name(blk);
             if blk.syncopation_fill {
                 label.push('◆');
             }
-            let font_size = if width_px < 22.0 {
-                9.0
-            } else if width_px < 40.0 {
-                10.5
-            } else {
-                13.0
-            };
-            if width_px < 18.0 && label.len() > 3 {
-                // Extremely narrow: first letter + quality hint
-                label = label.chars().take(2).collect();
-            }
-            let pad = if width_px < 28.0 { 2.0 } else { 6.0 };
+            let font_size = if width_px < 28.0 { 10.0 } else if width_px < 48.0 { 11.5 } else { 13.0 };
             painter.text(
-                Pos2::new(x0 + pad, y0 + 6.0),
+                Pos2::new(x0 + 4.0, y0 + 6.0),
                 egui::Align2::LEFT_TOP,
                 label,
                 egui::FontId::proportional(font_size),
                 Color32::WHITE,
             );
 
+            // Stretch grip on every block (right edge of visual body)
+            let grip = 18.0f32.min(width_px * 0.45).max(10.0);
+            let hx0 = x1 - grip;
+            painter.rect_filled(
+                Rect::from_min_max(Pos2::new(hx0, y0 + 2.0), Pos2::new(x1, y1 - 2.0)),
+                1.0,
+                Color32::from_rgba_unmultiplied(255, 200, 120, if primary { 120 } else { 60 }),
+            );
+            painter.line_segment(
+                [Pos2::new(x1 - 1.0, y0 + 3.0), Pos2::new(x1 - 1.0, y1 - 3.0)],
+                Stroke::new(if primary { 2.0 } else { 1.2 }, Color32::from_rgb(255, 200, 120)),
+            );
+
             if primary {
-                painter.rect_stroke(Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)), 3.0, Stroke::new(2.0, Color32::from_rgb(255, 180, 80)));
-                let width = (x1 - x0).max(1.0);
-                // Wide resize grip so 1/16 blocks stay stretchable (operability ≥ ~1/4 feel).
-                let resize_px = 28.0f32.min(width.max(12.0) * 0.55).max(14.0);
-                let hx0 = x1 - resize_px;
-                painter.rect_filled(
-                    Rect::from_min_max(Pos2::new(hx0, y0 + 3.0), Pos2::new(x1, y1 - 3.0)),
-                    1.0,
-                    Color32::from_rgba_unmultiplied(255, 200, 120, 70),
+                painter.rect_stroke(
+                    Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)),
+                    3.0,
+                    Stroke::new(2.0, Color32::from_rgb(255, 180, 80)),
                 );
-                painter.line_segment(
-                    [Pos2::new(x1 - 1.0, y0 + 4.0), Pos2::new(x1 - 1.0, y1 - 4.0)],
-                    Stroke::new(2.0, Color32::from_rgb(255, 200, 120)),
-                );
-            } else if self.selection.blocks.contains(&i) {
+            } else if selected {
                 painter.rect_stroke(
                     Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)),
                     3.0,
@@ -5769,20 +5807,26 @@ impl JpoApp {
             );
         }
 
-        // interaction (Chord tab only) — click place, drag move/resize, no drag-to-create
-        if editable && (resp.clicked() || resp.dragged() || resp.double_clicked()) {
+        // interaction (Chord tab only) — click place, drag move/resize
+        if editable && (resp.clicked() || resp.dragged() || resp.double_clicked() || resp.drag_started()) {
             if let Some(ptr) = resp.interact_pointer_pos() {
                 let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
                 let snapped = self.snap_beat(beat);
+                let ui_min = self.chord_ui_min_beats();
 
                 let chord_hit = |app: &JpoApp, beat: f64, ptr_x: f32| -> Option<(usize, ChordDragKind)> {
                     for (i, blk) in app.proj.chord_blocks.iter().enumerate().rev() {
-                        if beat < blk.start || beat > blk.end() {
-                            continue;
-                        }
                         let x0 = rect.min.x + ((blk.start - start_b) * px_per_beat) as f32;
                         let x1 = rect.min.x + ((blk.end() - start_b) * px_per_beat) as f32;
-                        let kind = JpoApp::chord_hit_at(ptr_x, x0, x1, beat, blk);
+                        let kind = JpoApp::chord_hit_at(
+                            ptr_x,
+                            x0,
+                            x1,
+                            beat,
+                            blk,
+                            px_per_beat,
+                            ui_min,
+                        );
                         if kind != ChordDragKind::None {
                             return Some((i, kind));
                         }
@@ -5802,7 +5846,8 @@ impl JpoApp {
                             self.chord_drag_kind = ChordDragKind::None;
                             self.chord_drag_block_idx = None;
                             self.end_gesture_undo();
-                        } else if self.edit_mode == EditMode::Draw {
+                        } else {
+                            // Stretch/move in Draw *and* Select — Erase only deletes.
                             self.begin_gesture_undo();
                             let blk = self.proj.chord_blocks[i].clone();
                             self.select_chord_block(i, false);
@@ -5827,7 +5872,7 @@ impl JpoApp {
                             self.set_playhead(beat);
                             self.preview_chord_block(&blk);
                         }
-                    } else if self.edit_mode == EditMode::Draw {
+                    } else if self.edit_mode != EditMode::Erase {
                         self.set_playhead(snapped);
                         self.place_chord_block_at(snapped);
                     }
@@ -5836,16 +5881,29 @@ impl JpoApp {
                 if resp.dragged() {
                     if let Some(i) = self.chord_drag_block_idx {
                         if i < self.proj.chord_blocks.len() {
-                            let (orig_start, _orig_dur) = self.block_drag_orig;
+                            let (orig_start, orig_dur) = self.block_drag_orig;
                             let db = beat - self.drag_start_beat;
                             let min_dur = self.chord_resize_min_dur();
                             match self.chord_drag_kind {
                                 ChordDragKind::Resize => {
                                     let max_end = self.chord_resize_max_end(i);
-                                    let snapped_end = self.snap_beat(beat).min(max_end);
-                                    let new_end = snapped_end.max(orig_start + min_dur);
-                                    let new_dur = self.snap_dur(new_end - orig_start);
-                                    self.proj.chord_blocks[i].dur = new_dur.max(min_dur);
+                                    // Pointer-follow: new end = original end + delta.
+                                    let mut new_end = orig_start + orig_dur + db;
+                                    new_end = self.snap_beat(new_end);
+                                    if max_end.is_finite() {
+                                        new_end = new_end.min(max_end);
+                                    }
+                                    let room = if max_end.is_finite() {
+                                        (max_end - orig_start).max(0.0625)
+                                    } else {
+                                        f64::INFINITY
+                                    };
+                                    let floor = min_dur.min(room);
+                                    let mut new_dur = (new_end - orig_start).max(floor);
+                                    if new_dur > room {
+                                        new_dur = room;
+                                    }
+                                    self.proj.chord_blocks[i].dur = new_dur.max(0.0625);
                                 }
                                 ChordDragKind::Move => {
                                     let raw = self.snap_beat((orig_start + db).max(0.0));
