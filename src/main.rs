@@ -1785,10 +1785,27 @@ struct ArrangeSlot {
     bank_idx: usize,
     #[serde(default = "default_arrange_repeats")]
     repeats: u8,
+    /// Color palette index for the song-chain block (0..CHAIN_PALETTE_LEN).
+    #[serde(default)]
+    color_idx: u8,
 }
 
 fn default_arrange_repeats() -> u8 {
     1
+}
+
+const CHAIN_PALETTE_LEN: usize = 6;
+
+fn chain_slot_color(color_idx: u8) -> Color32 {
+    const PAL: [Color32; CHAIN_PALETTE_LEN] = [
+        Color32::from_rgb(62, 118, 168),  // blue
+        Color32::from_rgb(72, 140, 98),   // green
+        Color32::from_rgb(168, 112, 64),  // amber
+        Color32::from_rgb(118, 92, 158),  // purple
+        Color32::from_rgb(158, 88, 104),  // rose
+        Color32::from_rgb(64, 128, 132),  // teal
+    ];
+    PAL[(color_idx as usize) % CHAIN_PALETTE_LEN]
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2163,7 +2180,11 @@ impl Default for JpoApp {
             syncopation_fill: true,
             gen_preview: None,
             active_tab: AppTab::Chord,
-            arrange_sequence: vec![ArrangeSlot { bank_idx: 0, repeats: 1 }],
+            arrange_sequence: vec![ArrangeSlot {
+                bank_idx: 0,
+                repeats: 1,
+                color_idx: 0,
+            }],
             status_toast: None,
             status_toast_until: 0.0,
             edit_status: String::new(),
@@ -2275,82 +2296,80 @@ impl JpoApp {
     }
 
     fn show_grok_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, allow_nl_text_input: bool) {
-        ui.label(egui::RichText::new("Grok Parts").strong());
-        ui.label(
-            egui::RichText::new("P5: pass chord timeline to Grok → import MIDI parts (not full auto-arrange)")
-                .small()
-                .weak(),
-        );
-        ui.horizontal(|ui| {
-            ui.selectable_value(
-                &mut self.grok_import_mode,
-                GrokImportMode::NaturalLanguage,
-                "Progression text",
-            );
-            ui.selectable_value(&mut self.grok_import_mode, GrokImportMode::MidiFile, "MIDI part");
-        });
-        match self.grok_import_mode {
-            GrokImportMode::NaturalLanguage => {
-                ui.label(
-                    egui::RichText::new("Paste progression (C | Am | F | G or I-vi-IV-V) → place at playhead")
-                        .small()
-                        .weak(),
-                );
-                if allow_nl_text_input {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.grok_paste_text)
-                            .id(egui::Id::new("grok_nl_text"))
-                            .desired_rows(3)
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.button("Apply at playhead").clicked() {
-                            self.apply_grok_natural_language(ctx);
-                        }
-                        if ui.button("Copy progression prompt").clicked() {
-                            let prompt = self.build_grok_progression_prompt();
-                            ui.ctx().output_mut(|o| o.copied_text = prompt);
-                            self.show_toast(ctx, "Progression prompt copied");
-                        }
-                    });
-                } else {
-                    ui.label(
-                        egui::RichText::new("Progression paste is on Progress tab (keeps Ctrl+C/V free for notes)")
-                            .small()
-                            .weak(),
-                    );
-                }
-            }
-            GrokImportMode::MidiFile => {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Import .mid → Ch{} at playhead ({:.2}). Prefer Edit tab for parts.",
-                        self.selected_ch, self.current_beat
-                    ))
-                    .small()
-                    .weak(),
-                );
+        egui::CollapsingHeader::new("Grok")
+            .default_open(false)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if ui
-                        .button("Copy Grok part context")
-                        .on_hover_text("Key, BPM, chord timeline, range, track — paste into Grok")
-                        .clicked()
-                    {
-                        let ctx_text = self.build_grok_parts_context("");
-                        ui.ctx().output_mut(|o| o.copied_text = ctx_text);
-                        self.show_toast(ctx, "Grok part context copied");
-                    }
-                    if ui.button("Import MIDI…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("MIDI", &["mid", "midi"])
-                            .pick_file()
-                        {
-                            self.import_midi_to_selected_track(&path, ctx);
+                    ui.selectable_value(
+                        &mut self.grok_import_mode,
+                        GrokImportMode::NaturalLanguage,
+                        "進行テキスト",
+                    );
+                    ui.selectable_value(
+                        &mut self.grok_import_mode,
+                        GrokImportMode::MidiFile,
+                        "MIDI part",
+                    );
+                });
+                match self.grok_import_mode {
+                    GrokImportMode::NaturalLanguage => {
+                        if allow_nl_text_input {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.grok_paste_text)
+                                    .id(egui::Id::new("grok_nl_text"))
+                                    .desired_rows(2)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("C | Am | F | G  または  I-vi-IV-V"),
+                            );
+                            ui.horizontal(|ui| {
+                                if ui.button("playhead に配置").clicked() {
+                                    self.apply_grok_natural_language(ctx);
+                                }
+                                if ui.button("進行プロンプトコピー").clicked() {
+                                    let prompt = self.build_grok_progression_prompt();
+                                    ui.ctx().output_mut(|o| o.copied_text = prompt);
+                                    self.show_toast(ctx, "コピーしました");
+                                }
+                            });
+                        } else {
+                            ui.label(
+                                egui::RichText::new("進行の貼り付けは Progress タブへ")
+                                    .small()
+                                    .weak(),
+                            );
                         }
                     }
-                });
-            }
-        }
+                    GrokImportMode::MidiFile => {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("パート文脈コピー")
+                                .on_hover_text("Key/BPM/コード表を Grok へ")
+                                .clicked()
+                            {
+                                let ctx_text = self.build_grok_parts_context("");
+                                ui.ctx().output_mut(|o| o.copied_text = ctx_text);
+                                self.show_toast(ctx, "コピーしました");
+                            }
+                            if ui.button("MIDI 取込…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("MIDI", &["mid", "midi"])
+                                    .pick_file()
+                                {
+                                    self.import_midi_to_selected_track(&path, ctx);
+                                }
+                            }
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "→ Ch{} @{:.1}",
+                                    self.selected_ch, self.current_beat
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        });
+                    }
+                }
+            });
     }
 
     fn visible_pitch_min(&self) -> u8 {
@@ -3238,18 +3257,18 @@ impl JpoApp {
     }
 
     fn show_loop_bars_picker(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("Loop length").strong());
+        ui.label(egui::RichText::new("長さ").strong());
         for bars in [4u8, 8, 16] {
-            let label = format!("{bars} bars");
-            if ui.selectable_label(self.loop_bars == bars, label).clicked() {
+            let label = format!("{bars}");
+            if ui
+                .selectable_label(self.loop_bars == bars, label)
+                .on_hover_text(format!("{bars} 小節（{:.0} 拍）", bars as f64 * 4.0))
+                .clicked()
+            {
                 self.set_loop_bars(bars);
             }
         }
-        ui.label(
-            egui::RichText::new(format!("= {:.0} beats", self.loop_beats()))
-                .small()
-                .weak(),
-        );
+        ui.label(egui::RichText::new("小節").small().weak());
     }
 
     fn ensure_beat_visible(&mut self, beat: f64) {
@@ -3340,7 +3359,7 @@ impl JpoApp {
     fn show_loop_bank_panel(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("LOOP BANK").strong());
         ui.label(
-            egui::RichText::new(format!("{} bars • per-loop key", self.loop_bars))
+            egui::RichText::new(format!("{} 小節 · ループ単位キー", self.loop_bars))
                 .small()
                 .weak(),
         );
@@ -3395,113 +3414,293 @@ impl JpoApp {
             .sum()
     }
 
+    /// Which chain block is under the playhead, and 0..1 progress inside that block.
+    fn arrange_play_focus(&self) -> Option<(usize, f64)> {
+        if self.arrange_sequence.is_empty() {
+            return None;
+        }
+        let mut t = self.current_beat.max(0.0);
+        let total = self.arrange_total_beats().max(0.25);
+        if self.loop_playback {
+            t = t.rem_euclid(total);
+        }
+        let mut acc = 0.0;
+        for (i, slot) in self.arrange_sequence.iter().enumerate() {
+            let len = self
+                .loop_bank
+                .get(slot.bank_idx)
+                .map(|sk| sk.beats() * slot.repeats.max(1) as f64)
+                .unwrap_or(0.0)
+                .max(0.25);
+            if t < acc + len - 1e-9 || i + 1 == self.arrange_sequence.len() {
+                let frac = ((t - acc) / len).clamp(0.0, 1.0);
+                return Some((i, frac));
+            }
+            acc += len;
+        }
+        Some((self.arrange_sequence.len() - 1, 1.0))
+    }
+
+    fn seek_to_arrange_slot(&mut self, slot_idx: usize) {
+        if slot_idx >= self.arrange_sequence.len() {
+            return;
+        }
+        let mut acc = 0.0;
+        for (i, slot) in self.arrange_sequence.iter().enumerate() {
+            if i == slot_idx {
+                break;
+            }
+            acc += self
+                .loop_bank
+                .get(slot.bank_idx)
+                .map(|sk| sk.beats() * slot.repeats.max(1) as f64)
+                .unwrap_or(0.0);
+        }
+        let was_playing = self.audio_stream.is_some();
+        if was_playing {
+            self.stop_playback();
+        }
+        self.current_beat = acc;
+        if was_playing {
+            self.start_playback();
+        }
+    }
+
     fn show_arrange_panel(&mut self, ui: &mut egui::Ui) {
+        let total = self.arrange_total_beats();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("曲チェイン").strong().size(16.0));
+            ui.label(
+                egui::RichText::new(format!(
+                    "合計 {:.0} 拍（{:.1} 小節）",
+                    total,
+                    total / 4.0
+                ))
+                .small()
+                .weak(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Export Full MIDI…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name("arrangement.mid")
+                        .add_filter("MIDI", &["mid"])
+                        .save_file()
+                    {
+                        if let Err(e) = self.export_arrange_midi(&path.to_string_lossy()) {
+                            eprintln!("Arrange MIDI export error: {}", e);
+                        }
+                    }
+                }
+                if ui
+                    .button("+ Bank")
+                    .on_hover_text("アクティブな Loop Bank をチェイン末尾に追加")
+                    .clicked()
+                {
+                    let color_idx = (self.arrange_sequence.len() as u8) % CHAIN_PALETTE_LEN as u8;
+                    self.arrange_sequence.push(ArrangeSlot {
+                        bank_idx: self.active_bank_idx,
+                        repeats: 1,
+                        color_idx,
+                    });
+                }
+            });
+        });
         ui.label(
-            egui::RichText::new("ARRANGE — sequence loops left to right, then Export Full MIDI")
-                .strong(),
-        );
-        ui.label(
-            egui::RichText::new(format!(
-                "Total: {:.0} beats ({:.1} bars) • Play uses this timeline in Arrange mode",
-                self.arrange_total_beats(),
-                self.arrange_total_beats() / 4.0
-            ))
-            .small()
-            .weak(),
+            egui::RichText::new("ブロック = ループ　色クリックで色変更　クリックでそこから再生")
+                .small()
+                .weak(),
         );
 
-        let mut remove_idx: Option<usize> = None;
-        let mut move_up: Option<usize> = None;
-        let mut move_down: Option<usize> = None;
-        let mut add_from_bank: Option<usize> = None;
+        let play_focus = self.arrange_play_focus();
         let bank_names: Vec<String> = self
             .loop_bank
             .iter()
-            .enumerate()
-            .map(|(bi, s)| format!("{bi}: {}", s.name))
+            .map(|s| s.name.clone())
             .collect();
         let seq_len = self.arrange_sequence.len();
 
-        egui::ScrollArea::vertical()
-            .max_height(280.0)
+        let mut remove_idx: Option<usize> = None;
+        let mut move_left: Option<usize> = None;
+        let mut move_right: Option<usize> = None;
+        let mut seek_idx: Option<usize> = None;
+        let mut cycle_color: Option<usize> = None;
+
+        // Song chain — fills the empty center (effect-chain style).
+        let chain_h = (ui.available_height() - 48.0).clamp(160.0, 420.0);
+        egui::ScrollArea::both()
+            .auto_shrink([false, false])
+            .max_height(chain_h)
             .show(ui, |ui| {
-                for (i, slot) in self.arrange_sequence.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{}.", i + 1));
-                        let selected = bank_names
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(10.0, 12.0);
+                    for i in 0..seq_len {
+                        let slot = self.arrange_sequence[i].clone();
+                        let name = bank_names
                             .get(slot.bank_idx)
                             .cloned()
-                            .unwrap_or_else(|| "?".to_string());
+                            .unwrap_or_else(|| "?".into());
+                        let bars = self
+                            .loop_bank
+                            .get(slot.bank_idx)
+                            .map(|s| s.loop_bars)
+                            .unwrap_or(4);
+                        let base = chain_slot_color(slot.color_idx);
+                        let is_playing = play_focus.map(|(pi, _)| pi == i).unwrap_or(false);
+                        let frac = play_focus
+                            .filter(|(pi, _)| *pi == i)
+                            .map(|(_, f)| f)
+                            .unwrap_or(0.0);
+
+                        let block_w = 108.0 + (slot.repeats.saturating_sub(1) as f32) * 12.0;
+                        let block_h = 88.0;
+                        let (resp, painter) =
+                            ui.allocate_painter(Vec2::new(block_w, block_h), Sense::click());
+                        let r = resp.rect;
+
+                        // Body
+                        painter.rect_filled(r, 8.0, base);
+                        // Progress fill (left → right) instead of a thin orange needle
+                        if is_playing && frac > 0.001 {
+                            let mut fill = r;
+                            fill.set_width((r.width() * frac as f32).max(2.0));
+                            painter.rect_filled(
+                                fill,
+                                8.0,
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 55),
+                            );
+                        }
+                        if is_playing {
+                            painter.rect_stroke(
+                                r,
+                                8.0,
+                                Stroke::new(3.0, Color32::from_rgb(255, 230, 120)),
+                            );
+                        } else {
+                            painter.rect_stroke(
+                                r,
+                                8.0,
+                                Stroke::new(1.0, Color32::from_rgb(30, 30, 36)),
+                            );
+                        }
+
+                        painter.text(
+                            r.min + Vec2::new(10.0, 10.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{}", i + 1),
+                            egui::FontId::proportional(12.0),
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 180),
+                        );
+                        painter.text(
+                            r.center() + Vec2::new(0.0, -8.0),
+                            egui::Align2::CENTER_CENTER,
+                            name,
+                            egui::FontId::proportional(15.0),
+                            Color32::WHITE,
+                        );
+                        painter.text(
+                            r.center() + Vec2::new(0.0, 14.0),
+                            egui::Align2::CENTER_CENTER,
+                            format!("{}小節 ×{}", bars, slot.repeats.max(1)),
+                            egui::FontId::proportional(12.0),
+                            Color32::from_rgb(230, 235, 245),
+                        );
+
+                        // Color chip (top-right) — cycle palette
+                        let chip = Rect::from_min_size(
+                            Pos2::new(r.max.x - 22.0, r.min.y + 8.0),
+                            Vec2::new(14.0, 14.0),
+                        );
+                        painter.rect_filled(chip, 3.0, Color32::from_rgb(255, 255, 255));
+                        painter.rect_filled(
+                            chip.shrink(2.0),
+                            2.0,
+                            chain_slot_color(slot.color_idx.wrapping_add(1)),
+                        );
+
+                        if resp.clicked() {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                if chip.expand(4.0).contains(pos) {
+                                    cycle_color = Some(i);
+                                } else {
+                                    seek_idx = Some(i);
+                                }
+                            } else {
+                                seek_idx = Some(i);
+                            }
+                        }
+                        resp.on_hover_text("クリック: ここから再生  /  右上チップ: 色変更");
+
+                        // Connector to next
+                        if i + 1 < seq_len {
+                            ui.label(egui::RichText::new("→").size(18.0).weak());
+                        }
+                    }
+                });
+
+                ui.add_space(16.0);
+                // Compact list for fine control (combo / repeats / reorder)
+                ui.label(egui::RichText::new("詳細").small().strong());
+                for i in 0..seq_len {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}", i + 1));
+                        let selected = bank_names
+                            .get(self.arrange_sequence[i].bank_idx)
+                            .cloned()
+                            .unwrap_or_else(|| "?".into());
                         egui::ComboBox::from_id_salt(format!("arr_slot_{i}"))
                             .selected_text(selected)
+                            .width(120.0)
                             .show_ui(ui, |ui| {
                                 for (bi, name) in bank_names.iter().enumerate() {
-                                    if ui.selectable_label(slot.bank_idx == bi, name).clicked() {
-                                        slot.bank_idx = bi;
+                                    if ui
+                                        .selectable_label(
+                                            self.arrange_sequence[i].bank_idx == bi,
+                                            name,
+                                        )
+                                        .clicked()
+                                    {
+                                        self.arrange_sequence[i].bank_idx = bi;
                                     }
                                 }
                             });
                         ui.label("×");
-                        ui.add(egui::DragValue::new(&mut slot.repeats).range(1..=8));
-                        if ui.button("↑").clicked() && i > 0 {
-                            move_up = Some(i);
+                        ui.add(
+                            egui::DragValue::new(&mut self.arrange_sequence[i].repeats)
+                                .range(1..=8),
+                        );
+                        if ui.small_button("←").clicked() && i > 0 {
+                            move_left = Some(i);
                         }
-                        if ui.button("↓").clicked() && i + 1 < seq_len {
-                            move_down = Some(i);
+                        if ui.small_button("→").clicked() && i + 1 < seq_len {
+                            move_right = Some(i);
                         }
-                        if ui.button("✕").clicked() {
+                        if ui.small_button("✕").clicked() {
                             remove_idx = Some(i);
                         }
                     });
                 }
             });
 
-        ui.horizontal(|ui| {
-            if ui.button("+ Add slot").clicked() {
-                self.arrange_sequence.push(ArrangeSlot {
-                    bank_idx: self.active_bank_idx,
-                    repeats: 1,
-                });
+        if let Some(i) = cycle_color {
+            if let Some(s) = self.arrange_sequence.get_mut(i) {
+                s.color_idx = (s.color_idx + 1) % CHAIN_PALETTE_LEN as u8;
             }
-            if ui.button("+ From bank").clicked() {
-                add_from_bank = Some(self.active_bank_idx);
-            }
-            if ui.button("Export Full MIDI…").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_file_name("arrangement.mid")
-                    .add_filter("MIDI", &["mid"])
-                    .save_file()
-                {
-                    if let Err(e) = self.export_arrange_midi(&path.to_string_lossy()) {
-                        eprintln!("Arrange MIDI export error: {}", e);
-                    }
-                }
-            }
-            if ui.button("王道 I-V-vi-IV (8b)").clicked() {
-                self.apply_chord_progression_odori();
-            }
-        });
-
+        }
+        if let Some(i) = seek_idx {
+            self.seek_to_arrange_slot(i);
+        }
         if let Some(i) = remove_idx {
             if self.arrange_sequence.len() > 1 {
                 self.arrange_sequence.remove(i);
             }
         }
-        if let Some(i) = move_up {
+        if let Some(i) = move_left {
             self.arrange_sequence.swap(i, i - 1);
         }
-        if let Some(i) = move_down {
+        if let Some(i) = move_right {
             self.arrange_sequence.swap(i, i + 1);
         }
-        if let Some(bi) = add_from_bank {
-            self.arrange_sequence.push(ArrangeSlot {
-                bank_idx: bi,
-                repeats: 1,
-            });
-        }
-
-        ui.add_space(8.0);
-        ui.label("Switch to Sketch to edit the active loop slot.");
     }
 
     fn apply_chord_progression_odori(&mut self) {
@@ -5150,108 +5349,108 @@ impl eframe::App for JpoApp {
             }); // ScrollArea
         });
 
-        // Bottom controls — loop *length* is only on Progress/Bed (SoT). Playback loop toggle here.
+        // Bottom: transport-only (compact). Tab tools live next to content.
         egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(format!("Loop {} bars", self.loop_bars))
+                    egui::RichText::new(format!("{}小節", self.loop_bars))
                         .strong(),
                 );
-                ui.label(
-                    egui::RichText::new("(change length on Progress / Bed)")
-                        .small()
-                        .weak(),
-                );
-                let loop_label = if self.loop_playback { "🔁 Loop" } else { "Play once" };
+                let loop_label = if self.loop_playback { "🔁" } else { "1×" };
                 if ui
                     .selectable_label(self.loop_playback, loop_label)
-                    .on_hover_text("Loop playback within loop region")
+                    .on_hover_text("ループ再生 ON/OFF")
                     .clicked()
                 {
                     self.loop_playback = !self.loop_playback;
                 }
-                if ui.button("Fit loop").clicked() {
+                if ui.button("Fit").on_hover_text("ループ全体を表示").clicked() {
                     self.fit_loop_view();
                 }
-            });
-
-            ui.horizontal(|ui| {
+                ui.separator();
                 ui.label("Zoom");
                 let max_visible = self.loop_beats().max(8.0);
-                ui.add(egui::Slider::new(&mut self.visible_beats, 4.0..=max_visible));
+                ui.add(
+                    egui::Slider::new(&mut self.visible_beats, 4.0..=max_visible).show_value(false),
+                );
                 ui.label("Scroll");
                 let max_scroll = (self.loop_beats() - 4.0).max(0.0);
-                ui.add(egui::Slider::new(&mut self.visible_start, 0.0..=max_scroll));
+                ui.add(
+                    egui::Slider::new(&mut self.visible_start, 0.0..=max_scroll).show_value(false),
+                );
+                if self.active_tab == AppTab::Edit {
+                    ui.separator();
+                    ui.label("Pitch");
+                    if ui
+                        .add(egui::Slider::new(&mut self.visible_pitch_span, 12.0..=72.0).show_value(false))
+                        .changed()
+                    {
+                        self.clamp_pitch_center();
+                    }
+                    ui.label("Onion");
+                    ui.add(
+                        egui::Slider::new(&mut self.chord_opacity, 0.0..=1.0)
+                            .step_by(0.02)
+                            .show_value(false),
+                    );
+                }
             });
+        });
+
+        // Main area — one tab = one primary interaction surface
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::SidePanel::right("loop_bank")
+                .resizable(false)
+                .default_width(132.0)
+                .max_width(160.0)
+                .show_inside(ui, |ui| {
+                    self.show_loop_bank_panel(ui);
+                });
 
             match self.active_tab {
                 AppTab::Chord => {
                     ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("コード進行").strong().size(15.0));
+                        ui.separator();
                         self.show_loop_bars_picker(ui);
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new("Stamps").strong());
-                        if ui
-                            .button("王道 1bar")
-                            .on_hover_text("I–V–vi–IV · 1 bar each (16 beats)")
-                            .clicked()
-                        {
+                        ui.separator();
+                        ui.label(egui::RichText::new("Stamps").small().strong());
+                        if ui.button("王道1").on_hover_text("I–V–vi–IV 1小節ずつ").clicked() {
                             self.apply_chord_progression_odori();
-                            self.show_toast(ctx, "Stamp: 王道 1bar");
+                            self.show_toast(ctx, "王道 1bar");
                         }
-                        if ui
-                            .button("王道 ½bar")
-                            .on_hover_text("I–V–vi–IV · 2 beats each ×2 cycles")
-                            .clicked()
-                        {
+                        if ui.button("王道½").on_hover_text("半小節ずつ").clicked() {
                             self.apply_chord_stamp_half_odori();
-                            self.show_toast(ctx, "Stamp: 王道 half-bar");
+                            self.show_toast(ctx, "王道 half");
                         }
-                        if ui
-                            .button("Dense demo")
-                            .on_hover_text("Mixed 1-beat / ½-beat + anticipation (J-Pop density)")
-                            .clicked()
-                        {
+                        if ui.button("Dense").on_hover_text("密配置デモ").clicked() {
                             self.apply_chord_stamp_dense_demo();
-                            self.show_toast(ctx, "Stamp: dense demo");
+                            self.show_toast(ctx, "Dense demo");
                         }
                         ui.separator();
-                        if ui.button("−1/16").on_hover_text("Nudge selection earlier (anticipation)").clicked()
-                        {
+                        if ui.small_button("−1/16").clicked() {
                             self.nudge_selected_chords(-0.25);
                         }
-                        if ui.button("−1/8").on_hover_text("Nudge selection earlier").clicked() {
+                        if ui.small_button("−1/8").clicked() {
                             self.nudge_selected_chords(-0.5);
                         }
-                        if ui.button("+1/16").clicked() {
+                        if ui.small_button("+1/16").clicked() {
                             self.nudge_selected_chords(0.25);
                         }
                     });
+                    let _chord_response = self.draw_chord_timeline(ui);
+                    self.show_chord_strip(ui);
                     self.show_grok_panel(ui, ctx, true);
-                    ui.label(
-                        "Tip: Progress — Len 1/16 default • click empty = place • right edge = stretch • Space=play",
-                    );
                 }
                 AppTab::Generate => {
                     ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("伴奏ベッド").strong().size(15.0));
+                        ui.separator();
                         self.show_loop_bars_picker(ui);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Bed range (beats)");
-                        ui.add(egui::DragValue::new(&mut self.gen_start).speed(0.5).range(0.0..=128.0));
-                        ui.label("→");
-                        ui.add(egui::DragValue::new(&mut self.gen_end).speed(0.5).range(0.0..=128.0));
-                        if ui.button("Range=Loop").clicked() {
-                            self.gen_start = 0.0;
-                            self.gen_end = self.loop_beats();
-                        }
-                    });
-                    ui.horizontal(|ui| {
+                        ui.separator();
                         if ui
-                            .add(egui::Button::new(
-                                egui::RichText::new("Simple Bed").strong(),
-                            ))
-                            .on_hover_text("Write simple Piano+Bass+Drum bed into Ch2/3/10 (melody-friendly, not full arrange)")
+                            .add(egui::Button::new(egui::RichText::new("Simple Bed").strong()))
+                            .on_hover_text("Piano+Bass+Drum を範囲に生成")
                             .clicked()
                         {
                             self.apply_simple_bed(ctx);
@@ -5269,27 +5468,31 @@ impl eframe::App for JpoApp {
                                 &self.drum_pattern_id,
                                 self.syncopation_fill,
                             ));
-                            self.show_toast(ctx, "Preview ready (Bed lanes)");
+                            self.show_toast(ctx, "Preview");
                         }
-                        if ui
-                            .button("Clear Bed")
-                            .on_hover_text("Remove Ch2/3/10 notes only in bed range")
-                            .clicked()
-                        {
+                        if ui.button("Clear").on_hover_text("範囲内 Ch2/3/10 を消去").clicked() {
                             self.begin_gesture_undo();
                             let s = self.gen_start;
                             let e = self.gen_end.max(s + 0.25);
                             self.clear_bed_in_range(s, e);
                             self.end_gesture_undo();
-                            self.show_toast(ctx, "Cleared bed in range");
                         }
-                        ui.checkbox(&mut self.syncopation_fill, "Syncopation fill");
+                        ui.checkbox(&mut self.syncopation_fill, "Sync");
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Piano");
+                        ui.label("範囲");
+                        ui.add(egui::DragValue::new(&mut self.gen_start).speed(0.5).range(0.0..=128.0));
+                        ui.label("→");
+                        ui.add(egui::DragValue::new(&mut self.gen_end).speed(0.5).range(0.0..=128.0));
+                        if ui.small_button("=Loop").clicked() {
+                            self.gen_start = 0.0;
+                            self.gen_end = self.loop_beats();
+                        }
+                        ui.separator();
+                        ui.label("P");
                         egui::ComboBox::from_id_salt("gen_piano_pat")
                             .selected_text(&self.piano_pattern_id)
-                            .width(88.0)
+                            .width(96.0)
                             .show_ui(ui, |ui| {
                                 for id in self.pattern_lib.ids_for(PatternCategory::Piano, false) {
                                     if ui.selectable_label(self.piano_pattern_id == id, id).clicked() {
@@ -5297,10 +5500,10 @@ impl eframe::App for JpoApp {
                                     }
                                 }
                             });
-                        ui.label("Bass");
+                        ui.label("B");
                         egui::ComboBox::from_id_salt("gen_bass_pat")
                             .selected_text(&self.bass_pattern_id)
-                            .width(96.0)
+                            .width(100.0)
                             .show_ui(ui, |ui| {
                                 for id in self.pattern_lib.ids_for(PatternCategory::Bass, false) {
                                     if ui.selectable_label(self.bass_pattern_id == id, id).clicked() {
@@ -5308,10 +5511,10 @@ impl eframe::App for JpoApp {
                                     }
                                 }
                             });
-                        ui.label("Drum");
+                        ui.label("D");
                         egui::ComboBox::from_id_salt("gen_drum_pat")
                             .selected_text(&self.drum_pattern_id)
-                            .width(108.0)
+                            .width(110.0)
                             .show_ui(ui, |ui| {
                                 for id in self.pattern_lib.ids_for(PatternCategory::Drum, false) {
                                     if ui.selectable_label(self.drum_pattern_id == id, id).clicked() {
@@ -5320,76 +5523,17 @@ impl eframe::App for JpoApp {
                                 }
                             });
                     });
-                }
-                AppTab::Edit => {
-                    ui.horizontal(|ui| {
-                        ui.label("Pitch Zoom");
-                        if ui.add(egui::Slider::new(&mut self.visible_pitch_span, 12.0..=72.0)).changed() {
-                            self.clamp_pitch_center();
-                        }
-                        ui.label("Onion Chord");
-                        ui.add(egui::Slider::new(&mut self.chord_opacity, 0.0..=1.0).step_by(0.02));
-                    });
-                    self.show_grok_panel(ui, ctx, false);
-                    ui.label(
-                        egui::RichText::new(
-                            "Copy/Paste: toolbar buttons or Ctrl+C/V (notes go through OS text clipboard)",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                }
-                AppTab::Arrange => {
-                    ui.label("Tip: Arrange — sequence loops • Space plays full arrange timeline");
-                }
-            }
-        });
-
-        // Main area — one tab = one primary interaction surface
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::SidePanel::right("loop_bank")
-                .resizable(false)
-                .default_width(132.0)
-                .max_width(160.0)
-                .show_inside(ui, |ui| {
-                    self.show_loop_bank_panel(ui);
-                });
-
-            match self.active_tab {
-                AppTab::Chord => {
-                    ui.label(
-                        egui::RichText::new(
-                            "1 PROGRESS — dense J-Pop chords (1/16 grid) • stamps • anticipation nudge",
-                        )
-                        .strong(),
-                    );
                     let _chord_response = self.draw_chord_timeline(ui);
-                    self.show_chord_strip(ui);
-                }
-                AppTab::Generate => {
-                    ui.label(
-                        egui::RichText::new(
-                            "2 BED — Simple Bed = thin P+B+D under chords (not full arrange)",
-                        )
-                        .strong(),
-                    );
-                    let _chord_response = self.draw_chord_timeline(ui);
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                     self.show_gen_preview_lanes(ui);
-                    ui.label(
-                        egui::RichText::new(
-                            "Preview = dry-run • Simple Bed = write Ch2/3/10 • polish in Edit",
-                        )
-                        .weak(),
-                    );
                 }
                 AppTab::Edit => {
                     egui::SidePanel::left("tracks")
                         .resizable(false)
-                        .default_width(196.0)
-                        .max_width(220.0)
+                        .default_width(168.0)
+                        .max_width(200.0)
                         .show_inside(ui, |ui| {
-                            ui.label("TRACKS  (M=mute S=solo Vol% • P=patch)");
+                            ui.label(egui::RichText::new("TRACKS").strong());
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -5481,16 +5625,17 @@ impl eframe::App for JpoApp {
                                 });
                         });
 
-                    ui.label(
-                        egui::RichText::new("TAB 3 EDIT — timeline/playhead • piano roll • Ctrl+C/V")
-                            .strong(),
-                    );
                     if self.selected_ch == 1 {
-                        ui.label("Select Ch2–16 in the track list to edit generated/hand parts.");
+                        ui.label(
+                            egui::RichText::new("Ch2–16 を選んでノート編集")
+                                .small()
+                                .weak(),
+                        );
                     }
                     let _timeline_response = self.draw_chord_timeline(ui);
-                    let roll_h = ui.available_height().clamp(220.0, 520.0);
+                    let roll_h = ui.available_height().clamp(260.0, 640.0);
                     let _roll_response = self.draw_piano_roll_with_keyboard(ui, roll_h);
+                    self.show_grok_panel(ui, ctx, false);
                 }
                 AppTab::Arrange => {
                     self.show_arrange_panel(ui);
@@ -5516,10 +5661,11 @@ impl eframe::App for JpoApp {
                 } else {
                     self.loop_beats().max(0.25)
                 };
-                beat % len
+                beat.rem_euclid(len)
             } else {
                 beat
             };
+            // Keep Arrange chain progress fill animating.
             ctx.request_repaint();
         }
     }
@@ -5648,7 +5794,13 @@ impl JpoApp {
     fn draw_chord_timeline(&mut self, ui: &mut egui::Ui) -> egui::Response {
         let editable = self.active_tab == AppTab::Chord;
         let playhead_ruler = self.active_tab == AppTab::Edit;
-        let desired = Vec2::new(ui.available_width().min(980.0), 92.0);
+        // Taller strip so Progress/Bed don't look empty; Edit keeps slightly shorter.
+        let h = if self.active_tab == AppTab::Edit {
+            72.0
+        } else {
+            (ui.available_height() * 0.22).clamp(110.0, 160.0)
+        };
+        let desired = Vec2::new(ui.available_width().min(1100.0), h);
         let sense = if editable {
             Sense::click_and_drag()
         } else if playhead_ruler {
@@ -5801,7 +5953,7 @@ impl JpoApp {
             painter.text(
                 rect.min + Vec2::new(16.0, 28.0),
                 egui::Align2::LEFT_TOP,
-                "click empty = place (Len, default 1/16) • stamps above for dense J-Pop starts",
+                "空きクリックで配置（Len）　右端ドラッグで伸長",
                 egui::FontId::proportional(12.0),
                 Color32::from_rgb(90, 95, 105),
             );
@@ -6489,12 +6641,12 @@ impl JpoApp {
     /// Fixed chord editor under the timeline (replaces floating palette).
     fn show_chord_strip(&mut self, ui: &mut egui::Ui) {
         ui.add_space(2.0);
-        ui.label(egui::RichText::new("CHORD STRIP").strong());
+        ui.label(egui::RichText::new("選択コード").strong());
 
         let Some(idx) = self.active_chord_idx() else {
             ui.label(
                 egui::RichText::new(format!(
-                    "▸ playhead {:.1} — click empty = place (Len) • drag body = move • right edge = stretch",
+                    "▸ {:.1}  ·  空きクリック配置 / 右端伸長",
                     self.current_beat
                 ))
                 .small()
