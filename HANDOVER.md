@@ -1,84 +1,53 @@
 # JpoProducer 引継ぎ書
 
-**最終更新:** 2026-07-16  
+**最終更新:** 2026-07-20  
 **仕様の真実:** [`SPEC-v1.md`](SPEC-v1.md)  
+**入力フィードバック:** `D:\JPOP改善シート.txt`  
 **リポジトリ:** https://github.com/OptimalNotes/JpoProducer  
-**開発環境:** [`ENV.md`](ENV.md) — **WSL2 `~/JpoProducer` がメイン**、Windows は配布用  
-**ローカル (Win):** `C:\Users\user\JpoProducer\`
+**ローカル:** `C:\Users\user\JpoProducer\`
 
 ---
 
-## プロダクト要約（SPEC）
+## 2026-07-20 — 改善シート実装
 
-1. **密な J-Pop コード進行**  2. **単純伴奏ベッド**  3. **MIDI 編集**  
-4. **4/8/16 ループ接続**  5. **Grok パート**
-
-**現行タブ:** **1 Progress / 2 Bed / 3 Edit / 4 Arrange**
-
----
-
-## UI 洗練（2026-07-16）
-
+### Progress
 | 項目 | 内容 |
 |------|------|
-| 共通 | 下帯を Zoom/Loop のみに圧縮。長い英語 Tip を削減 |
-| Progress | 操作をタイムライン直上に集約、タイムライン高さを拡大、Grok 折りたたみ |
-| Bed | **Simple Bed** を主ボタンとして上段へ、パターンは副 |
-| Edit | トラック列やや狭く、ピアノロール高さ拡大、Grok 折りたたみ |
-| **Arrange** | **色付きブロック・チェイン UI**（エフェクトチェイン型）。クリックでそこから再生、右上チップで色変更、再生中はブロック内塗り＋枠ハイライト（縦線中心ではない） |
+| Len / Grid | **完全分離**。Len 既定 **1 拍**、Grid 既定 1/16 |
+| Stamp 貼付 | playhead または **末尾へ**。ループ超過は切り捨て |
+| Dense | **廃止** |
+| ユーザー stamp | 「現在を保存」→ `jpo_user_stamps.json`（exe 隣）。クリックで貼付 |
+| Grok 進行 | Progress から削除 |
 
-`ArrangeSlot.color_idx` を追加（旧 .jpo は default 0）。
-
-### 次
-
-1. ユーザーがスクショで UI 確認  
-2. 微調整 → 配布 zip / v1.0 は UI 一段落後  
-
-### 残ギャップ（任意）
-
-| ID | 内容 |
-|----|------|
-| DnD | チェインのドラッグ並べ替え（現状 ← →） |
-| G-struct | main.rs 分割 |
-| G-P2b | Piano01 Gate |
-
----
-
-## ピッチマッピング
-
-| トラック | 方式 | clamp |
-|---------|------|-------|
-| Bass Ch3 | `bass_pitch_from_pattern` | 28–51 |
-| Piano Ch2 | `piano_pitch_from_pattern` | 36–96 |
-| Drum Ch10 | 転調なし | — |
-
----
-
-## 検証
-
-```powershell
-cd C:\Users\user\JpoProducer
-cargo test
-cargo run
-```
-
-手動: [`tests/golden/ACCEPTANCE.md`](tests/golden/ACCEPTANCE.md)
-
----
-
-## 次セッション
-
-1. ユーザー: ACCEPTANCE 記入  
-2. ❌ のみ修正  
-3. （任意）Piano01 Gate、Sketch 統合、main 分割  
-4. `1.0.0` + `pack.ps1`
-
-## 参考
-
-| パス | 内容 |
+### Bed
+| 項目 | 内容 |
 |------|------|
-| `SPEC-v1.md` | 仕様の真実 |
-| `src/main.rs` | 本体（Simple Bed / stamps / Grok context） |
-| `assets/patterns/` | ベッド用パターン |
-| `archive/jpo-v2/` | 凍結・再起動しない |
-| Domino Desktop | テンプレ手編集のみ |
+| 流れ | プリセット選択 → **Simple Bed** |
+| 長さ | UI なし（常にループ全体 `0..loop_beats()`） |
+
+### Edit
+| 項目 | 内容 |
+|------|------|
+| ツール | **Q** Select / **W** Draw / **E** Erase |
+| Len / Grid | 別コンボ |
+| Scale | **Scale** トグルで縦ピッチをスケール吸着 |
+| Key 変更 | メロディックノートを半音平行移動（Ch10 除外、Bass 再 clamp） |
+| 左パネル | « / » で折りたたみ |
+| 下パネル | 「下パネル（Grok / Vel）」で開閉（Grok はここに） |
+
+### Arrange
+| 項目 | 内容 |
+|------|------|
+| ＋ | チェイン末尾の大きな **＋** ブロック + Bank の「→ チェインへ」 |
+| Key | Arrange 中はツールバー Key 非表示 |
+| Bank | 縦スクロール領域を拡大 |
+
+### テスト
+`cargo test` → **38 passed**（`paste_stamp_clips_to_loop_end` 追加）
+
+### 次（残）
+- Arrange ドラッグ並べ替え
+- Velocity グラフ
+- Grok API 直結
+- main.rs 分割
+- portable zip（依頼時）

@@ -1800,6 +1800,84 @@ fn default_arrange_repeats() -> u8 {
     1
 }
 
+/// User-saved chord progression stamp (relative beats from 0).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct UserStamp {
+    name: String,
+    blocks: Vec<ChordBlock>,
+}
+
+fn user_stamps_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("jpo_user_stamps.json")))
+        .unwrap_or_else(|| std::path::PathBuf::from("jpo_user_stamps.json"))
+}
+
+fn load_user_stamps() -> Vec<UserStamp> {
+    let path = user_stamps_path();
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_user_stamps(stamps: &[UserStamp]) {
+    let path = user_stamps_path();
+    if let Ok(s) = serde_json::to_string_pretty(stamps) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
+/// Normalize blocks so the earliest start is 0.
+fn chord_blocks_relative(blocks: &[ChordBlock]) -> Vec<ChordBlock> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let min_start = blocks
+        .iter()
+        .map(|b| b.start)
+        .fold(f64::INFINITY, f64::min);
+    let mut out: Vec<ChordBlock> = blocks
+        .iter()
+        .map(|b| {
+            let mut c = b.clone();
+            c.start = (b.start - min_start).max(0.0);
+            c
+        })
+        .collect();
+    out.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
+/// Paste relative stamp blocks at `paste_start`, clipping to [0, loop_end).
+fn paste_stamp_blocks_clipped(
+    stamp: &[ChordBlock],
+    paste_start: f64,
+    loop_end: f64,
+    min_dur: f64,
+) -> Vec<ChordBlock> {
+    let mut out = Vec::new();
+    let paste_start = paste_start.max(0.0);
+    let loop_end = loop_end.max(paste_start + min_dur);
+    for b in stamp {
+        let abs_start = paste_start + b.start;
+        if abs_start >= loop_end - 0.001 {
+            continue;
+        }
+        let abs_end = (abs_start + b.dur).min(loop_end);
+        let dur = abs_end - abs_start;
+        if dur < min_dur - 0.001 {
+            continue;
+        }
+        let mut nb = b.clone();
+        nb.start = abs_start;
+        nb.dur = dur;
+        out.push(nb);
+    }
+    out
+}
+
 const CHAIN_PALETTE_LEN: usize = 6;
 
 fn chain_slot_color(color_idx: u8) -> Color32 {
@@ -2015,8 +2093,18 @@ struct JpoApp {
     current_beat: f64,
 
     edit_mode: EditMode,
-    note_len: f64,             // 0.25, 0.5, 1.0 ...
+    /// New note/chord block default duration (beats). Independent of snap grid.
+    note_len: f64,
+    /// Position/duration quantize step (beats). Independent of Len.
+    snap_grid: f64,
     snap_enabled: bool,
+    /// When true, pitch input snaps to current key scale degrees.
+    scale_snap: bool,
+    /// Stamp paste: false = at playhead, true = after last chord block.
+    stamp_paste_at_end: bool,
+    user_stamps: Vec<UserStamp>,
+    tracks_panel_open: bool,
+    edit_bottom_open: bool,
 
     // interaction state
     /// Stable chord selection keyed by block start beat (survives sort_by).
@@ -2132,8 +2220,14 @@ impl Default for JpoApp {
             visible_beats: 16.0,
             current_beat: 0.0,
             edit_mode: EditMode::Select,
-            note_len: 0.25, // 1/16 default — dense J-Pop chord placement (SPEC-v1)
+            note_len: 1.0,   // default Len = 1 beat (1/4)
+            snap_grid: 0.25, // default Grid = 1/16
             snap_enabled: true,
+            scale_snap: true,
+            stamp_paste_at_end: false,
+            user_stamps: load_user_stamps(),
+            tracks_panel_open: true,
+            edit_bottom_open: false,
             active_chord_beat: None,
             selected_note: None,
             selection: Selection::default(),
@@ -2570,7 +2664,27 @@ impl JpoApp {
 
     /// Tab3 (Ch2–16) only — clipboard and nudge shortcuts. Returns true if a shortcut fired.
     fn handle_edit_shortcuts(&mut self, ctx: &egui::Context, i: &mut egui::InputState) -> bool {
-        if self.active_tab != AppTab::Edit || self.selected_ch == 1 {
+        if self.active_tab != AppTab::Edit {
+            return false;
+        }
+
+        // Tool switch: Q Select / W Draw / E Erase (works even on Ch1 for mode prep).
+        if !i.modifiers.ctrl && !i.modifiers.command && !i.modifiers.alt {
+            if i.key_pressed(egui::Key::Q) {
+                self.edit_mode = EditMode::Select;
+                return true;
+            }
+            if i.key_pressed(egui::Key::W) {
+                self.edit_mode = EditMode::Draw;
+                return true;
+            }
+            if i.key_pressed(egui::Key::E) {
+                self.edit_mode = EditMode::Erase;
+                return true;
+            }
+        }
+
+        if self.selected_ch == 1 {
             return false;
         }
 
@@ -2768,11 +2882,10 @@ impl JpoApp {
         dist_right >= -POINTER_SLOP_PX && dist_right <= resize_px
     }
 
-    /// Minimum interactive / visual chord width in beats for Progress (Len may be 1/16).
-    /// Coarser Len (e.g. 1/2) keeps that coarser size.
+    /// Minimum interactive / visual chord width in beats (floor 1/4; follows Grid if coarser).
     fn chord_ui_min_beats(&self) -> f64 {
         let grid = if self.snap_enabled {
-            self.note_len.max(0.0625)
+            self.snap_grid.max(0.0625)
         } else {
             0.25
         };
@@ -2819,7 +2932,7 @@ impl JpoApp {
 
     /// Clamp move target so [start, start+dur) does not overlap any other block.
     fn clamp_chord_start(&self, idx: usize, want_start: f64, dur: f64) -> f64 {
-        let min_dur = self.snap_dur(self.note_len.max(0.0625));
+        let min_dur = self.snap_dur(self.snap_grid.max(0.0625));
         let dur = dur.max(min_dur);
         let mut lo: f64 = 0.0;
         let mut hi: f64 = f64::INFINITY;
@@ -2887,7 +3000,7 @@ impl JpoApp {
     /// Important: never snap a pushed start *downward* (that re-creates overlap when
     /// `prev_end` falls between grid lines). Prefer exact `prev_end`, then optional snap-up.
     fn enforce_chord_timeline_no_overlap(&mut self) {
-        let min_dur = self.snap_dur(self.note_len.max(0.0625));
+        let min_dur = self.snap_dur(self.snap_grid.max(0.0625));
         let abs_min = 0.0625;
         if self.proj.chord_blocks.is_empty() {
             return;
@@ -2909,7 +3022,7 @@ impl JpoApp {
             if self.proj.chord_blocks[i].start < prev_end - 0.001 {
                 let mut start = prev_end;
                 if self.snap_enabled {
-                    let step = self.note_len.max(abs_min);
+                    let step = self.snap_grid.max(abs_min);
                     let snapped_up = (start / step).ceil() * step;
                     // Only snap up when it does not re-enter the previous block.
                     if snapped_up + 0.001 >= prev_end {
@@ -2989,7 +3102,7 @@ impl JpoApp {
     }
 
     fn place_chord_block_at(&mut self, snapped: f64) {
-        let want_dur = self.snap_dur(self.note_len.max(0.0625));
+        let want_dur = self.place_dur();
         // If click lands inside a block, place just after it (dense packing).
         let mut start = snapped.max(0.0);
         if let Some(b) = self
@@ -3371,42 +3484,52 @@ impl JpoApp {
         );
         let active = self.active_bank_idx;
         let mut switch_to = None;
-        for (i, slot) in self.loop_bank.iter().enumerate() {
-            let label = format!(
-                "{}  {}  {}b",
-                slot.name,
-                slot.key_short_label(),
-                slot.loop_bars
-            );
-            if ui.selectable_label(i == active, label).clicked() && i != active {
-                switch_to = Some(i);
-            }
-        }
+        let list_h = (ui.available_height() - 120.0).max(80.0);
+        egui::ScrollArea::vertical()
+            .max_height(list_h)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, slot) in self.loop_bank.iter().enumerate() {
+                    let label = format!(
+                        "{}  {}  {}b",
+                        slot.name,
+                        slot.key_short_label(),
+                        slot.loop_bars
+                    );
+                    if ui.selectable_label(i == active, label).clicked() && i != active {
+                        switch_to = Some(i);
+                    }
+                }
+            });
         if let Some(i) = switch_to {
             self.switch_loop_bank(i);
         }
         ui.horizontal(|ui| {
-            if ui.button("+ New").on_hover_text("New empty loop slot").clicked() {
+            if ui.button("+ New").on_hover_text("空のループ").clicked() {
                 self.new_loop_bank_slot();
             }
-            if ui
-                .button("Dup")
-                .on_hover_text("Duplicate current loop")
-                .clicked()
-            {
+            if ui.button("Dup").on_hover_text("複製").clicked() {
                 self.duplicate_loop_bank_slot();
             }
         });
+        if self.active_tab == AppTab::Arrange {
+            if ui
+                .button("→ チェインへ")
+                .on_hover_text("この Bank を曲チェイン末尾に追加")
+                .clicked()
+            {
+                let color_idx = (self.arrange_sequence.len() as u8) % CHAIN_PALETTE_LEN as u8;
+                self.arrange_sequence.push(ArrangeSlot {
+                    bank_idx: self.active_bank_idx,
+                    repeats: 1,
+                    color_idx,
+                });
+            }
+        }
         if let Some(slot) = self.loop_bank.get_mut(self.active_bank_idx) {
             ui.label("Name");
             ui.text_edit_singleline(&mut slot.name);
         }
-        ui.separator();
-        ui.label(
-            egui::RichText::new("Toolbar Key = this loop")
-                .small()
-                .weak(),
-        );
     }
 
     fn arrange_total_beats(&self) -> f64 {
@@ -3642,6 +3765,41 @@ impl JpoApp {
                             ui.label(egui::RichText::new("→").size(18.0).weak());
                         }
                     }
+                    // Trailing big "+" add block
+                    if seq_len > 0 {
+                        ui.label(egui::RichText::new("→").size(18.0).weak());
+                    }
+                    let (add_resp, add_painter) =
+                        ui.allocate_painter(Vec2::new(72.0, 88.0), Sense::click());
+                    add_painter.rect_filled(
+                        add_resp.rect,
+                        8.0,
+                        Color32::from_rgb(48, 52, 60),
+                    );
+                    add_painter.rect_stroke(
+                        add_resp.rect,
+                        8.0,
+                        Stroke::new(2.0, Color32::from_rgb(140, 150, 170)),
+                    );
+                    add_painter.text(
+                        add_resp.rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "＋",
+                        egui::FontId::proportional(28.0),
+                        Color32::from_rgb(220, 225, 235),
+                    );
+                    if add_resp
+                        .on_hover_text("アクティブ Bank を末尾に追加")
+                        .clicked()
+                    {
+                        let color_idx =
+                            (self.arrange_sequence.len() as u8) % CHAIN_PALETTE_LEN as u8;
+                        self.arrange_sequence.push(ArrangeSlot {
+                            bank_idx: self.active_bank_idx,
+                            repeats: 1,
+                            color_idx,
+                        });
+                    }
                 });
 
                 ui.add_space(16.0);
@@ -3709,128 +3867,53 @@ impl JpoApp {
         }
     }
 
-    fn apply_chord_progression_odori(&mut self) {
-        // 1 bar per chord — classic 王道 (8 bars total when loop is 8).
-        self.apply_chord_stamp(&[
-            (0.0, 4.0, 1, ""),
-            (4.0, 4.0, 5, ""),
-            (8.0, 4.0, 6, "m"),
-            (12.0, 4.0, 4, ""),
-        ]);
-    }
-
-    /// Replace project chord blocks with a stamp starting at beat 0.
-    /// Each entry: (start, dur, degree, quality).
-    fn apply_chord_stamp(&mut self, stamp: &[(f64, f64, u8, &str)]) {
-        self.begin_gesture_undo();
-        self.proj.chord_blocks = stamp
+    fn builtin_odori_1bar() -> Vec<ChordBlock> {
+        // Relative 16 beats (4 bars × 1 bar each); paste clips to current loop.
+        [(0.0, 4.0, 1u8, ""), (4.0, 4.0, 5, ""), (8.0, 4.0, 6, "m"), (12.0, 4.0, 4, "")]
             .iter()
-            .map(|(start, dur, degree, quality)| ChordBlock {
-                start: *start,
-                dur: *dur,
-                degree: *degree,
-                quality: (*quality).into(),
+            .map(|(s, d, deg, q)| ChordBlock {
+                start: *s,
+                dur: *d,
+                degree: *deg,
+                quality: (*q).into(),
                 octave: 4,
                 syncopation_fill: false,
             })
-            .collect();
-        self.proj
-            .chord_blocks
-            .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
-        self.enforce_chord_timeline_no_overlap();
-        self.clear_chord_selection();
-        self.end_gesture_undo();
-        self.sync_active_bank_from_proj();
+            .collect()
     }
 
-    /// 半割り: 2 beats each — denser than bar-long tools.
-    fn apply_chord_stamp_half_odori(&mut self) {
-        self.apply_chord_stamp(&[
-            (0.0, 2.0, 1, ""),
-            (2.0, 2.0, 5, ""),
-            (4.0, 2.0, 6, "m"),
-            (6.0, 2.0, 4, ""),
-            (8.0, 2.0, 1, ""),
-            (10.0, 2.0, 5, ""),
-            (12.0, 2.0, 6, "m"),
-            (14.0, 2.0, 4, ""),
-        ]);
-    }
-
-    /// Dense demo: mixed 1-beat / 0.5-beat cells + one syncopated anticipation.
-    fn apply_chord_stamp_dense_demo(&mut self) {
-        self.begin_gesture_undo();
-        self.proj.chord_blocks = vec![
-            ChordBlock {
-                start: 0.0,
-                dur: 1.0,
-                degree: 1,
-                quality: "".into(),
-                octave: 4,
-                syncopation_fill: false,
-            },
-            ChordBlock {
-                start: 1.0,
-                dur: 0.5,
-                degree: 5,
-                quality: "".into(),
-                octave: 4,
-                syncopation_fill: false,
-            },
-            ChordBlock {
-                start: 1.5,
-                dur: 0.5,
-                degree: 6,
-                quality: "m".into(),
-                octave: 4,
-                syncopation_fill: false,
-            },
-            ChordBlock {
-                start: 2.0,
-                dur: 1.0,
-                degree: 4,
-                quality: "".into(),
-                octave: 4,
-                syncopation_fill: false,
-            },
-            // Anticipation into bar 2 (beat 4) — classic J-Pop push.
-            ChordBlock {
-                start: 3.5,
-                dur: 0.5,
-                degree: 5,
-                quality: "7".into(),
-                octave: 4,
-                syncopation_fill: true,
-            },
-            ChordBlock {
-                start: 4.0,
-                dur: 2.0,
-                degree: 1,
-                quality: "".into(),
-                octave: 4,
-                syncopation_fill: false,
-            },
-            ChordBlock {
-                start: 6.0,
-                dur: 1.0,
-                degree: 6,
-                quality: "m".into(),
-                octave: 4,
-                syncopation_fill: false,
-            },
-            ChordBlock {
-                start: 7.0,
-                dur: 1.0,
-                degree: 4,
-                quality: "".into(),
-                octave: 4,
-                syncopation_fill: false,
-            },
+    fn builtin_odori_half() -> Vec<ChordBlock> {
+        // Relative 16 beats of half-bar cells.
+        let mut v = Vec::new();
+        let cells: [(f64, u8, &str); 8] = [
+            (0.0, 1, ""),
+            (2.0, 5, ""),
+            (4.0, 6, "m"),
+            (6.0, 4, ""),
+            (8.0, 1, ""),
+            (10.0, 5, ""),
+            (12.0, 6, "m"),
+            (14.0, 4, ""),
         ];
-        self.enforce_chord_timeline_no_overlap();
-        self.clear_chord_selection();
-        self.end_gesture_undo();
-        self.sync_active_bank_from_proj();
+        for (s, deg, q) in cells {
+            v.push(ChordBlock {
+                start: s,
+                dur: 2.0,
+                degree: deg,
+                quality: q.into(),
+                octave: 4,
+                syncopation_fill: false,
+            });
+        }
+        v
+    }
+
+    fn apply_chord_progression_odori(&mut self) {
+        self.apply_stamp_blocks(&Self::builtin_odori_1bar());
+    }
+
+    fn apply_chord_stamp_half_odori(&mut self) {
+        self.apply_stamp_blocks(&Self::builtin_odori_half());
     }
 
     fn nudge_selected_chords(&mut self, delta_beats: f64) {
@@ -4338,7 +4421,7 @@ impl JpoApp {
         if !self.snap_enabled {
             return beat.max(0.0);
         }
-        let step = self.note_len.max(0.0625);
+        let step = self.snap_grid.max(0.0625);
         (beat / step).round() * step
     }
 
@@ -4347,13 +4430,120 @@ impl JpoApp {
         if !self.snap_enabled {
             return dur.max(min);
         }
-        let step = self.note_len.max(min);
+        let step = self.snap_grid.max(min);
         ((dur / step).round() * step).max(step)
+    }
+
+    /// Default duration for newly placed notes/blocks = Len (not grid).
+    fn place_dur(&self) -> f64 {
+        self.note_len.max(0.0625)
+    }
+
+    fn grid_label(&self) -> &'static str {
+        for (label, val) in Self::NOTE_LENS {
+            if (self.snap_grid - val).abs() < 0.01 {
+                return label;
+            }
+        }
+        "?"
     }
 
     /// Progress: while resizing, snap length to grid but never force below ui min (1/4).
     fn chord_resize_min_dur(&self) -> f64 {
         self.snap_dur(self.chord_ui_min_beats())
+    }
+
+    fn snap_pitch_to_scale(&self, pitch: u8) -> u8 {
+        if !self.scale_snap {
+            return pitch;
+        }
+        let pcs = self.proj.scale_pitch_classes();
+        let p = pitch as i32;
+        let mut best = pitch;
+        let mut best_d = 128i32;
+        for cand in 0u8..=127 {
+            let pc = cand % 12;
+            if !pcs.contains(&pc) {
+                continue;
+            }
+            let d = (cand as i32 - p).abs();
+            if d < best_d {
+                best_d = d;
+                best = cand;
+            }
+        }
+        best
+    }
+
+    fn transpose_melodic_notes(&mut self, semitones: i32) {
+        if semitones == 0 {
+            return;
+        }
+        self.begin_gesture_undo();
+        for t in &mut self.proj.tracks {
+            if t.ch == 10 {
+                continue; // drums
+            }
+            for n in &mut t.notes {
+                n.pitch = (n.pitch as i32 + semitones).clamp(0, 127) as u8;
+            }
+            if t.ch == 3 {
+                clamp_bass_note_pitches(&mut t.notes);
+            }
+        }
+        self.end_gesture_undo();
+    }
+
+    fn stamp_paste_start(&self) -> f64 {
+        if self.stamp_paste_at_end {
+            self.proj
+                .chord_blocks
+                .iter()
+                .map(|b| b.end())
+                .fold(0.0_f64, f64::max)
+        } else {
+            self.current_beat.max(0.0)
+        }
+    }
+
+    fn apply_stamp_blocks(&mut self, stamp: &[ChordBlock]) {
+        let loop_end = self.loop_beats();
+        let min_dur = 0.0625;
+        let paste_at = self.snap_beat(self.stamp_paste_start());
+        let clipped = paste_stamp_blocks_clipped(stamp, paste_at, loop_end, min_dur);
+        if clipped.is_empty() {
+            return;
+        }
+        self.begin_gesture_undo();
+        self.proj.chord_blocks.extend(clipped);
+        self.proj
+            .chord_blocks
+            .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+        self.enforce_chord_timeline_no_overlap();
+        self.clear_chord_selection();
+        self.end_gesture_undo();
+        self.sync_active_bank_from_proj();
+    }
+
+    fn save_current_as_user_stamp(&mut self, name: String) {
+        let rel = chord_blocks_relative(&self.proj.chord_blocks);
+        if rel.is_empty() {
+            return;
+        }
+        let name = if name.trim().is_empty() {
+            format!("Stamp {}", self.user_stamps.len() + 1)
+        } else {
+            name.trim().to_string()
+        };
+        self.user_stamps.push(UserStamp { name, blocks: rel });
+        save_user_stamps(&self.user_stamps);
+    }
+
+    fn delete_user_stamp(&mut self, idx: usize) {
+        if idx < self.user_stamps.len() {
+            self.user_stamps.remove(idx);
+            save_user_stamps(&self.user_stamps);
+        }
     }
 
     fn begin_gesture_undo(&mut self) {
@@ -4716,11 +4906,12 @@ impl JpoApp {
     /// Click empty grid = place note at Len (same UX as chord blocks).
     fn place_piano_note_at(&mut self, track_idx: usize, beat: f64, pitch: u8) {
         self.begin_gesture_undo();
+        let pitch = self.snap_pitch_to_scale(pitch.clamp(0, 127));
         let new_n = Note {
             id: self.next_note_id(),
             start: self.snap_beat(beat),
-            pitch: pitch.clamp(0, 127),
-            dur: self.note_len,
+            pitch,
+            dur: self.place_dur(),
             vel: self.default_velocity,
         };
         self.proj.tracks[track_idx].notes.push(new_n);
@@ -4965,6 +5156,7 @@ mod tests {
         // Acceptance 1.1: three short blocks in one bar must not pile up.
         let mut app = JpoApp::default();
         app.note_len = 0.25;
+        app.snap_grid = 0.25;
         app.snap_enabled = true;
         app.place_chord_block_at(0.0);
         app.place_chord_block_at(0.25);
@@ -4988,6 +5180,7 @@ mod tests {
     fn enforce_after_off_grid_prev_end_does_not_snap_down_into_overlap() {
         let mut app = JpoApp::default();
         app.note_len = 0.25;
+        app.snap_grid = 0.25;
         app.snap_enabled = true;
         // prev ends at 0.3 — old code snapped next start down to 0.25 → overlap.
         app.proj.chord_blocks = vec![
@@ -5003,10 +5196,49 @@ mod tests {
     }
 
     #[test]
+    fn paste_stamp_clips_to_loop_end() {
+        let stamp = vec![
+            ChordBlock {
+                start: 0.0,
+                dur: 4.0,
+                degree: 1,
+                quality: String::new(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+            ChordBlock {
+                start: 4.0,
+                dur: 4.0,
+                degree: 5,
+                quality: String::new(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+            ChordBlock {
+                start: 8.0,
+                dur: 4.0,
+                degree: 6,
+                quality: "m".into(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+        ];
+        // 4-bar loop = 16 beats, paste at 12 → only first block partially? start 12+0=12, 12+4=16 OK; 12+4=16 skip rest
+        let clipped = paste_stamp_blocks_clipped(&stamp, 12.0, 16.0, 0.0625);
+        assert_eq!(clipped.len(), 1);
+        assert!((clipped[0].start - 12.0).abs() < 0.001);
+        assert!((clipped[0].dur - 4.0).abs() < 0.001);
+        // Full paste at 0 into 16-beat loop keeps all 3
+        let full = paste_stamp_blocks_clipped(&stamp, 0.0, 16.0, 0.0625);
+        assert_eq!(full.len(), 3);
+    }
+
+    #[test]
     fn paste_uses_playhead_not_draw_len_grid() {
         let mut app = JpoApp::default();
         app.selected_ch = 2;
         app.note_len = 2.0; // Draw Len coarse — must NOT force paste to even beats only.
+        app.snap_grid = 0.25;
         app.snap_enabled = true;
         app.proj.tracks[1].notes = vec![Note {
             id: NoteId(1),
@@ -5229,45 +5461,34 @@ impl eframe::App for JpoApp {
                 ui.label("BPM");
                 ui.add(egui::DragValue::new(&mut self.proj.bpm).speed(1.0).range(40.0..=240.0));
 
-                ui.separator();
-                ui.label("Key");
-                egui::ComboBox::from_id_salt("toolbar_key")
-                    .selected_text(roots[self.proj.key_root as usize])
-                    .width(52.0)
-                    .show_ui(ui, |ui| {
-                        for (i, r) in roots.iter().enumerate() {
-                            if ui.selectable_label(self.proj.key_root as usize == i, *r).clicked() {
-                                self.proj.key_root = i as u8;
-                                self.on_proj_key_changed();
+                // Arrange: hide Key (loop-local key is enough; avoids messy global edits).
+                if self.active_tab != AppTab::Arrange {
+                    ui.separator();
+                    ui.label("Key");
+                    egui::ComboBox::from_id_salt("toolbar_key")
+                        .selected_text(roots[self.proj.key_root as usize])
+                        .width(52.0)
+                        .show_ui(ui, |ui| {
+                            for (i, r) in roots.iter().enumerate() {
+                                if ui.selectable_label(self.proj.key_root as usize == i, *r).clicked()
+                                {
+                                    let old = self.proj.key_root as i32;
+                                    let new = i as i32;
+                                    self.proj.key_root = i as u8;
+                                    self.transpose_melodic_notes(new - old);
+                                    self.on_proj_key_changed();
+                                }
                             }
-                        }
-                    });
-                let mode_label = if self.proj.is_minor { "Minor" } else { "Major" };
-                if ui.button(mode_label).clicked() {
-                    self.proj.is_minor = !self.proj.is_minor;
-                    self.on_proj_key_changed();
+                        });
+                    let mode_label = if self.proj.is_minor { "Minor" } else { "Major" };
+                    if ui.button(mode_label).clicked() {
+                        self.proj.is_minor = !self.proj.is_minor;
+                        self.on_proj_key_changed();
+                    }
                 }
 
                 ui.separator();
                 self.show_tools_menu(ui, &roots);
-
-                if self.active_tab == AppTab::Chord {
-                    ui.separator();
-                    ui.label("Len");
-                    egui::ComboBox::from_id_salt("toolbar_note_len")
-                        .selected_text(self.note_len_label())
-                        .width(48.0)
-                        .show_ui(ui, |ui| {
-                            for (label, val) in Self::NOTE_LENS {
-                                if ui
-                                    .selectable_label((self.note_len - val).abs() < 0.01, label)
-                                    .clicked()
-                                {
-                                    self.set_len(val);
-                                }
-                            }
-                        });
-                }
 
                 if self.active_tab == AppTab::Edit {
                     ui.separator();
@@ -5280,6 +5501,7 @@ impl eframe::App for JpoApp {
                             self.edit_mode = mode;
                         }
                     }
+                    ui.label(egui::RichText::new("Q/W/E").small().weak());
                     ui.separator();
                     ui.label("Len");
                     egui::ComboBox::from_id_salt("toolbar_edit_note_len")
@@ -5295,14 +5517,36 @@ impl eframe::App for JpoApp {
                                 }
                             }
                         });
+                    ui.label("Grid");
+                    egui::ComboBox::from_id_salt("toolbar_edit_grid")
+                        .selected_text(self.grid_label())
+                        .width(48.0)
+                        .show_ui(ui, |ui| {
+                            for (label, val) in Self::NOTE_LENS {
+                                if ui
+                                    .selectable_label((self.snap_grid - val).abs() < 0.01, label)
+                                    .clicked()
+                                {
+                                    self.snap_grid = val;
+                                }
+                            }
+                        });
                     ui.separator();
-                    let snap_label = if self.snap_enabled { "Snap" } else { "Snap off" };
+                    let snap_label = if self.snap_enabled { "Snap" } else { "Free" };
                     if ui
                         .selectable_label(self.snap_enabled, snap_label)
-                        .on_hover_text("Grid snap (Tab3)")
+                        .on_hover_text("時間グリッド吸着")
                         .clicked()
                     {
                         self.snap_enabled = !self.snap_enabled;
+                    }
+                    let sc_lab = if self.scale_snap { "Scale" } else { "Chrom" };
+                    if ui
+                        .selectable_label(self.scale_snap, sc_lab)
+                        .on_hover_text("縦ピッチをスケール音に吸着")
+                        .clicked()
+                    {
+                        self.scale_snap = !self.scale_snap;
                     }
                     ui.separator();
                     if ui.button("Copy").on_hover_text("Ctrl+C — also fills OS clipboard").clicked() {
@@ -5420,18 +5664,57 @@ impl eframe::App for JpoApp {
                         ui.separator();
                         self.show_loop_bars_picker(ui);
                         ui.separator();
-                        ui.label(egui::RichText::new("Stamps").small().strong());
-                        if ui.button("王道1").on_hover_text("I–V–vi–IV 1小節ずつ").clicked() {
+                        ui.label("Len");
+                        egui::ComboBox::from_id_salt("prog_len")
+                            .selected_text(self.note_len_label())
+                            .width(48.0)
+                            .show_ui(ui, |ui| {
+                                for (label, val) in Self::NOTE_LENS {
+                                    if ui
+                                        .selectable_label((self.note_len - val).abs() < 0.01, label)
+                                        .clicked()
+                                    {
+                                        self.set_len(val);
+                                    }
+                                }
+                            });
+                        ui.label("Grid");
+                        egui::ComboBox::from_id_salt("prog_grid")
+                            .selected_text(self.grid_label())
+                            .width(48.0)
+                            .show_ui(ui, |ui| {
+                                for (label, val) in Self::NOTE_LENS {
+                                    if ui
+                                        .selectable_label((self.snap_grid - val).abs() < 0.01, label)
+                                        .clicked()
+                                    {
+                                        self.snap_grid = val;
+                                    }
+                                }
+                            });
+                        let snap_lab = if self.snap_enabled { "Snap" } else { "Free" };
+                        if ui.selectable_label(self.snap_enabled, snap_lab).clicked() {
+                            self.snap_enabled = !self.snap_enabled;
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Stamp").small().strong());
+                        if ui.button("王道1").on_hover_text("playhead/末尾に貼付・超過切り捨て").clicked() {
                             self.apply_chord_progression_odori();
-                            self.show_toast(ctx, "王道 1bar");
+                            self.show_toast(ctx, "王道1 を貼付");
                         }
-                        if ui.button("王道½").on_hover_text("半小節ずつ").clicked() {
+                        if ui.button("王道½").clicked() {
                             self.apply_chord_stamp_half_odori();
-                            self.show_toast(ctx, "王道 half");
+                            self.show_toast(ctx, "王道½ を貼付");
                         }
-                        if ui.button("Dense").on_hover_text("密配置デモ").clicked() {
-                            self.apply_chord_stamp_dense_demo();
-                            self.show_toast(ctx, "Dense demo");
+                        ui.separator();
+                        ui.checkbox(&mut self.stamp_paste_at_end, "末尾へ");
+                        if !self.stamp_paste_at_end {
+                            ui.label(
+                                egui::RichText::new(format!("@playhead {:.1}", self.current_beat))
+                                    .small()
+                                    .weak(),
+                            );
                         }
                         ui.separator();
                         if ui.small_button("−1/16").clicked() {
@@ -5444,26 +5727,97 @@ impl eframe::App for JpoApp {
                             self.nudge_selected_chords(0.25);
                         }
                     });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("My stamps").small().strong());
+                        if ui
+                            .button("現在を保存")
+                            .on_hover_text("今のコード進行をスタンプとして保存")
+                            .clicked()
+                        {
+                            let n = self.user_stamps.len() + 1;
+                            self.save_current_as_user_stamp(format!("Stamp {n}"));
+                            self.show_toast(ctx, "スタンプ保存");
+                        }
+                        let mut del: Option<usize> = None;
+                        let mut apply: Option<usize> = None;
+                        for (i, st) in self.user_stamps.iter().enumerate() {
+                            if ui.button(&st.name).clicked() {
+                                apply = Some(i);
+                            }
+                            if ui.small_button("✕").on_hover_text("削除").clicked() {
+                                del = Some(i);
+                            }
+                        }
+                        if let Some(i) = apply {
+                            let blocks = self.user_stamps[i].blocks.clone();
+                            self.apply_stamp_blocks(&blocks);
+                            self.show_toast(ctx, "スタンプ貼付");
+                        }
+                        if let Some(i) = del {
+                            self.delete_user_stamp(i);
+                        }
+                    });
                     let _chord_response = self.draw_chord_timeline(ui);
                     self.show_chord_strip(ui);
-                    self.show_grok_panel(ui, ctx, true);
                 }
                 AppTab::Generate => {
+                    // Preset → Simple Bed flow; loop length is Progress-only.
+                    self.gen_start = 0.0;
+                    self.gen_end = self.loop_beats();
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("伴奏ベッド").strong().size(15.0));
-                        ui.separator();
-                        self.show_loop_bars_picker(ui);
+                        ui.label(
+                            egui::RichText::new(format!("（{}小節ループ全体）", self.loop_bars))
+                                .small()
+                                .weak(),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Piano");
+                        egui::ComboBox::from_id_salt("gen_piano_pat")
+                            .selected_text(&self.piano_pattern_id)
+                            .width(100.0)
+                            .show_ui(ui, |ui| {
+                                for id in self.pattern_lib.ids_for(PatternCategory::Piano, false) {
+                                    if ui.selectable_label(self.piano_pattern_id == id, id).clicked() {
+                                        self.piano_pattern_id = id.to_string();
+                                    }
+                                }
+                            });
+                        ui.label("Bass");
+                        egui::ComboBox::from_id_salt("gen_bass_pat")
+                            .selected_text(&self.bass_pattern_id)
+                            .width(100.0)
+                            .show_ui(ui, |ui| {
+                                for id in self.pattern_lib.ids_for(PatternCategory::Bass, false) {
+                                    if ui.selectable_label(self.bass_pattern_id == id, id).clicked() {
+                                        self.bass_pattern_id = id.to_string();
+                                    }
+                                }
+                            });
+                        ui.label("Drum");
+                        egui::ComboBox::from_id_salt("gen_drum_pat")
+                            .selected_text(&self.drum_pattern_id)
+                            .width(110.0)
+                            .show_ui(ui, |ui| {
+                                for id in self.pattern_lib.ids_for(PatternCategory::Drum, false) {
+                                    if ui.selectable_label(self.drum_pattern_id == id, id).clicked() {
+                                        self.drum_pattern_id = id.to_string();
+                                    }
+                                }
+                            });
+                        ui.checkbox(&mut self.syncopation_fill, "Sync");
                         ui.separator();
                         if ui
                             .add(egui::Button::new(egui::RichText::new("Simple Bed").strong()))
-                            .on_hover_text("Piano+Bass+Drum を範囲に生成")
+                            .on_hover_text("選択プリセットでループ全体に生成")
                             .clicked()
                         {
                             self.apply_simple_bed(ctx);
                         }
                         if ui.button("Preview").clicked() {
-                            let s = self.gen_start;
-                            let e = self.gen_end.max(s + 0.25);
+                            let s = 0.0;
+                            let e = self.loop_beats();
                             self.gen_preview = Some(generate_from_patterns(
                                 &self.pattern_lib,
                                 &self.proj,
@@ -5476,73 +5830,60 @@ impl eframe::App for JpoApp {
                             ));
                             self.show_toast(ctx, "Preview");
                         }
-                        if ui.button("Clear").on_hover_text("範囲内 Ch2/3/10 を消去").clicked() {
+                        if ui.button("Clear").clicked() {
                             self.begin_gesture_undo();
-                            let s = self.gen_start;
-                            let e = self.gen_end.max(s + 0.25);
-                            self.clear_bed_in_range(s, e);
+                            self.clear_bed_in_range(0.0, self.loop_beats());
                             self.end_gesture_undo();
                         }
-                        ui.checkbox(&mut self.syncopation_fill, "Sync");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("範囲");
-                        ui.add(egui::DragValue::new(&mut self.gen_start).speed(0.5).range(0.0..=128.0));
-                        ui.label("→");
-                        ui.add(egui::DragValue::new(&mut self.gen_end).speed(0.5).range(0.0..=128.0));
-                        if ui.small_button("=Loop").clicked() {
-                            self.gen_start = 0.0;
-                            self.gen_end = self.loop_beats();
-                        }
-                        ui.separator();
-                        ui.label("P");
-                        egui::ComboBox::from_id_salt("gen_piano_pat")
-                            .selected_text(&self.piano_pattern_id)
-                            .width(96.0)
-                            .show_ui(ui, |ui| {
-                                for id in self.pattern_lib.ids_for(PatternCategory::Piano, false) {
-                                    if ui.selectable_label(self.piano_pattern_id == id, id).clicked() {
-                                        self.piano_pattern_id = id.to_string();
-                                    }
-                                }
-                            });
-                        ui.label("B");
-                        egui::ComboBox::from_id_salt("gen_bass_pat")
-                            .selected_text(&self.bass_pattern_id)
-                            .width(100.0)
-                            .show_ui(ui, |ui| {
-                                for id in self.pattern_lib.ids_for(PatternCategory::Bass, false) {
-                                    if ui.selectable_label(self.bass_pattern_id == id, id).clicked() {
-                                        self.bass_pattern_id = id.to_string();
-                                    }
-                                }
-                            });
-                        ui.label("D");
-                        egui::ComboBox::from_id_salt("gen_drum_pat")
-                            .selected_text(&self.drum_pattern_id)
-                            .width(110.0)
-                            .show_ui(ui, |ui| {
-                                for id in self.pattern_lib.ids_for(PatternCategory::Drum, false) {
-                                    if ui.selectable_label(self.drum_pattern_id == id, id).clicked() {
-                                        self.drum_pattern_id = id.to_string();
-                                    }
-                                }
-                            });
                     });
                     let _chord_response = self.draw_chord_timeline(ui);
                     ui.add_space(4.0);
                     self.show_gen_preview_lanes(ui);
                 }
                 AppTab::Edit => {
+                    let track_w = if self.tracks_panel_open { 168.0 } else { 56.0 };
                     egui::SidePanel::left("tracks")
                         .resizable(false)
-                        .default_width(168.0)
-                        .max_width(200.0)
+                        .default_width(track_w)
+                        .max_width(if self.tracks_panel_open { 200.0 } else { 64.0 })
                         .show_inside(ui, |ui| {
-                            ui.label(egui::RichText::new("TRACKS").strong());
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .small_button(if self.tracks_panel_open { "«" } else { "»" })
+                                    .on_hover_text("トラック一覧 折りたたみ")
+                                    .clicked()
+                                {
+                                    self.tracks_panel_open = !self.tracks_panel_open;
+                                }
+                                if self.tracks_panel_open {
+                                    ui.label(egui::RichText::new("TRACKS").strong());
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(track_short_label(self.selected_ch))
+                                            .strong(),
+                                    );
+                                }
+                            });
                             egui::ScrollArea::vertical()
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
+                                    if !self.tracks_panel_open {
+                                        // Compact: only channel chips
+                                        for ch in 1..=16 {
+                                            if ui
+                                                .selectable_label(
+                                                    self.selected_ch == ch,
+                                                    track_short_label(ch),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.selected_ch = ch;
+                                                self.selected_note = None;
+                                                self.piano_roll_focused = ch != 1;
+                                            }
+                                        }
+                                        return;
+                                    }
                                     for ch in 1..=16 {
                                         let t_idx = (ch - 1) as usize;
                                         let mut mix_changed = false;
@@ -5639,9 +5980,35 @@ impl eframe::App for JpoApp {
                         );
                     }
                     let _timeline_response = self.draw_chord_timeline(ui);
-                    let roll_h = ui.available_height().clamp(260.0, 640.0);
+                    let bottom_reserve = if self.edit_bottom_open { 140.0 } else { 28.0 };
+                    let roll_h = (ui.available_height() - bottom_reserve).clamp(200.0, 640.0);
                     let _roll_response = self.draw_piano_roll_with_keyboard(ui, roll_h);
-                    self.show_grok_panel(ui, ctx, false);
+                    ui.horizontal(|ui| {
+                        let lab = if self.edit_bottom_open {
+                            "▾ 下パネル（Grok / Vel）"
+                        } else {
+                            "▸ 下パネル（Grok / Vel）"
+                        };
+                        if ui.selectable_label(self.edit_bottom_open, lab).clicked() {
+                            self.edit_bottom_open = !self.edit_bottom_open;
+                        }
+                    });
+                    if self.edit_bottom_open {
+                        ui.horizontal(|ui| {
+                            ui.label("選択 Vel");
+                            let mut v = self.default_velocity;
+                            if ui
+                                .add(egui::DragValue::new(&mut v).range(1..=127))
+                                .changed()
+                            {
+                                self.default_velocity = v;
+                                if self.selected_ch != 1 {
+                                    self.apply_velocity_to_selection(v);
+                                }
+                            }
+                        });
+                        self.show_grok_panel(ui, ctx, false);
+                    }
                 }
                 AppTab::Arrange => {
                     self.show_arrange_panel(ui);
@@ -6234,9 +6601,8 @@ impl JpoApp {
         let min_p = self.visible_pitch_min();
         let max_p = self.visible_pitch_max().max(min_p.saturating_add(1));
 
-        // time grid (vertical lines) - base on current note_len to avoid being too fine (user feedback).
-        // Weighted: bar strong, beat medium, main snap, light subs only when zoomed in.
-        let main_step = self.note_len.max(0.25);
+        // time grid — uses snap_grid (not Len).
+        let main_step = self.snap_grid.max(0.25);
         let sub_step = if self.visible_beats < 12.0 { main_step / 2.0 } else { main_step };
         let mut b = start_b.floor();
         while b <= end_b + 0.1 {
@@ -6496,11 +6862,12 @@ impl JpoApp {
                                 self.drag_sel_offsets = vec![(nid, 0.0, 0)];
                             } else {
                                 let snapped = self.snap_beat(beat);
-                                let dur = self.snap_dur(self.note_len.max(0.0625));
+                                let dur = self.place_dur();
+                                let pitch = self.snap_pitch_to_scale(pitch.clamp(0, 127));
                                 let new_n = Note {
                                     id: self.next_note_id(),
                                     start: snapped,
-                                    pitch: pitch.clamp(0, 127),
+                                    pitch,
                                     dur,
                                     vel: self.default_velocity,
                                 };
