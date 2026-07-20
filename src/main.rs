@@ -1800,34 +1800,193 @@ fn default_arrange_repeats() -> u8 {
     1
 }
 
-/// User-saved chord progression stamp (relative beats from 0).
+/// Chord progression stamp (relative beats from 0).
+/// On disk: one file per stamp under `stamps/` next to the exe (or cwd).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct UserStamp {
     name: String,
     blocks: Vec<ChordBlock>,
+    /// Source path (not serialized into the stamp body as authority — set on load).
+    #[serde(skip)]
+    path: Option<std::path::PathBuf>,
+    /// Bundled preset under assets/stamps — not deletable from UI.
+    #[serde(skip)]
+    read_only: bool,
 }
 
-fn user_stamps_path() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("jpo_user_stamps.json")))
-        .unwrap_or_else(|| std::path::PathBuf::from("jpo_user_stamps.json"))
+/// Directory for user stamps: next to jpo.exe (portable), else `./stamps`.
+fn user_stamps_dir() -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return parent.join("stamps");
+        }
+    }
+    std::path::PathBuf::from("stamps")
 }
 
+fn sanitize_stamp_filename(name: &str) -> String {
+    let mut s: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    s = s.trim().to_string();
+    if s.is_empty() {
+        s = "stamp".into();
+    }
+    if s.len() > 80 {
+        s.truncate(80);
+    }
+    s
+}
+
+fn load_stamp_file(path: &std::path::Path) -> Option<UserStamp> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let mut stamp: UserStamp = serde_json::from_str(&s).ok()?;
+    if stamp.name.trim().is_empty() {
+        stamp.name = path
+            .file_stem()
+            .and_then(|x| x.to_str())
+            .unwrap_or("stamp")
+            .to_string();
+    }
+    stamp.blocks = chord_blocks_relative(&stamp.blocks);
+    if stamp.blocks.is_empty() {
+        return None;
+    }
+    stamp.path = Some(path.to_path_buf());
+    // Everything under exe/stamps is user-owned (seeded presets are copies).
+    stamp.read_only = false;
+    Some(stamp)
+}
+
+/// Bundled preset sources used only to seed `stamps/` next to the exe on first run.
+fn bundled_stamps_src_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![std::path::PathBuf::from("assets/stamps")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for up in [
+                "assets/stamps",
+                "../assets/stamps",
+                "../../assets/stamps",
+                "../../../assets/stamps",
+            ] {
+                let p = parent.join(up);
+                if p.is_dir() {
+                    dirs.push(p);
+                }
+            }
+        }
+    }
+    dirs
+}
+
+/// Seed `<exe>/stamps` from assets/stamps if empty (first launch / portable pack).
+fn ensure_user_stamps_seeded() {
+    let user_dir = user_stamps_dir();
+    let _ = std::fs::create_dir_all(&user_dir);
+    let has_user_file = std::fs::read_dir(&user_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()).any(|e| {
+                let p = e.path();
+                matches!(
+                    p.extension()
+                        .and_then(|x| x.to_str())
+                        .map(|x| x.to_ascii_lowercase())
+                        .as_deref(),
+                    Some("jpostamp") | Some("json")
+                )
+            })
+        })
+        .unwrap_or(false);
+    if has_user_file {
+        return;
+    }
+    for src_dir in bundled_stamps_src_dirs() {
+        if !src_dir.is_dir() {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&src_dir) else {
+            continue;
+        };
+        let mut copied = 0u32;
+        for ent in rd.filter_map(|e| e.ok()) {
+            let path = ent.path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext != "jpostamp" && ext != "json" {
+                continue;
+            }
+            if let Some(name) = path.file_name() {
+                let dst = user_dir.join(name);
+                if !dst.exists() && std::fs::copy(&path, &dst).is_ok() {
+                    copied += 1;
+                }
+            }
+        }
+        if copied > 0 {
+            eprintln!(
+                "[Stamp] seeded {} file(s) → {}",
+                copied,
+                user_dir.display()
+            );
+            break;
+        }
+    }
+}
+
+/// Load all stamps from `<exe>/stamps` (one file = one stamp).
 fn load_user_stamps() -> Vec<UserStamp> {
-    let path = user_stamps_path();
-    match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(_) => Vec::new(),
+    ensure_user_stamps_seeded();
+    let dir = user_stamps_dir();
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return out;
+    };
+    let mut files: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+    files.sort_by_key(|e| e.file_name());
+    for ent in files {
+        let path = ent.path();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext != "jpostamp" && ext != "json" {
+            continue;
+        }
+        if let Some(st) = load_stamp_file(&path) {
+            out.push(st);
+        }
     }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
-fn save_user_stamps(stamps: &[UserStamp]) {
-    let path = user_stamps_path();
-    if let Ok(s) = serde_json::to_string_pretty(stamps) {
-        let _ = std::fs::write(path, s);
+fn write_stamp_file(path: &std::path::Path, stamp: &UserStamp) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct StampFile<'a> {
+        name: &'a str,
+        blocks: &'a [ChordBlock],
     }
+    let body = StampFile {
+        name: &stamp.name,
+        blocks: &stamp.blocks,
+    };
+    let s = serde_json::to_string_pretty(&body).map_err(|e| e.to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, s).map_err(|e| e.to_string())
 }
+
+
 
 /// Normalize blocks so the earliest start is 0.
 fn chord_blocks_relative(blocks: &[ChordBlock]) -> Vec<ChordBlock> {
@@ -2225,7 +2384,10 @@ impl Default for JpoApp {
             snap_enabled: true,
             scale_snap: true,
             stamp_paste_at_end: false,
-            user_stamps: load_user_stamps(),
+            user_stamps: {
+                ensure_user_stamps_seeded();
+                load_user_stamps()
+            },
             tracks_panel_open: true,
             edit_bottom_open: false,
             active_chord_beat: None,
@@ -4525,25 +4687,56 @@ impl JpoApp {
         self.sync_active_bank_from_proj();
     }
 
+    fn reload_stamps(&mut self) {
+        ensure_user_stamps_seeded();
+        self.user_stamps = load_user_stamps();
+    }
+
     fn save_current_as_user_stamp(&mut self, name: String) {
         let rel = chord_blocks_relative(&self.proj.chord_blocks);
         if rel.is_empty() {
             return;
         }
         let name = if name.trim().is_empty() {
-            format!("Stamp {}", self.user_stamps.len() + 1)
+            format!("Stamp {}", self.user_stamps.iter().filter(|s| !s.read_only).count() + 1)
         } else {
             name.trim().to_string()
         };
-        self.user_stamps.push(UserStamp { name, blocks: rel });
-        save_user_stamps(&self.user_stamps);
+        let dir = user_stamps_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let mut file_stem = sanitize_stamp_filename(&name);
+        let mut path = dir.join(format!("{file_stem}.jpostamp"));
+        let mut n = 2;
+        while path.exists() {
+            path = dir.join(format!("{file_stem}_{n}.jpostamp"));
+            n += 1;
+            if n > 999 {
+                break;
+            }
+        }
+        let stamp = UserStamp {
+            name: name.clone(),
+            blocks: rel,
+            path: Some(path.clone()),
+            read_only: false,
+        };
+        if write_stamp_file(&path, &stamp).is_ok() {
+            self.reload_stamps();
+        }
+        let _ = file_stem;
     }
 
     fn delete_user_stamp(&mut self, idx: usize) {
-        if idx < self.user_stamps.len() {
-            self.user_stamps.remove(idx);
-            save_user_stamps(&self.user_stamps);
+        let Some(st) = self.user_stamps.get(idx) else {
+            return;
+        };
+        if st.read_only {
+            return;
         }
+        if let Some(path) = st.path.clone() {
+            let _ = std::fs::remove_file(path);
+        }
+        self.reload_stamps();
     }
 
     fn begin_gesture_undo(&mut self) {
@@ -5728,23 +5921,40 @@ impl eframe::App for JpoApp {
                         }
                     });
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new("My stamps").small().strong());
+                        ui.label(egui::RichText::new("Stamps").small().strong());
+                        ui.label(
+                            egui::RichText::new("exe横 stamps/*.jpostamp")
+                                .small()
+                                .weak(),
+                        );
                         if ui
                             .button("現在を保存")
-                            .on_hover_text("今のコード進行をスタンプとして保存")
+                            .on_hover_text(format!("保存先: {}", user_stamps_dir().display()))
                             .clicked()
                         {
                             let n = self.user_stamps.len() + 1;
                             self.save_current_as_user_stamp(format!("Stamp {n}"));
-                            self.show_toast(ctx, "スタンプ保存");
+                            self.show_toast(ctx, "stamps/ に保存");
+                        }
+                        if ui.small_button("↻").on_hover_text("stamps/ を再読込").clicked() {
+                            self.reload_stamps();
                         }
                         let mut del: Option<usize> = None;
                         let mut apply: Option<usize> = None;
                         for (i, st) in self.user_stamps.iter().enumerate() {
-                            if ui.button(&st.name).clicked() {
+                            if ui
+                                .button(&st.name)
+                                .on_hover_text(
+                                    st.path
+                                        .as_ref()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_default(),
+                                )
+                                .clicked()
+                            {
                                 apply = Some(i);
                             }
-                            if ui.small_button("✕").on_hover_text("削除").clicked() {
+                            if ui.small_button("✕").on_hover_text("ファイル削除").clicked() {
                                 del = Some(i);
                             }
                         }

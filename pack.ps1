@@ -41,6 +41,15 @@ if (Test-Path $PatternsSrc) {
     Copy-Item (Join-Path $PatternsSrc "*.mid") $PatternsDst -Force
 }
 
+# Chord stamps next to exe (user can add/edit/delete *.jpostamp here)
+$StampsSrc = Join-Path $Root "assets\stamps"
+if (Test-Path $StampsSrc) {
+    $StampsDst = Join-Path $OutDir "stamps"
+    New-Item -ItemType Directory -Path $StampsDst -Force | Out-Null
+    Copy-Item (Join-Path $StampsSrc "*.jpostamp") $StampsDst -Force -ErrorAction SilentlyContinue
+    Copy-Item (Join-Path $StampsSrc "README.txt") $StampsDst -Force -ErrorAction SilentlyContinue
+}
+
 @'
 JpoProducer — portable pack
 ===========================
@@ -58,6 +67,8 @@ If the app does not start:
 Tips:
 - Save sketches as .jpo (Tools menu -> Save)
 - Play needs SF2: sidebar should show "SF2: found"
+- Chord stamps live in the stamps\ folder next to jpo.exe
+  (Progress tab: click a stamp to paste; "現在を保存" adds a new file)
 '@ | Set-Content -Path (Join-Path $OutDir "START.txt") -Encoding UTF8
 
 Write-Host "==> Packed to: $OutDir"
@@ -66,6 +77,9 @@ Write-Host "    FluidR3 GM.SF2"
 Write-Host "    START.txt"
 if (Test-Path (Join-Path $OutDir "patterns")) {
     Write-Host "    patterns\ (*.mid)"
+}
+if (Test-Path (Join-Path $OutDir "stamps")) {
+    Write-Host "    stamps\ (*.jpostamp chord presets)"
 }
 
 if ($Zip) {

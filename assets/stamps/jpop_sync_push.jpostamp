@@ -1,0 +1,11 @@
+{
+  "name": "前ノリ入り I-V-vi-IV (4小節)",
+  "blocks": [
+    { "start": 0.0, "dur": 3.5, "degree": 1, "quality": "", "octave": 4, "syncopation_fill": false },
+    { "start": 3.5, "dur": 0.5, "degree": 5, "quality": "", "octave": 4, "syncopation_fill": true },
+    { "start": 4.0, "dur": 3.5, "degree": 5, "quality": "", "octave": 4, "syncopation_fill": false },
+    { "start": 7.5, "dur": 0.5, "degree": 6, "quality": "m", "octave": 4, "syncopation_fill": true },
+    { "start": 8.0, "dur": 4.0, "degree": 6, "quality": "m", "octave": 4, "syncopation_fill": false },
+    { "start": 12.0, "dur": 4.0, "degree": 4, "quality": "", "octave": 4, "syncopation_fill": false }
+  ]
+}

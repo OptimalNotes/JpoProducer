@@ -19,3 +19,6 @@ Desktop.ini
 
 # Local scratch
 _tmp_*.rs
+# User stamp folder next to cwd when developing
+/stamps/
+

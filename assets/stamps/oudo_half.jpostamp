@@ -1,0 +1,13 @@
+{
+  "name": "王道 ½小節 (4小節分)",
+  "blocks": [
+    { "start": 0.0, "dur": 2.0, "degree": 1, "quality": "", "octave": 4, "syncopation_fill": false },
+    { "start": 2.0, "dur": 2.0, "degree": 5, "quality": "", "octave": 4, "syncopation_fill": false },
+    { "start": 4.0, "dur": 2.0, "degree": 6, "quality": "m", "octave": 4, "syncopation_fill": false },
+    { "start": 6.0, "dur": 2.0, "degree": 4, "quality": "", "octave": 4, "syncopation_fill": false },
+    { "start": 8.0, "dur": 2.0, "degree": 1, "quality": "", "octave": 4, "syncopation_fill": false },
+    { "start": 10.0, "dur": 2.0, "degree": 5, "quality": "", "octave": 4, "syncopation_fill": false },
+    { "start": 12.0, "dur": 2.0, "degree": 6, "quality": "m", "octave": 4, "syncopation_fill": false },
+    { "start": 14.0, "dur": 2.0, "degree": 4, "quality": "", "octave": 4, "syncopation_fill": false }
+  ]
+}

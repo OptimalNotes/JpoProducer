@@ -1,0 +1,13 @@
+{
+  "name": "下降 I-vii-vi-V / IV-iii-ii-V (8小節)",
+  "blocks": [
+    { "start": 0.0, "dur": 4.0, "degree": 1, "quality": "", "octave": 4, "syncopation_fill": false },
+    { "start": 4.0, "dur": 4.0, "degree": 7, "quality": "", "octave": 4, "syncopation_fill": false },
+    { "start": 8.0, "dur": 4.0, "degree": 6, "quality": "m", "octave": 4, "syncopation_fill": false },
+    { "start": 12.0, "dur": 4.0, "degree": 5, "quality": "", "octave": 4, "syncopation_fill": false },
+    { "start": 16.0, "dur": 4.0, "degree": 4, "quality": "", "octave": 4, "syncopation_fill": false },
+    { "start": 20.0, "dur": 4.0, "degree": 3, "quality": "m", "octave": 4, "syncopation_fill": false },
+    { "start": 24.0, "dur": 4.0, "degree": 2, "quality": "m", "octave": 4, "syncopation_fill": false },
+    { "start": 28.0, "dur": 4.0, "degree": 5, "quality": "7", "octave": 4, "syncopation_fill": false }
+  ]
+}

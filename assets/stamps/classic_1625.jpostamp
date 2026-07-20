@@ -1,0 +1,9 @@
+{
+  "name": "王道バリエ I-vi-II-V (4小節)",
+  "blocks": [
+    { "start": 0.0, "dur": 4.0, "degree": 1, "quality": "", "octave": 4, "syncopation_fill": false },
+    { "start": 4.0, "dur": 4.0, "degree": 6, "quality": "m", "octave": 4, "syncopation_fill": false },
+    { "start": 8.0, "dur": 4.0, "degree": 2, "quality": "m", "octave": 4, "syncopation_fill": false },
+    { "start": 12.0, "dur": 4.0, "degree": 5, "quality": "7", "octave": 4, "syncopation_fill": false }
+  ]
+}
