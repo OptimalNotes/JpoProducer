@@ -67,6 +67,39 @@
 
 ---
 
+## 後回しタスク: Grok Co-Producer（Chrome 拡張）
+
+**本体が一段落してから。** 詳細: [`docs/FUTURE-grok-co-producer.md`](docs/FUTURE-grok-co-producer.md)
+
+| 項目 | 方針 |
+|------|------|
+| 名前のニュアンス | Grok を**共同制作のプロデューサー**に（仮称 Grok Co-Producer） |
+| 公式範囲 | **Grok 専用**拡張。他 LLM はジョブ貼り付け DIY + GitHub |
+| 本体 | 単体 + Fluid で完結。任意 LLM にジョブ可（推奨 Grok） |
+| 通信 | まず **クリップボード**（故障少）。必要なら後から localhost HTTP |
+| 配布 | 最初は Chrome **デベロッパーモード**でフォルダ読み込み（ストア不要） |
+
+ストーリー例:
+1. ソフト DL + Fluid → そのまま使える／LLM チャットで作曲補助  
+2. 拡張で Grok 連携 → 往復がラク  
+3. 他 LLM がいいならソース見て自分で  
+
+---
+
+## ポータブル配布物（この PC・2026-07-22 時点）
+
+別 Windows PC へ持っていく用（再生成: `pwsh -File pack.ps1 -Zip`）:
+
+| 種類 | フルパス |
+|------|----------|
+| **ZIP（おすすめ）** | `C:\Users\user\JpoProducer\dist\JpoProducer-portable-2026-07-22.zip`（約 130 MB） |
+| **展開フォルダ** | `C:\Users\user\JpoProducer\dist\JpoProducer-portable-2026-07-22\` |
+
+中身: `jpo.exe` + `FluidR3 GM.SF2` + `START.txt` + `patterns\` + `stamps\`  
+使い方: zip をコピー → 展開 → `jpo.exe`（SF2 は同じフォルダのまま）
+
+---
+
 ## 開発コマンド
 
 ```powershell
