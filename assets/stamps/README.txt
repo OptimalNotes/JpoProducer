@@ -15,6 +15,8 @@ Each file is one progression (.jpostamp or .json):
 - start/dur are in beats, relative (first block usually starts at 0)
 - degree: 1–7 (diatonic)
 - quality: "", "m", "7", "m7", "maj7", "dim", "sus4", ...
-- On paste: playhead or end of timeline; parts past loop length are clipped
+- On append (S2): always paste after the last chord block (empty timeline → beat 0).
+  Parts past loop length are clipped. Playhead is not used.
+- To try another stamp from scratch: clear progression, then append again.
 
 User saves go to:  <folder of jpo.exe>\stamps\*.jpostamp

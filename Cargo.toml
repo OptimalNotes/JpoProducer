@@ -14,6 +14,7 @@ rfd = "0.15"   # native file dialogs for save MIDI
 chrono = "0.4" # for timestamps in MIDI meta
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+ureq = { version = "2", features = ["json"] } # Grok API (S2 job send)
 
 # Integrated SoundFont playback (pure Rust, no FluidSynth DLLs ever).
 # These are required per the revised # JpoProducer.txt instruction (2026-06-15).

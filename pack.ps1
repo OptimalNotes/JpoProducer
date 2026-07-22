@@ -54,21 +54,39 @@ if (Test-Path $StampsSrc) {
 JpoProducer — portable pack
 ===========================
 
-1. Unzip this folder anywhere (Desktop, USB stick, etc.)
-2. Double-click jpo.exe
-   - jpo.exe and FluidR3 GM.SF2 must stay in the SAME folder.
-3. No Rust / cargo needed on this PC.
+【起動】
+1. このフォルダをどこかへ展開（Desktop / USB など）
+2. jpo.exe をダブルクリック
+   ※ jpo.exe と FluidR3 GM.SF2 は必ず同じフォルダに置く
+3. この PC に Rust / cargo は不要
 
-If the app does not start:
-- Windows 10/11 64-bit required
-- Install "Microsoft Visual C++ Redistributable" (2015-2022 x64)
+【起動しないとき】
+- Windows 10/11 64-bit
+- Microsoft Visual C++ Redistributable (2015-2022 x64)
   https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist
 
-Tips:
-- Save sketches as .jpo (Tools menu -> Save)
-- Play needs SF2: sidebar should show "SF2: found"
-- Chord stamps live in the stamps\ folder next to jpo.exe
-  (Progress tab: click a stamp to paste; "現在を保存" adds a new file)
+【タブ】
+1 Progress … コード進行（スタンプは末尾追記・進行クリアあり）
+2 Bed      … Piano/Bass/Drum 単純伴奏
+3 Edit     … ピアノロール / Vel・音色・Grok 下レーン
+4 Arrange  … ループ並べ
+
+【Edit 下レーン】
+- Vel  … ベロシティ棒グラフ
+- 音色 … GM 音色表（トラック単位。曲中 PC はしない）
+- Grok … 発注デスク
+  S1: 「ジョブをコピー」→ 外の Grok チャットに貼る
+  S2: 環境変数 XAI_API_KEY または GROK_API_KEY があれば API 送信
+  結果のノート列を「結果を取込」（雑談のみは拒否）
+
+【その他】
+- スケッチ保存: Tools → Save（.jpo）
+- stamps\ … 進行スタンプ（Progress で追記）
+- patterns\ … Bed 用パターン MIDI（exe から相対で読める配置）
+- Space = 再生、Edit の Q/W/E = Select/Draw/Erase
+
+開発リポジトリ: https://github.com/OptimalNotes/JpoProducer
+引継ぎ: リポジトリ内 HANDOVER.md
 '@ | Set-Content -Path (Join-Path $OutDir "START.txt") -Encoding UTF8
 
 Write-Host "==> Packed to: $OutDir"

@@ -48,6 +48,7 @@ fn track_short_label(ch: u8) -> String {
     }
 }
 
+#[allow(dead_code)] // reserved for compact UI labels
 fn truncate_ascii(s: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -458,6 +459,8 @@ fn track_is_audible(tracks: &[TrackData], idx: usize) -> bool {
 }
 
 /// True if every note id appears at most once across all tracks (Tab3 edit model).
+/// Used by golden/unit tests; kept outside `#[cfg(test)]` so release shares the same helpers.
+#[allow(dead_code)]
 fn note_ids_unique_across_tracks(tracks: &[TrackData]) -> bool {
     let mut seen = std::collections::HashSet::new();
     for tr in tracks {
@@ -693,6 +696,8 @@ fn expand_chords(proj: &Project) -> Vec<Note> {
 
 // === GROK / PROGRESSION PARSING ===
 
+// --- Progression text parsers (NL import / future Progress paste). Not on primary UI path. ---
+#[allow(dead_code)]
 fn normalize_roman_token(token: &str) -> String {
     token
         .replace('Ⅰ', "I")
@@ -711,6 +716,7 @@ fn normalize_roman_token(token: &str) -> String {
         .replace('ⅶ', "vii")
 }
 
+#[allow(dead_code)]
 fn split_progression_tokens(s: &str) -> Vec<String> {
     let mut buf = String::new();
     for c in s.chars() {
@@ -725,6 +731,7 @@ fn split_progression_tokens(s: &str) -> Vec<String> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn parse_literal_chord(proj: &Project, token: &str) -> Option<(u8, String)> {
     let t = token.trim();
     if t.is_empty() {
@@ -772,6 +779,7 @@ fn parse_literal_chord(proj: &Project, token: &str) -> Option<(u8, String)> {
     Some((degree, quality))
 }
 
+#[allow(dead_code)]
 fn parse_roman_chord(proj: &Project, token: &str) -> Option<(u8, String)> {
     let t = token.trim();
     if t.is_empty() {
@@ -819,10 +827,12 @@ fn parse_roman_chord(proj: &Project, token: &str) -> Option<(u8, String)> {
     Some((degree, quality))
 }
 
+#[allow(dead_code)]
 fn parse_chord_token(proj: &Project, token: &str) -> Option<(u8, String)> {
     parse_roman_chord(proj, token).or_else(|| parse_literal_chord(proj, token))
 }
 
+#[allow(dead_code)]
 fn parse_progression_text(proj: &Project, text: &str) -> Vec<(u8, String)> {
     split_progression_tokens(text)
         .iter()
@@ -885,6 +895,8 @@ fn parse_midi_track_notes(data: &[u8], paste_at: f64) -> Result<Vec<Note>, Strin
 }
 
 /// Parse all notes on a 1-based MIDI channel (Ch2=2, Ch10=10) from a multi-track SMF.
+/// Golden MIDI helpers (also used from `#[cfg(test)]`).
+#[allow(dead_code)]
 fn parse_midi_channel_notes(data: &[u8], ch: u8) -> Result<Vec<Note>, String> {
     let smf = Smf::parse(data).map_err(|e| format!("MIDI parse: {e}"))?;
     let ppq = match smf.header.timing {
@@ -896,14 +908,12 @@ fn parse_midi_channel_notes(data: &[u8], ch: u8) -> Result<Vec<Note>, String> {
     let mut pairs: Vec<(u32, u32, u8, u8)> = Vec::new();
     for track in &smf.tracks {
         let mut abs_tick = 0u32;
-        let mut cur_channel = 0u8;
         let mut active: std::collections::HashMap<u8, (u32, u8)> =
             std::collections::HashMap::new();
         for ev in track {
             abs_tick = abs_tick.saturating_add(ev.delta.as_int());
             if let TrackEventKind::Midi { channel, message } = &ev.kind {
-                cur_channel = channel.as_int();
-                if cur_channel != midi_ch {
+                if channel.as_int() != midi_ch {
                     continue;
                 }
                 match message {
@@ -946,6 +956,7 @@ fn parse_midi_channel_notes(data: &[u8], ch: u8) -> Result<Vec<Note>, String> {
     Ok(notes)
 }
 
+#[allow(dead_code)]
 fn note_time_events(notes: &[Note]) -> Vec<(f64, f64)> {
     let mut ev: Vec<(f64, f64)> = notes
         .iter()
@@ -959,6 +970,7 @@ fn note_time_events(notes: &[Note]) -> Vec<(f64, f64)> {
     ev
 }
 
+#[allow(dead_code)]
 fn time_events_match(a: &[Note], b: &[Note], tol: f64) -> bool {
     let ea = note_time_events(a);
     let eb = note_time_events(b);
@@ -970,6 +982,7 @@ fn time_events_match(a: &[Note], b: &[Note], tol: f64) -> bool {
         .all(|((as_, ad), (bs, bd))| (as_ - bs).abs() <= tol && (ad - bd).abs() <= tol)
 }
 
+#[allow(dead_code)]
 fn count_temporal_overlaps(notes: &[Note]) -> usize {
     let mut n = 0usize;
     for i in 0..notes.len() {
@@ -1007,6 +1020,7 @@ struct LoadedPattern {
     length_beats: f64,
     template_root: u8,
     /// BPM the pattern MIDI was authored at (default 120).
+    #[allow(dead_code)] // loaded for future BPM-aware pattern tools; beat grid is BPM-independent
     reference_bpm: f64,
     notes: Vec<PatternNote>,
 }
@@ -1193,6 +1207,7 @@ const BASS_MIDI_MIN: u8 = 28; // E1
 const BASS_MIDI_MAX: u8 = 51; // D#2
 
 /// Parallel transpose: preserve pattern voicing intervals from template key (piano).
+#[allow(dead_code)] // alternate pitch map; piano path uses quality-aware mapper
 fn melodic_pitch(pattern_pitch: u8, template_root: u8, target_root: u8) -> u8 {
     (pattern_pitch as i32 + target_root as i32 - template_root as i32).clamp(0, 127) as u8
 }
@@ -1288,6 +1303,7 @@ fn clamp_bass_note_pitches(notes: &mut [Note]) {
     }
 }
 
+#[allow(dead_code)] // generate_tests + future asserts
 fn bass_notes_in_range(notes: &[Note]) -> bool {
     notes
         .iter()
@@ -1375,6 +1391,7 @@ fn trim_same_pitch_temporal_overlap(notes: &mut Vec<Note>) {
     }
 }
 
+#[allow(dead_code)] // generate_tests + future asserts
 fn count_same_pitch_temporal_overlaps(notes: &[Note]) -> usize {
     let mut n = 0usize;
     for i in 0..notes.len() {
@@ -1764,12 +1781,263 @@ fn find_soundfont() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Tab1 chords: Draw + Erase. Tab3 piano roll: Select + Draw + Erase (standard MIDI editor).
+/// Tab3 piano roll tools only. Progress (Tab1) is modeless — no Draw/Erase.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditMode {
     Select,
     Draw,
     Erase,
+}
+
+/// Tab3 bottom lane: Domino-style tool strip under the piano roll.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditLaneTool {
+    /// Velocity bar graph.
+    Velocity,
+    /// Track GM instrument (patch) — not mid-song PC events.
+    Timbre,
+    /// Part order desk: structured survey → job → S1 copy / S2 API → import.
+    Grok,
+}
+
+/// Part role — primary arranging decision for the model.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum GrokPartRole {
+    #[default]
+    Pad,
+    Melody,
+    Counter,
+    Arpeggio,
+    Hook,
+    Free,
+}
+
+impl GrokPartRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pad => "パッド",
+            Self::Melody => "メロ",
+            Self::Counter => "カウンタメロ",
+            Self::Arpeggio => "アルペジオ",
+            Self::Hook => "フック/リフ",
+            Self::Free => "自由",
+        }
+    }
+    fn for_model(self) -> &'static str {
+        match self {
+            Self::Pad => "harmonic pad / sustained chord tones, minimal motion",
+            Self::Melody => "single-line lead melody with phrasing and rests",
+            Self::Counter => "countermelody: answer the implied vocal, leave space",
+            Self::Arpeggio => "arpeggiated chord tones, steady rhythmic pattern",
+            Self::Hook => "short memorable riff/hook, repeatable",
+            Self::Free => "follow USER PHRASE IDEA freely within constraints",
+        }
+    }
+    const ALL: [Self; 6] = [
+        Self::Pad,
+        Self::Melody,
+        Self::Counter,
+        Self::Arpeggio,
+        Self::Hook,
+        Self::Free,
+    ];
+}
+
+/// Where this part sits in song energy (not exact form analysis).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum GrokFormSlot {
+    #[default]
+    Any,
+    Verse,
+    Chorus,
+    Bridge,
+    IntroOutro,
+}
+
+impl GrokFormSlot {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Any => "指定なし",
+            Self::Verse => "Aメロ/Verse",
+            Self::Chorus => "サビ/Chorus",
+            Self::Bridge => "B/Bridge",
+            Self::IntroOutro => "Intro/Outro",
+        }
+    }
+    fn for_model(self) -> &'static str {
+        match self {
+            Self::Any => "unspecified section energy",
+            Self::Verse => "verse-like: lower intensity, leave room",
+            Self::Chorus => "chorus-like: higher intensity, more memorable",
+            Self::Bridge => "bridge-like: contrast, possible lift",
+            Self::IntroOutro => "intro/outro: establish or resolve, can be sparser",
+        }
+    }
+    const ALL: [Self; 5] = [
+        Self::Any,
+        Self::Verse,
+        Self::Chorus,
+        Self::Bridge,
+        Self::IntroOutro,
+    ];
+}
+
+/// Pitch register preference (model-facing MIDI guidance).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum GrokRegister {
+    Low,
+    #[default]
+    Mid,
+    High,
+    Wide,
+}
+
+impl GrokRegister {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Low => "低域",
+            Self::Mid => "中域",
+            Self::High => "高域",
+            Self::Wide => "広め",
+        }
+    }
+    fn for_model(self) -> &'static str {
+        match self {
+            Self::Low => "prefer MIDI ~36–55 (C2–G3)",
+            Self::Mid => "prefer MIDI ~55–79 (G3–G5)",
+            Self::High => "prefer MIDI ~72–96 (C5–C7)",
+            Self::Wide => "may span ~48–84; avoid extremes unless needed",
+        }
+    }
+    const ALL: [Self; 4] = [Self::Low, Self::Mid, Self::High, Self::Wide];
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum GrokDensity {
+    Sparse,
+    #[default]
+    Medium,
+    Dense,
+}
+
+impl GrokDensity {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sparse => "疎",
+            Self::Medium => "中",
+            Self::Dense => "密",
+        }
+    }
+    fn for_model(self) -> &'static str {
+        match self {
+            Self::Sparse => "sparse: few notes, lots of air, sketch-level",
+            Self::Medium => "medium density: clear phrases, not busy",
+            Self::Dense => "denser writing OK but still sketch, not full orchestration",
+        }
+    }
+    const ALL: [Self; 3] = [Self::Sparse, Self::Medium, Self::Dense];
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum GrokRhythmFeel {
+    #[default]
+    Sustained,
+    Even8,
+    Syncopated,
+    ChordOnly,
+}
+
+impl GrokRhythmFeel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sustained => "伸ばし",
+            Self::Even8 => "均等8分",
+            Self::Syncopated => "シンコ",
+            Self::ChordOnly => "コード変化に合わせる",
+        }
+    }
+    fn for_model(self) -> &'static str {
+        match self {
+            Self::Sustained => "long notes / pads; few attacks",
+            Self::Even8 => "mostly even 8th-note motion",
+            Self::Syncopated => "syncopation / off-beats welcome (J-Pop push)",
+            Self::ChordOnly => "change mainly with chord changes; minimal inner motion",
+        }
+    }
+    const ALL: [Self; 4] = [
+        Self::Sustained,
+        Self::Even8,
+        Self::Syncopated,
+        Self::ChordOnly,
+    ];
+}
+
+/// Structured answers Grok needs to reason (survey), not a free-form mega-prompt.
+#[derive(Clone, Debug)]
+struct GrokPartSurvey {
+    /// 1–based inclusive bar numbers.
+    bar_start: u8,
+    bar_end: u8,
+    role: GrokPartRole,
+    form_slot: GrokFormSlot,
+    register: GrokRegister,
+    density: GrokDensity,
+    rhythm: GrokRhythmFeel,
+    /// Song world / vibe (what album are we in?).
+    style_world: String,
+    /// Phrase / melodic-rhythmic idea.
+    phrase_idea: String,
+    /// Hard don'ts.
+    avoid: String,
+    leave_vocal_space: bool,
+    avoid_doubling_bed: bool,
+    /// Import / result paste buffer.
+    result_text: String,
+    /// Optional API status line.
+    api_status: String,
+}
+
+impl Default for GrokPartSurvey {
+    fn default() -> Self {
+        Self {
+            bar_start: 1,
+            bar_end: 4,
+            role: GrokPartRole::Pad,
+            form_slot: GrokFormSlot::Any,
+            register: GrokRegister::Mid,
+            density: GrokDensity::Medium,
+            rhythm: GrokRhythmFeel::Sustained,
+            style_world: String::new(),
+            phrase_idea: String::new(),
+            avoid: String::new(),
+            leave_vocal_space: true,
+            avoid_doubling_bed: true,
+            result_text: String::new(),
+            api_status: String::new(),
+        }
+    }
+}
+
+/// GM bank categories for the Timbre lane (patch ranges inclusive).
+fn gm_categories() -> &'static [(&'static str, u8, u8)] {
+    &[
+        ("Piano", 0, 7),
+        ("Chromatic Perc", 8, 15),
+        ("Organ", 16, 23),
+        ("Guitar", 24, 31),
+        ("Bass", 32, 39),
+        ("Strings", 40, 47),
+        ("Ensemble", 48, 55),
+        ("Brass", 56, 63),
+        ("Reed", 64, 71),
+        ("Pipe", 72, 79),
+        ("Synth Lead", 80, 87),
+        ("Synth Pad", 88, 95),
+        ("Synth FX", 96, 103),
+        ("Ethnic", 104, 111),
+        ("Percussive", 112, 119),
+        ("Sound FX", 120, 127),
+    ]
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1781,6 +2049,7 @@ enum AppTab {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // legacy panel; order desk uses GrokPartSurvey
 enum GrokImportMode {
     NaturalLanguage,
     MidiFile,
@@ -2064,15 +2333,87 @@ const POINTER_SLOP_PX: f32 = 8.0;
 /// not as `Key::V`. Notes are encoded as text so the system clipboard works.
 const JPO_NOTES_CLIP_MAGIC: &str = "JPO_NOTES_V1";
 
+/// Encode notes for OS clipboard. Times are **relative to min_start** so paste preserves
+/// intervals/durations exactly (absolute starts would only work if min_start is applied once).
 fn notes_to_clip_text(notes: &[Note], min_start: f64) -> String {
     let mut lines = vec![JPO_NOTES_CLIP_MAGIC.to_string(), format!("{min_start:.6}")];
     for n in notes {
         lines.push(format!(
             "{:.6},{:.6},{},{}",
-            n.start, n.dur, n.pitch, n.vel
+            n.start - min_start,
+            n.dur,
+            n.pitch,
+            n.vel
         ));
     }
     lines.join("\n")
+}
+
+/// Parse Grok / human note lines for Tab3 import.
+/// - `JPO_NOTES_V1` clipboard body, or
+/// - lines `start,dur,pitch[,vel]` (relative start → shifted by `paste_at`).
+fn parse_grok_note_lines(text: &str, paste_at: f64, default_vel: u8) -> Vec<Note> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if let Some(clip) = notes_from_clip_text(text) {
+        let mut notes = clip.notes;
+        let min_s = notes
+            .iter()
+            .map(|n| n.start)
+            .fold(f64::INFINITY, f64::min);
+        if min_s.is_finite() {
+            for n in &mut notes {
+                n.start = n.start - min_s + paste_at;
+            }
+        }
+        return notes;
+    }
+    let mut notes = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+            continue;
+        }
+        let parts: Vec<&str> = line
+            .split([',', '\t', ' '])
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let Ok(start) = parts[0].parse::<f64>() else {
+            continue;
+        };
+        let Ok(dur) = parts[1].parse::<f64>() else {
+            continue;
+        };
+        let pitch = match parts[2].parse::<u16>() {
+            Ok(v) if v <= 127 => v as u8,
+            _ => continue,
+        };
+        let vel = if parts.len() >= 4 {
+            parts[3]
+                .parse::<u16>()
+                .ok()
+                .map(|v| v.clamp(1, 127) as u8)
+                .unwrap_or(default_vel)
+        } else {
+            default_vel
+        };
+        if dur <= 0.0 {
+            continue;
+        }
+        notes.push(Note {
+            id: NoteId(0),
+            start: paste_at + start,
+            pitch,
+            dur,
+            vel,
+        });
+    }
+    notes
 }
 
 fn notes_from_clip_text(s: &str) -> Option<ClipboardNotes> {
@@ -2081,7 +2422,8 @@ fn notes_from_clip_text(s: &str) -> Option<ClipboardNotes> {
     if magic != JPO_NOTES_CLIP_MAGIC {
         return None;
     }
-    let min_start: f64 = lines.next()?.parse().ok()?;
+    // Historical absolute min_start header (ignored for timing; notes store relative starts).
+    let _header_min: f64 = lines.next()?.parse().ok()?;
     let mut notes = Vec::new();
     for line in lines {
         let mut parts = line.split(',');
@@ -2089,21 +2431,38 @@ fn notes_from_clip_text(s: &str) -> Option<ClipboardNotes> {
         let dur: f64 = parts.next()?.parse().ok()?;
         let pitch: u8 = parts.next()?.parse().ok()?;
         let vel: u8 = parts.next()?.parse().ok()?;
+        if dur <= 0.0 {
+            continue;
+        }
         notes.push(Note {
             id: NoteId(0),
-            start,
-            dur,
+            start, // relative to selection origin
             pitch,
+            dur,
             vel,
         });
     }
     if notes.is_empty() {
         return None;
     }
-    let anchor_pitch = notes[0].pitch;
+    // Normalize so earliest relative start is 0 (handles older absolute exports too).
+    let min_rel = notes
+        .iter()
+        .map(|n| n.start)
+        .fold(f64::INFINITY, f64::min);
+    if min_rel.is_finite() && min_rel.abs() > 1e-9 {
+        for n in &mut notes {
+            n.start -= min_rel;
+        }
+    }
+    let anchor_pitch = notes
+        .iter()
+        .min_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|n| n.pitch)
+        .unwrap_or(60);
     Some(ClipboardNotes {
         notes,
-        min_start,
+        min_start: 0.0, // notes[].start are relative
         anchor_pitch,
     })
 }
@@ -2159,6 +2518,7 @@ fn clip_notes_to_starting_chord(notes: &mut [Note], blocks: &[ChordBlock]) {
 struct ClipboardNotes {
     notes: Vec<Note>,
     min_start: f64,
+    #[allow(dead_code)]
     anchor_pitch: u8,
 }
 
@@ -2179,6 +2539,8 @@ fn build_pasted_notes(
     base_id: NoteId,
 ) -> Vec<Note> {
     let mut next_id = base_id.0;
+    // Preserve source start offsets and durations exactly — do not snap per-note or
+    // clip to chords here (that was making paste lengths/gaps wrong).
     cb.notes
         .iter()
         .map(|n| {
@@ -2187,7 +2549,7 @@ fn build_pasted_notes(
                 id: NoteId(next_id),
                 start: paste_at + rel,
                 pitch: (n.pitch as i32 + pitch_shift).clamp(0, 127) as u8,
-                dur: n.dur,
+                dur: n.dur.max(0.0625),
                 vel: n.vel,
             };
             next_id += 1;
@@ -2197,6 +2559,7 @@ fn build_pasted_notes(
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Tab1 modeless path no longer exposes chord clipboard
 struct ChordClipboard {
     blocks: Vec<ChordBlock>,
     anchor_start: f64,
@@ -2259,11 +2622,24 @@ struct JpoApp {
     snap_enabled: bool,
     /// When true, pitch input snaps to current key scale degrees.
     scale_snap: bool,
-    /// Stamp paste: false = at playhead, true = after last chord block.
-    stamp_paste_at_end: bool,
+    /// Selected index in the Progress stamp combo (for append).
+    stamp_combo_idx: usize,
     user_stamps: Vec<UserStamp>,
     tracks_panel_open: bool,
-    edit_bottom_open: bool,
+    /// Tab3 bottom lane tool (Vel graph / Grok / …). Always visible on Edit.
+    edit_lane_tool: EditLaneTool,
+    /// Note id being velocity-dragged in the Vel lane.
+    vel_drag_note: Option<NoteId>,
+    /// Tab3: at most one clipboard op (esp. paste) per frame.
+    /// Windows fires both `Event::Paste` and Ctrl+V; we also used to run handlers twice.
+    edit_clipboard_done: bool,
+    /// Grok order desk survey (stable fields for the model).
+    grok_survey: GrokPartSurvey,
+    /// Timbre lane: selected GM category index.
+    timbre_cat_idx: usize,
+    /// Background Grok API result (S2): Ok(text) / Err(msg).
+    grok_api_inbox: Arc<Mutex<Option<Result<String, String>>>>,
+    grok_api_busy: bool,
 
     // interaction state
     /// Stable chord selection keyed by block start beat (survives sort_by).
@@ -2366,7 +2742,9 @@ struct JpoApp {
     piano_roll_focused: bool,
 
     /// Grok: natural-language progression paste, or MIDI file import.
+    #[allow(dead_code)]
     grok_import_mode: GrokImportMode,
+    #[allow(dead_code)] // legacy; results go to grok_survey.result_text
     grok_paste_text: String,
 }
 
@@ -2383,13 +2761,19 @@ impl Default for JpoApp {
             snap_grid: 0.25, // default Grid = 1/16
             snap_enabled: true,
             scale_snap: true,
-            stamp_paste_at_end: false,
+            stamp_combo_idx: 0,
             user_stamps: {
                 ensure_user_stamps_seeded();
                 load_user_stamps()
             },
             tracks_panel_open: true,
-            edit_bottom_open: false,
+            edit_lane_tool: EditLaneTool::Velocity,
+            vel_drag_note: None,
+            edit_clipboard_done: false,
+            grok_survey: GrokPartSurvey::default(),
+            timbre_cat_idx: 0,
+            grok_api_inbox: Arc::new(Mutex::new(None)),
+            grok_api_busy: false,
             active_chord_beat: None,
             selected_note: None,
             selection: Selection::default(),
@@ -2407,8 +2791,8 @@ impl Default for JpoApp {
             box_select_start_beat: None,
             box_select_start_pitch: None,
             playback_volume: 0.8,
-            visible_pitch_center: 60.0,
-            visible_pitch_span: 48.0,
+            visible_pitch_center: 60.0, // C4 — hand-writing center
+            visible_pitch_span: 24.0,   // ~2 octaves default (was 48)
             scale_opacity: 0.22,
             chord_opacity: 0.28,
             last_mouse_beat: 0.0,
@@ -2484,9 +2868,8 @@ impl JpoApp {
                 self.selected_ch = 2;
             }
             self.piano_roll_focused = true;
-        } else if tab == AppTab::Chord {
-            self.edit_mode = EditMode::Draw;
         }
+        // Progress (Chord): modeless — no Draw/Erase; gestures only.
         if tab != AppTab::Edit {
             self.selected_note = None;
             self.selection.notes.clear();
@@ -2496,6 +2879,7 @@ impl JpoApp {
         }
     }
 
+    #[allow(dead_code)] // NL progression import; not on Progress primary UI
     fn apply_grok_natural_language(&mut self, ctx: &egui::Context) {
         let chords = parse_progression_text(&self.proj, &self.grok_paste_text);
         if chords.is_empty() {
@@ -2557,6 +2941,7 @@ impl JpoApp {
         }
     }
 
+    #[allow(dead_code)] // replaced by show_edit_grok_lane order desk
     fn show_grok_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, allow_nl_text_input: bool) {
         egui::CollapsingHeader::new("Grok")
             .default_open(false)
@@ -2794,6 +3179,10 @@ impl JpoApp {
     }
 
     fn try_paste_notes(&mut self, ctx: &egui::Context) -> bool {
+        // Hard stop: never paste twice in one frame (OS Paste + Ctrl+V, or dual handlers).
+        if self.edit_clipboard_done {
+            return false;
+        }
         if self.active_tab != AppTab::Edit || self.selected_ch == 1 {
             self.show_edit_feedback(
                 ctx,
@@ -2814,6 +3203,7 @@ impl JpoApp {
             self.show_edit_feedback(ctx, "Paste failed");
             return false;
         }
+        self.edit_clipboard_done = true;
         let after = self.proj.tracks[t_idx].notes.len();
         self.show_edit_feedback(
             ctx,
@@ -2885,7 +3275,11 @@ impl JpoApp {
         }
 
         if pressed_ctrl_letter(i, egui::Key::V) {
-            self.try_paste_notes(ctx);
+            // OS `Event::Paste` often already handled this frame (Windows).
+            if !self.edit_clipboard_done {
+                self.try_paste_notes(ctx);
+                self.edit_clipboard_done = true;
+            }
             consume_ctrl_letter(i, egui::Key::V);
             return true;
         }
@@ -3244,6 +3638,7 @@ impl JpoApp {
         !self.selected_note_ids(self.track_idx()).is_empty()
     }
 
+    #[allow(dead_code)]
     fn has_chord_selection(&self) -> bool {
         !self.selection.blocks.is_empty() || self.active_chord_beat.is_some()
     }
@@ -3348,6 +3743,7 @@ impl JpoApp {
         true
     }
 
+    #[allow(dead_code)]
     fn paste_chord_blocks(&mut self) {
         let Some(cb) = self.chord_clipboard.clone() else {
             return;
@@ -3480,7 +3876,7 @@ impl JpoApp {
 
     fn finalize_box_selection(&mut self, min_b: f64, max_b: f64, min_p: u8, max_p: u8) {
         let t_idx = self.track_idx();
-        for (i, n) in self.proj.tracks[t_idx].notes.iter().enumerate() {
+        for n in self.proj.tracks[t_idx].notes.iter() {
             let in_time = n.start <= max_b && n.end() >= min_b;
             let in_pitch = n.pitch >= min_p && n.pitch <= max_p;
             if in_time && in_pitch {
@@ -4070,12 +4466,14 @@ impl JpoApp {
         v
     }
 
+    #[allow(dead_code)] // kept for tests / internal demos; Progress UI uses file stamps only
     fn apply_chord_progression_odori(&mut self) {
-        self.apply_stamp_blocks(&Self::builtin_odori_1bar());
+        let _ = self.apply_stamp_blocks(&Self::builtin_odori_1bar());
     }
 
+    #[allow(dead_code)]
     fn apply_chord_stamp_half_odori(&mut self) {
-        self.apply_stamp_blocks(&Self::builtin_odori_half());
+        let _ = self.apply_stamp_blocks(&Self::builtin_odori_half());
     }
 
     fn nudge_selected_chords(&mut self, delta_beats: f64) {
@@ -4401,37 +4799,35 @@ impl JpoApp {
         }
     }
 
-    /// Overflow menu — tab-specific edit tools + shared project I/O.
-    fn show_tools_menu(&mut self, ui: &mut egui::Ui, roots: &[&str]) {
+    /// Overflow menu — Edit tools + shared project I/O. Progress has no tool modes.
+    fn show_tools_menu(&mut self, ui: &mut egui::Ui, _roots: &[&str]) {
         let menu_title = match self.active_tab {
-            AppTab::Chord | AppTab::Edit => format!("{} ▾", self.edit_tool_label()),
+            AppTab::Edit => format!("{} ▾", self.edit_tool_label()),
             _ => "Tools ▾".to_string(),
         };
         ui.menu_button(menu_title, |ui| {
-            if matches!(self.active_tab, AppTab::Chord | AppTab::Edit) {
+            if self.active_tab == AppTab::Edit {
                 ui.label(egui::RichText::new("Tool").strong());
-                if self.active_tab == AppTab::Edit {
-                    for (mode, label) in [
-                        (EditMode::Select, "Select"),
-                        (EditMode::Draw, "Draw"),
-                        (EditMode::Erase, "Erase"),
-                    ] {
-                        if ui.selectable_label(self.edit_mode == mode, label).clicked() {
-                            self.edit_mode = mode;
-                            ui.close_menu();
-                        }
-                    }
-                } else {
-                    for (mode, label) in [(EditMode::Draw, "Draw"), (EditMode::Erase, "Erase")] {
-                        if ui.selectable_label(self.edit_mode == mode, label).clicked() {
-                            self.edit_mode = mode;
-                            ui.close_menu();
-                        }
+                for (mode, label) in [
+                    (EditMode::Select, "Select"),
+                    (EditMode::Draw, "Draw"),
+                    (EditMode::Erase, "Erase"),
+                ] {
+                    if ui.selectable_label(self.edit_mode == mode, label).clicked() {
+                        self.edit_mode = mode;
+                        ui.close_menu();
                     }
                 }
             }
 
             if self.active_tab == AppTab::Chord {
+                ui.label(
+                    egui::RichText::new(
+                        "Progress: モデルレス（空きクリック配置 / 右端伸長 / ダブルクリック削除）",
+                    )
+                    .small()
+                    .weak(),
+                );
                 ui.separator();
                 ui.label(egui::RichText::new("Chord block length").strong());
                 for (label, val) in Self::NOTE_LENS {
@@ -4656,26 +5052,26 @@ impl JpoApp {
         self.end_gesture_undo();
     }
 
+    /// S2 contract: stamps always append after the last chord block (empty → 0).
+    /// Playhead is playback-only and never used as paste origin.
     fn stamp_paste_start(&self) -> f64 {
-        if self.stamp_paste_at_end {
-            self.proj
-                .chord_blocks
-                .iter()
-                .map(|b| b.end())
-                .fold(0.0_f64, f64::max)
-        } else {
-            self.current_beat.max(0.0)
-        }
+        self.proj
+            .chord_blocks
+            .iter()
+            .map(|b| b.end())
+            .fold(0.0_f64, f64::max)
     }
 
-    fn apply_stamp_blocks(&mut self, stamp: &[ChordBlock]) {
+    /// Append relative stamp blocks at the progression end. Returns how many blocks landed.
+    fn apply_stamp_blocks(&mut self, stamp: &[ChordBlock]) -> usize {
         let loop_end = self.loop_beats();
         let min_dur = 0.0625;
         let paste_at = self.snap_beat(self.stamp_paste_start());
         let clipped = paste_stamp_blocks_clipped(stamp, paste_at, loop_end, min_dur);
         if clipped.is_empty() {
-            return;
+            return 0;
         }
+        let n = clipped.len();
         self.begin_gesture_undo();
         self.proj.chord_blocks.extend(clipped);
         self.proj
@@ -4685,11 +5081,47 @@ impl JpoApp {
         self.clear_chord_selection();
         self.end_gesture_undo();
         self.sync_active_bank_from_proj();
+        n
+    }
+
+    /// Clear all chord blocks (for compare / redo before another stamp). Undo-able.
+    fn clear_chord_progression(&mut self) {
+        if self.proj.chord_blocks.is_empty() {
+            return;
+        }
+        self.begin_gesture_undo();
+        self.proj.chord_blocks.clear();
+        self.clear_chord_selection();
+        self.end_gesture_undo();
+        self.sync_active_bank_from_proj();
+    }
+
+    fn append_selected_stamp(&mut self, ctx: &egui::Context) {
+        if self.user_stamps.is_empty() {
+            self.show_toast(ctx, "スタンプがありません（stamps/ を確認）");
+            return;
+        }
+        if self.stamp_combo_idx >= self.user_stamps.len() {
+            self.stamp_combo_idx = 0;
+        }
+        let name = self.user_stamps[self.stamp_combo_idx].name.clone();
+        let blocks = self.user_stamps[self.stamp_combo_idx].blocks.clone();
+        let n = self.apply_stamp_blocks(&blocks);
+        if n == 0 {
+            self.show_toast(ctx, "ループ末尾に空きが無く追記できませんでした");
+        } else {
+            self.show_toast(ctx, &format!("末尾に追記: {name}（{n} ブロック）"));
+        }
     }
 
     fn reload_stamps(&mut self) {
         ensure_user_stamps_seeded();
         self.user_stamps = load_user_stamps();
+        if self.user_stamps.is_empty() {
+            self.stamp_combo_idx = 0;
+        } else if self.stamp_combo_idx >= self.user_stamps.len() {
+            self.stamp_combo_idx = self.user_stamps.len() - 1;
+        }
     }
 
     fn save_current_as_user_stamp(&mut self, name: String) {
@@ -4704,7 +5136,7 @@ impl JpoApp {
         };
         let dir = user_stamps_dir();
         let _ = std::fs::create_dir_all(&dir);
-        let mut file_stem = sanitize_stamp_filename(&name);
+        let file_stem = sanitize_stamp_filename(&name);
         let mut path = dir.join(format!("{file_stem}.jpostamp"));
         let mut n = 2;
         while path.exists() {
@@ -4723,7 +5155,6 @@ impl JpoApp {
         if write_stamp_file(&path, &stamp).is_ok() {
             self.reload_stamps();
         }
-        let _ = file_stem;
     }
 
     fn delete_user_stamp(&mut self, idx: usize) {
@@ -4840,12 +5271,11 @@ impl JpoApp {
             return false;
         }
         self.begin_gesture_undo();
-        // Use playhead grid (1/16), not Draw Len — otherwise paste lands on the wrong beat.
+        // Snap only the paste origin (1/16). Relative spacing + durations stay exact.
         let paste_at = self.snap_playhead(self.current_beat);
-        // Standard MIDI paste: move in time only; keep source pitches. Target track may differ.
-        let mut pasted = build_pasted_notes(&cb, paste_at, 0, self.next_note_id());
-        // Long notes that land across a chord change: truncate at starting chord end.
-        clip_notes_to_starting_chord(&mut pasted, &self.proj.chord_blocks);
+        // Standard MIDI paste: time-shift only; keep source pitches and gate lengths.
+        // Do NOT clip to chord boundaries — that shortened notes and broke phrase spacing.
+        let pasted = build_pasted_notes(&cb, paste_at, 0, self.next_note_id());
         let pasted_ids: Vec<NoteId> = pasted.iter().map(|n| n.id).collect();
         // Clear selection from source track so UI doesn't keep ghost highlights.
         self.selection.notes.clear();
@@ -4876,13 +5306,19 @@ impl JpoApp {
         true
     }
 
-    /// Handle OS / egui clipboard events (Copy, Cut, Paste text). Call once per frame on Edit.
+    /// Handle OS / egui clipboard events (Copy, Cut, Paste text). Call **once** per frame on Edit.
     ///
     /// Important: do **not** gate on `wants_keyboard_input()` for Copy — a focused text field
     /// on another tab left focus and blocked Ctrl entirely. For Paste, only skip non-JPO text
     /// when a text field wants input.
+    ///
+    /// Windows often delivers **both** `Event::Paste` and Ctrl+V for one keystroke. We paste
+    /// at most once (`edit_clipboard_done`) and consume Ctrl+V so the key path does not double.
     fn handle_os_clipboard_events(&mut self, ctx: &egui::Context) -> bool {
         if self.active_tab != AppTab::Edit || self.selected_ch == 1 {
+            return false;
+        }
+        if self.edit_clipboard_done {
             return false;
         }
         let text_focus = ctx.wants_keyboard_input();
@@ -4909,6 +5345,7 @@ impl JpoApp {
             } else {
                 self.show_edit_feedback(ctx, "Copy — select notes first");
             }
+            self.edit_clipboard_done = true;
             did = true;
         }
         if want_cut {
@@ -4920,22 +5357,30 @@ impl JpoApp {
             } else {
                 self.show_edit_feedback(ctx, "Cut — nothing selected");
             }
+            self.edit_clipboard_done = true;
             did = true;
         }
         if let Some(s) = paste_payload {
             if let Some(cb) = notes_from_clip_text(&s) {
                 self.clipboard = Some(cb);
                 self.try_paste_notes(ctx);
+                self.edit_clipboard_done = true;
+                // Stop the parallel Ctrl+V key path from pasting again.
+                ctx.input_mut(|i| consume_ctrl_letter(i, egui::Key::V));
                 did = true;
             } else if !text_focus && self.clipboard.is_some() {
                 // OS paste fired (Ctrl+V) but text isn't ours — use internal note clipboard.
                 self.try_paste_notes(ctx);
+                self.edit_clipboard_done = true;
+                ctx.input_mut(|i| consume_ctrl_letter(i, egui::Key::V));
                 did = true;
             } else if !text_focus {
                 self.show_edit_feedback(
                     ctx,
                     "Paste — no Jpo notes on clipboard (select + Copy first)",
                 );
+                self.edit_clipboard_done = true;
+                ctx.input_mut(|i| consume_ctrl_letter(i, egui::Key::V));
                 did = true;
             }
             // If text_focus and non-JPO paste: leave for the text field.
@@ -4987,6 +5432,806 @@ impl JpoApp {
             }
         }
         self.end_gesture_undo();
+    }
+
+    fn set_note_velocity(&mut self, track_idx: usize, note_id: NoteId, vel: u8) {
+        let vel = vel.clamp(1, 127);
+        if let Some(n) = self.proj.tracks[track_idx]
+            .notes
+            .iter_mut()
+            .find(|n| n.id == note_id)
+        {
+            if n.vel != vel {
+                n.vel = vel;
+            }
+        }
+    }
+
+    /// Piano-roll-aligned velocity bars (Domino-style graph under the roll).
+    fn draw_velocity_lane(&mut self, ui: &mut egui::Ui, height: f32) {
+        let key_w = Self::PIANO_KEY_WIDTH;
+        ui.horizontal(|ui| {
+            // Gutter matches keyboard width so bars align with the roll.
+            ui.allocate_ui_with_layout(
+                Vec2::new(key_w, height),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.add_space(height * 0.25);
+                    ui.label(egui::RichText::new("Vel").small().strong());
+                    ui.label(egui::RichText::new("127").small().weak());
+                    ui.label(egui::RichText::new("1").small().weak());
+                },
+            );
+            let avail_w = ui.available_width().min(1100.0);
+            let desired = Vec2::new(avail_w, height);
+            let (resp, painter) = ui.allocate_painter(desired, Sense::click_and_drag());
+            let rect = resp.rect;
+            painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 22, 28));
+
+            let start_b = self.visible_start;
+            let vis = self.visible_beats.max(0.25);
+            let px_per_beat = rect.width() as f64 / vis;
+
+            // Grid lines (bars)
+            let mut b = (start_b * 4.0).floor() / 4.0;
+            while b <= start_b + vis + 0.01 {
+                let x = rect.min.x + ((b - start_b) * px_per_beat) as f32;
+                let is_bar = (b % 4.0).abs() < 0.001;
+                painter.line_segment(
+                    [Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)],
+                    Stroke::new(
+                        if is_bar { 1.2_f32 } else { 0.6_f32 },
+                        if is_bar {
+                            Color32::from_rgb(70, 72, 88)
+                        } else {
+                            Color32::from_rgb(40, 42, 52)
+                        },
+                    ),
+                );
+                b += 0.25;
+            }
+
+            // Mid velocity guide
+            let mid_y = rect.min.y + rect.height() * 0.5;
+            painter.line_segment(
+                [Pos2::new(rect.min.x, mid_y), Pos2::new(rect.max.x, mid_y)],
+                Stroke::new(0.8_f32, Color32::from_rgb(50, 52, 64)),
+            );
+
+            if self.selected_ch == 1 {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Ch2–16 で Vel 編集",
+                    egui::FontId::proportional(12.0),
+                    Color32::from_rgb(100, 105, 120),
+                );
+                return;
+            }
+
+            let t_idx = self.track_idx();
+            let end_b = start_b + vis;
+            let h = rect.height().max(1.0);
+
+            // Draw bars for visible notes
+            let notes_snapshot: Vec<(NoteId, f64, f64, u8, bool)> = self.proj.tracks[t_idx]
+                .notes
+                .iter()
+                .filter(|n| n.end() > start_b && n.start < end_b)
+                .map(|n| {
+                    let sel = self.selection.notes.contains(&(t_idx, n.id))
+                        || self.selected_note == Some((t_idx, n.id));
+                    (n.id, n.start, n.dur, n.vel, sel)
+                })
+                .collect();
+
+            for (id, nstart, ndur, vel, sel) in &notes_snapshot {
+                let x0 = rect.min.x + ((*nstart - start_b) * px_per_beat) as f32;
+                let x1 = rect.min.x + ((*nstart + *ndur - start_b) * px_per_beat) as f32;
+                let bar_w = (x1 - x0).max(3.0);
+                let vel_n = (*vel as f32 / 127.0).clamp(0.05, 1.0);
+                let bar_h = h * vel_n;
+                let y1 = rect.max.y - 1.0;
+                let y0 = y1 - bar_h;
+                let col = if *sel {
+                    Color32::from_rgb(90, 190, 255)
+                } else {
+                    Color32::from_rgb(
+                        (40.0 + 100.0 * vel_n) as u8,
+                        (90.0 + 100.0 * vel_n) as u8,
+                        (140.0 + 80.0 * vel_n) as u8,
+                    )
+                };
+                painter.rect_filled(
+                    Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x0 + bar_w, y1)),
+                    1.0,
+                    col,
+                );
+                let _ = id;
+            }
+
+            // Playhead
+            let ph_x = rect.min.x + ((self.current_beat - start_b) * px_per_beat) as f32;
+            if ph_x >= rect.min.x && ph_x <= rect.max.x {
+                painter.line_segment(
+                    [Pos2::new(ph_x, rect.min.y), Pos2::new(ph_x, rect.max.y)],
+                    Stroke::new(1.5_f32, Color32::from_rgb(255, 90, 90)),
+                );
+            }
+
+            let ptr = resp.interact_pointer_pos();
+            let vel_from_y = |y: f32| -> u8 {
+                let t = ((rect.max.y - y) / h).clamp(0.0, 1.0);
+                ((t * 127.0).round() as i32).clamp(1, 127) as u8
+            };
+            let hit_note = |px: f32| -> Option<NoteId> {
+                // Prefer selected, then highest bar under x
+                let mut best: Option<(NoteId, u8)> = None;
+                for (id, nstart, ndur, vel, sel) in &notes_snapshot {
+                    let x0 = rect.min.x + ((*nstart - start_b) * px_per_beat) as f32;
+                    let x1 = rect.min.x + ((*nstart + *ndur - start_b) * px_per_beat) as f32;
+                    let x1 = x1.max(x0 + 3.0);
+                    if px >= x0 && px <= x1 {
+                        let score = if *sel { 200u8.saturating_add(*vel) } else { *vel };
+                        if best.map(|(_, s)| score >= s).unwrap_or(true) {
+                            best = Some((*id, score));
+                        }
+                    }
+                }
+                best.map(|(id, _)| id)
+            };
+
+            if resp.drag_started() {
+                if let Some(p) = ptr {
+                    if let Some(id) = hit_note(p.x) {
+                        self.begin_gesture_undo();
+                        self.vel_drag_note = Some(id);
+                        let v = vel_from_y(p.y);
+                        self.set_note_velocity(t_idx, id, v);
+                        self.selection.notes.clear();
+                        self.selection.notes.insert((t_idx, id));
+                        self.selected_note = Some((t_idx, id));
+                    } else {
+                        // Empty click: set playhead
+                        let beat = start_b + ((p.x - rect.min.x) as f64 / px_per_beat);
+                        self.set_playhead(beat);
+                    }
+                }
+            }
+            if resp.dragged() {
+                if let (Some(id), Some(p)) = (self.vel_drag_note, ptr) {
+                    let v = vel_from_y(p.y);
+                    self.set_note_velocity(t_idx, id, v);
+                }
+            }
+            if resp.drag_stopped() {
+                if self.vel_drag_note.is_some() {
+                    self.end_gesture_undo();
+                    self.vel_drag_note = None;
+                }
+            }
+            if resp.clicked() && !resp.dragged() {
+                if let Some(p) = ptr {
+                    if let Some(id) = hit_note(p.x) {
+                        self.begin_gesture_undo();
+                        let v = vel_from_y(p.y);
+                        self.set_note_velocity(t_idx, id, v);
+                        self.selection.notes.clear();
+                        self.selection.notes.insert((t_idx, id));
+                        self.selected_note = Some((t_idx, id));
+                        self.end_gesture_undo();
+                    } else {
+                        let beat = start_b + ((p.x - rect.min.x) as f64 / px_per_beat);
+                        self.set_playhead(beat);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Timbre lane: pick GM instrument for selected track (no mid-song PC events).
+    fn show_timbre_lane(&mut self, ui: &mut egui::Ui, height: f32) {
+        let h = height.max(200.0);
+        let full_w = ui.available_width();
+        egui::Frame::none()
+            .fill(Color32::from_rgb(24, 24, 30))
+            .inner_margin(egui::Margin::same(8.0))
+            .show(ui, |ui| {
+                ui.set_min_height(h - 4.0);
+                ui.set_min_width(full_w);
+                if self.selected_ch == 1 {
+                    ui.label("コードトラックには音色なし（Ch2–16 を選択）");
+                    return;
+                }
+                if self.selected_ch == 10 {
+                    ui.label("Ch10 Drum: GM キット固定（パッチ変更なし）");
+                    return;
+                }
+                let t_idx = self.track_idx();
+                let patch = self.proj.tracks[t_idx].patch;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("音色（トラック）").strong().size(14.0));
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Ch{}  →  {} ({})",
+                            self.selected_ch,
+                            gm_instrument_name(patch),
+                            patch
+                        ))
+                        .color(Color32::from_rgb(160, 200, 255)),
+                    );
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "曲の途中で変えるPCイベントは作りません。このトラックの既定音色だけです。",
+                    )
+                    .small()
+                    .weak(),
+                );
+                let list_h = (h - 52.0).max(120.0);
+                let cat_w = (full_w * 0.28).clamp(140.0, 220.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_min_width(cat_w);
+                        ui.set_max_width(cat_w);
+                        ui.label(egui::RichText::new("カテゴリ").small().strong());
+                        egui::ScrollArea::vertical()
+                            .id_salt("timbre_cats")
+                            .max_height(list_h)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(cat_w - 8.0);
+                                for (i, (name, _, _)) in gm_categories().iter().enumerate() {
+                                    if ui
+                                        .selectable_label(self.timbre_cat_idx == i, *name)
+                                        .clicked()
+                                    {
+                                        self.timbre_cat_idx = i;
+                                    }
+                                }
+                            });
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.set_min_width((full_w - cat_w - 24.0).max(200.0));
+                        ui.label(egui::RichText::new("音色名").small().strong());
+                        let cats = gm_categories();
+                        let (lo, hi) = if self.timbre_cat_idx < cats.len() {
+                            (cats[self.timbre_cat_idx].1, cats[self.timbre_cat_idx].2)
+                        } else {
+                            (0, 7)
+                        };
+                        egui::ScrollArea::vertical()
+                            .id_salt("timbre_list")
+                            .max_height(list_h)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for p in lo..=hi {
+                                    let lab = format!("{p:3}  {}", gm_instrument_name(p));
+                                    if ui
+                                        .add_sized(
+                                            egui::vec2(ui.available_width().max(180.0), 20.0),
+                                            egui::SelectableLabel::new(patch == p, lab),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.proj.tracks[t_idx].patch = p;
+                                        self.preview_note(self.selected_ch, p, 60, 90);
+                                    }
+                                }
+                            });
+                    });
+                });
+            });
+    }
+
+    /// Beats for survey bar range (1-based inclusive bars → [start, end) beats).
+    fn grok_survey_beat_range(&self) -> (f64, f64) {
+        let max_bar = self.loop_bars.max(1);
+        let mut a = self.grok_survey.bar_start.clamp(1, max_bar);
+        let mut b = self.grok_survey.bar_end.clamp(1, max_bar);
+        if b < a {
+            std::mem::swap(&mut a, &mut b);
+        }
+        let start = (a as f64 - 1.0) * 4.0;
+        let end = (b as f64) * 4.0;
+        (start, end.min(self.loop_beats()))
+    }
+
+    /// Single job builder for S1 copy and S2 API — what Grok needs to think, not a chat opener.
+    fn build_grok_part_job(&self) -> String {
+        let s = &self.grok_survey;
+        let (beat0, beat1) = self.grok_survey_beat_range();
+        let roots = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+        let key = format!(
+            "{} {}",
+            roots[self.proj.key_root as usize],
+            if self.proj.is_minor { "minor" } else { "major" }
+        );
+        let mut lines: Vec<String> = Vec::new();
+        // --- Machine contract (always) ---
+        lines.push("###JPO_JOB_V1###".into());
+        lines.push("ROLE: You are a conservatory-level J-Pop/J-Rock sketch composer.".into());
+        lines.push(
+            "Write ONE MIDI part for JpoProducer (loop sketch tool). Not a full arrangement."
+                .into(),
+        );
+        lines.push("OUTPUT RULES (STRICT):".into());
+        lines.push("- NO chit-chat. NO markdown. NO analysis essays.".into());
+        lines.push("- Reply with ONLY one of:".into());
+        lines.push("  (A) Lines starting with JPO_NOTES_V1 then lines: start,dur,pitch,vel".into());
+        lines.push("      start/dur are in BEATS, relative to 0 = range start.".into());
+        lines.push("  (B) Plain note lines only: start,dur,pitch,vel (same units).".into());
+        lines.push("- Pitch 0-127 MIDI. Velocity 1-127. Keep sketch density.".into());
+        lines.push("- Follow the chord timeline. Prefer chord tones; light passing tones OK.".into());
+        lines.push("- Stay inside the requested bar/beat range length.".into());
+        lines.push("".into());
+        // --- App facts (Grok cannot see the UI) ---
+        lines.push("PROJECT FACTS:".into());
+        lines.push(format!("- Key: {key}"));
+        lines.push(format!("- BPM: {}", self.proj.bpm as i32));
+        lines.push(format!(
+            "- Loop: {} bars ({} beats total)",
+            self.loop_bars,
+            self.loop_beats()
+        ));
+        lines.push(format!(
+            "- Target bars: {}–{} (beats {:.2}–{:.2})",
+            s.bar_start.min(self.loop_bars).max(1),
+            s.bar_end.min(self.loop_bars).max(1),
+            beat0,
+            beat1
+        ));
+        lines.push(format!(
+            "- Target track: Ch{} ({})",
+            self.selected_ch,
+            track_short_label(self.selected_ch)
+        ));
+        lines.push(format!(
+            "- Range length beats: {:.2}",
+            (beat1 - beat0).max(0.25)
+        ));
+        lines.push("- Chord timeline in range (start, dur, name):".into());
+        let mut any = false;
+        for blk in &self.proj.chord_blocks {
+            if blk.end() > beat0 && blk.start < beat1 {
+                any = true;
+                let sync = if blk.syncopation_fill { " sync" } else { "" };
+                lines.push(format!(
+                    "  {:.2}\t{:.2}\t{}{}",
+                    (blk.start - beat0).max(0.0),
+                    blk.dur,
+                    self.proj.chord_name(blk),
+                    sync
+                ));
+            }
+        }
+        if !any {
+            lines.push("  (no chords in range — write diatonically in key)".into());
+        }
+        lines.push("".into());
+        // --- Survey answers (stable structure for reasoning) ---
+        lines.push("USER SURVEY (answer these constraints):".into());
+        lines.push(format!("- Part role: {} — {}", s.role.label(), s.role.for_model()));
+        lines.push(format!(
+            "- Form energy: {} — {}",
+            s.form_slot.label(),
+            s.form_slot.for_model()
+        ));
+        lines.push(format!(
+            "- Register: {} — {}",
+            s.register.label(),
+            s.register.for_model()
+        ));
+        lines.push(format!(
+            "- Density: {} — {}",
+            s.density.label(),
+            s.density.for_model()
+        ));
+        lines.push(format!(
+            "- Rhythm feel: {} — {}",
+            s.rhythm.label(),
+            s.rhythm.for_model()
+        ));
+        let style = s.style_world.trim();
+        lines.push(format!(
+            "- Style / world: {}",
+            if style.is_empty() {
+                "(unspecified — assume modern J-Pop/J-Rock sketch)"
+            } else {
+                style
+            }
+        ));
+        let phrase = s.phrase_idea.trim();
+        lines.push(format!(
+            "- Phrase idea: {}",
+            if phrase.is_empty() {
+                "(unspecified — invent a simple fitting idea)"
+            } else {
+                phrase
+            }
+        ));
+        let avoid = s.avoid.trim();
+        if !avoid.is_empty() {
+            lines.push(format!("- Hard avoid: {avoid}"));
+        }
+        if s.leave_vocal_space {
+            lines.push("- Leave space for a future vocal (avoid constant high density on top).".into());
+        }
+        if s.avoid_doubling_bed {
+            lines.push(
+                "- Avoid doubling a typical piano+bass bed; write a complementary part.".into(),
+            );
+        }
+        lines.push("".into());
+        lines.push("###END_JOB###".into());
+        lines.push("BEGIN OUTPUT NOW (notes only):".into());
+        lines.join("\n")
+    }
+
+    /// Order desk: survey fields Grok needs + S1 copy / S2 API / import.
+    fn show_edit_grok_lane(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, height: f32) {
+        let h = height.max(280.0);
+        let max_bar = self.loop_bars.max(1);
+        let full_w = ui.available_width();
+        egui::Frame::none()
+            .fill(Color32::from_rgb(24, 24, 30))
+            .inner_margin(egui::Margin::same(6.0))
+            .show(ui, |ui| {
+                ui.set_min_height(h - 4.0);
+                ui.set_width(full_w);
+                // Scroll so every control (including result box) stays reachable.
+                egui::ScrollArea::vertical()
+                    .id_salt("grok_desk_scroll")
+                    .max_height(h - 8.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Grok 発注デスク").strong());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "→ Ch{}  貼付原点=範囲先頭",
+                            self.selected_ch
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                    if !self.grok_survey.api_status.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&self.grok_survey.api_status)
+                                .small()
+                                .color(Color32::from_rgb(160, 200, 255)),
+                        );
+                    }
+                });
+
+                // --- Survey (what Grok needs to reason) ---
+                ui.label(
+                    egui::RichText::new("Grok へのアンケート（安定した項目 → ジョブに変換）")
+                        .small()
+                        .strong(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("小節");
+                    ui.add(
+                        egui::DragValue::new(&mut self.grok_survey.bar_start)
+                            .range(1..=max_bar)
+                            .prefix("始 "),
+                    );
+                    ui.label("〜");
+                    ui.add(
+                        egui::DragValue::new(&mut self.grok_survey.bar_end)
+                            .range(1..=max_bar)
+                            .prefix("終 "),
+                    );
+                    let (b0, b1) = self.grok_survey_beat_range();
+                    ui.label(
+                        egui::RichText::new(format!("({b0:.0}–{b1:.0}拍)"))
+                            .small()
+                            .weak(),
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("役割");
+                    for r in GrokPartRole::ALL {
+                        if ui
+                            .selectable_label(self.grok_survey.role == r, r.label())
+                            .clicked()
+                        {
+                            self.grok_survey.role = r;
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("位置づけ");
+                    for f in GrokFormSlot::ALL {
+                        if ui
+                            .selectable_label(self.grok_survey.form_slot == f, f.label())
+                            .clicked()
+                        {
+                            self.grok_survey.form_slot = f;
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("音域");
+                    for r in GrokRegister::ALL {
+                        if ui
+                            .selectable_label(self.grok_survey.register == r, r.label())
+                            .clicked()
+                        {
+                            self.grok_survey.register = r;
+                        }
+                    }
+                    ui.separator();
+                    ui.label("密度");
+                    for d in GrokDensity::ALL {
+                        if ui
+                            .selectable_label(self.grok_survey.density == d, d.label())
+                            .clicked()
+                        {
+                            self.grok_survey.density = d;
+                        }
+                    }
+                    ui.separator();
+                    ui.label("リズム");
+                    for r in GrokRhythmFeel::ALL {
+                        if ui
+                            .selectable_label(self.grok_survey.rhythm == r, r.label())
+                            .clicked()
+                        {
+                            self.grok_survey.rhythm = r;
+                        }
+                    }
+                });
+                // Multiline: Enter inserts newline / stays in field (singleline + Enter stole focus).
+                let text_w = (full_w - 100.0).clamp(280.0, 720.0);
+                ui.horizontal(|ui| {
+                    ui.label("曲の雰囲気");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.grok_survey.style_world)
+                            .id(egui::Id::new("grok_style_world"))
+                            .desired_width(text_w)
+                            .desired_rows(2)
+                            .hint_text("例: ブラス入りポップロック / 弦と歪みギターの融合"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("欲しいフレーズ");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.grok_survey.phrase_idea)
+                            .id(egui::Id::new("grok_phrase_idea"))
+                            .desired_width(text_w)
+                            .desired_rows(2)
+                            .hint_text("例: サビ前の上行フック / やや動きのあるシンセPAD"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("禁止・注意");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.grok_survey.avoid)
+                            .id(egui::Id::new("grok_avoid"))
+                            .desired_width(text_w)
+                            .desired_rows(2)
+                            .hint_text("例: 16分連打しない / 最高音を動かしすぎない"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.grok_survey.leave_vocal_space, "ボーカル余地");
+                    ui.checkbox(&mut self.grok_survey.avoid_doubling_bed, "Bedとユニゾン避け");
+                });
+
+                // --- Transport of the same job ---
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("ジョブをコピー (S1)")
+                        .on_hover_text("仕様+アンケートを1つにまとめてコピー → チャットに貼る")
+                        .clicked()
+                    {
+                        let job = self.build_grok_part_job();
+                        ui.ctx().output_mut(|o| o.copied_text = job);
+                        self.show_toast(ctx, "発注ジョブをコピー（外Grokへ貼って送信）");
+                    }
+                    let has_key = std::env::var("XAI_API_KEY")
+                        .or_else(|_| std::env::var("GROK_API_KEY"))
+                        .map(|k| !k.trim().is_empty())
+                        .unwrap_or(false);
+                    let send_lab = if self.grok_api_busy {
+                        "送信中…"
+                    } else {
+                        "Grokに送る (S2)"
+                    };
+                    if ui
+                        .add_enabled(has_key && !self.grok_api_busy, egui::Button::new(send_lab))
+                        .on_hover_text(if has_key {
+                            "同じジョブを xAI API へ（環境変数 XAI_API_KEY または GROK_API_KEY）"
+                        } else {
+                            "APIキー未設定。XAI_API_KEY または GROK_API_KEY を環境に"
+                        })
+                        .clicked()
+                    {
+                        self.start_grok_api_job(ctx);
+                    }
+                    if ui
+                        .button("MIDI取込…")
+                        .on_hover_text("返答の .mid を範囲先頭へ")
+                        .clicked()
+                    {
+                        if self.selected_ch == 1 {
+                            self.show_toast(ctx, "Ch2–16 を選択");
+                        } else if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("MIDI", &["mid", "midi"])
+                            .pick_file()
+                        {
+                            let (b0, _) = self.grok_survey_beat_range();
+                            self.set_playhead(b0);
+                            self.import_midi_to_selected_track(&path, ctx);
+                        }
+                    }
+                    if ui
+                        .button("結果を取込")
+                        .on_hover_text("下のテキスト（ノート列）を範囲先頭へ。雑談のみは拒否")
+                        .clicked()
+                    {
+                        self.import_grok_result_text(ctx);
+                    }
+                });
+
+                ui.label(egui::RichText::new("【結果】Grokの返答をここに（ノート列のみ）").small());
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.grok_survey.result_text)
+                        .id(egui::Id::new("edit_grok_result_text"))
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("JPO_NOTES_V1\n0.0,2.0,60,80\n…"),
+                );
+                    }); // ScrollArea
+            }); // Frame
+    }
+
+    fn poll_grok_api_inbox(&mut self, ctx: &egui::Context) {
+        let taken = self
+            .grok_api_inbox
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        if let Some(res) = taken {
+            self.grok_api_busy = false;
+            match res {
+                Ok(text) => {
+                    self.grok_survey.result_text = text;
+                    self.grok_survey.api_status = "API OK — 結果欄を確認→取込".into();
+                    self.show_toast(ctx, "Grok API 応答を結果欄へ");
+                    // Auto-try import if it looks like notes
+                    if parse_grok_note_lines(
+                        self.grok_survey.result_text.trim(),
+                        0.0,
+                        self.default_velocity,
+                    )
+                    .len()
+                        >= 1
+                    {
+                        self.import_grok_result_text(ctx);
+                    }
+                }
+                Err(e) => {
+                    self.grok_survey.api_status = format!("API 失敗: {e}");
+                    self.show_toast(ctx, &format!("Grok API: {e}"));
+                }
+            }
+        }
+    }
+
+    fn start_grok_api_job(&mut self, ctx: &egui::Context) {
+        if self.grok_api_busy {
+            return;
+        }
+        let key = match std::env::var("XAI_API_KEY").or_else(|_| std::env::var("GROK_API_KEY")) {
+            Ok(k) if !k.trim().is_empty() => k,
+            _ => {
+                self.show_toast(ctx, "XAI_API_KEY / GROK_API_KEY がありません");
+                return;
+            }
+        };
+        let job = self.build_grok_part_job();
+        let inbox = Arc::clone(&self.grok_api_inbox);
+        self.grok_api_busy = true;
+        self.grok_survey.api_status = "送信中…".into();
+        self.show_toast(ctx, "Grok API へ送信…");
+        std::thread::spawn(move || {
+            let body = serde_json::json!({
+                "model": "grok-3",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You output ONLY MIDI note data for JpoProducer. No chit-chat. Prefer JPO_NOTES_V1 then start,dur,pitch,vel lines in beats."
+                    },
+                    {
+                        "role": "user",
+                        "content": job
+                    }
+                ],
+                "temperature": 0.7
+            });
+            let result = (|| {
+                let resp = ureq::post("https://api.x.ai/v1/chat/completions")
+                    .set("Authorization", &format!("Bearer {key}"))
+                    .set("Content-Type", "application/json")
+                    .timeout(std::time::Duration::from_secs(90))
+                    .send_json(body)
+                    .map_err(|e| e.to_string())?;
+                let v: serde_json::Value = resp.into_json().map_err(|e| e.to_string())?;
+                let text = v["choices"][0]["message"]["content"]
+                    .as_str()
+                    .ok_or_else(|| "応答に content がありません".to_string())?
+                    .to_string();
+                Ok(text)
+            })();
+            if let Ok(mut g) = inbox.lock() {
+                *g = Some(result);
+            }
+        });
+    }
+
+    /// Import survey result text at range start; reject pure chat.
+    fn import_grok_result_text(&mut self, ctx: &egui::Context) {
+        if self.selected_ch == 1 {
+            self.show_toast(ctx, "Ch2–16 を選んでください");
+            return;
+        }
+        let text = self.grok_survey.result_text.trim();
+        if text.is_empty() {
+            self.show_toast(ctx, "結果テキストが空です");
+            return;
+        }
+        // Heuristic: if long prose without enough numeric lines → reject
+        let (beat0, _) = self.grok_survey_beat_range();
+        let paste_at = self.snap_playhead(beat0);
+        let mut notes = parse_grok_note_lines(text, paste_at, self.default_velocity);
+        if notes.is_empty() {
+            self.show_toast(
+                ctx,
+                "取込拒否: ノートデータが見つかりません（雑談のみ？ start,dur,pitch,vel で再送）",
+            );
+            return;
+        }
+        // Clip to range end
+        let (_, beat1) = self.grok_survey_beat_range();
+        notes.retain(|n| n.start < beat1 - 0.001);
+        for n in &mut notes {
+            if n.end() > beat1 {
+                n.dur = (beat1 - n.start).max(0.0625);
+            }
+        }
+        if notes.is_empty() {
+            self.show_toast(ctx, "範囲内に残るノートがありません");
+            return;
+        }
+        let count = notes.len();
+        self.begin_gesture_undo();
+        let next = self.next_note_id().0;
+        assign_unique_note_ids(&mut notes, next);
+        let t_idx = self.track_idx();
+        self.proj.tracks[t_idx].notes.extend(notes);
+        self.proj.tracks[t_idx]
+            .notes
+            .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap().then(a.pitch.cmp(&b.pitch)));
+        self.end_gesture_undo();
+        self.set_playhead(beat0);
+        self.show_toast(
+            ctx,
+            &format!("取込 {count} 音 → Ch{} @ bar range start", self.selected_ch),
+        );
+    }
+
+    /// Legacy helper: bridge old paste buffer into survey result import.
+    #[allow(dead_code)]
+    fn import_note_lines_from_grok_text(&mut self, ctx: &egui::Context) {
+        if self.grok_survey.result_text.trim().is_empty() && !self.grok_paste_text.trim().is_empty()
+        {
+            self.grok_survey.result_text = self.grok_paste_text.clone();
+        }
+        self.import_grok_result_text(ctx);
     }
 
     fn note_fill_color(&self, vel: u8, selected: bool, is_ch1: bool) -> Color32 {
@@ -5114,7 +6359,6 @@ impl JpoApp {
                 .unwrap()
                 .then(a.pitch.cmp(&b.pitch))
         });
-        let new_idx = self.proj.tracks[track_idx].notes.len() - 1;
         self.selection.notes.clear();
         self.selection.notes.insert((track_idx, new_n.id));
         self.selected_note = Some((track_idx, new_n.id));
@@ -5427,6 +6671,164 @@ mod tests {
     }
 
     #[test]
+    fn stamp_append_s2_ignores_playhead_and_appends_at_end() {
+        let mut app = JpoApp::default();
+        app.set_loop_bars(8);
+        app.current_beat = 7.5; // playhead mid-loop must not affect stamp origin
+        let stamp = vec![ChordBlock {
+            start: 0.0,
+            dur: 4.0,
+            degree: 1,
+            quality: String::new(),
+            octave: 4,
+            syncopation_fill: false,
+        }];
+        // Empty → paste at 0
+        assert!((app.stamp_paste_start() - 0.0).abs() < 0.001);
+        let n = app.apply_stamp_blocks(&stamp);
+        assert_eq!(n, 1);
+        assert!((app.proj.chord_blocks[0].start - 0.0).abs() < 0.001);
+        // Second append starts at end of first
+        let n2 = app.apply_stamp_blocks(&stamp);
+        assert_eq!(n2, 1);
+        assert_eq!(app.proj.chord_blocks.len(), 2);
+        assert!((app.proj.chord_blocks[1].start - 4.0).abs() < 0.001);
+        // Playhead still irrelevant
+        app.current_beat = 0.0;
+        assert!((app.stamp_paste_start() - 8.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn clear_chord_progression_empties_blocks() {
+        let mut app = JpoApp::default();
+        let stamp = vec![ChordBlock {
+            start: 0.0,
+            dur: 4.0,
+            degree: 1,
+            quality: String::new(),
+            octave: 4,
+            syncopation_fill: false,
+        }];
+        let _ = app.apply_stamp_blocks(&stamp);
+        assert!(!app.proj.chord_blocks.is_empty());
+        app.clear_chord_progression();
+        assert!(app.proj.chord_blocks.is_empty());
+    }
+
+    #[test]
+    fn parse_grok_note_lines_shifts_to_playhead() {
+        let text = "0.0,1.0,72,90\n1.0,0.5,74,80\nnot a note\n";
+        let notes = parse_grok_note_lines(text, 4.0, 100);
+        assert_eq!(notes.len(), 2);
+        assert!((notes[0].start - 4.0).abs() < 0.001);
+        assert_eq!(notes[0].pitch, 72);
+        assert_eq!(notes[0].vel, 90);
+        assert!((notes[1].start - 5.0).abs() < 0.001);
+        assert_eq!(notes[1].pitch, 74);
+    }
+
+    #[test]
+    fn grok_job_includes_survey_and_contract() {
+        let mut app = JpoApp::default();
+        app.selected_ch = 4;
+        app.loop_bars = 8;
+        app.grok_survey.bar_start = 1;
+        app.grok_survey.bar_end = 4;
+        app.grok_survey.role = GrokPartRole::Melody;
+        app.grok_survey.style_world = "ブラス入りポップロック".into();
+        app.grok_survey.phrase_idea = "サビ用フック".into();
+        app.grok_survey.leave_vocal_space = true;
+        let job = app.build_grok_part_job();
+        assert!(job.contains("###JPO_JOB_V1###"));
+        assert!(job.contains("chit-chat") || job.contains("NO chit"));
+        assert!(job.contains("USER SURVEY"));
+        assert!(job.contains("ブラス入りポップロック"));
+        assert!(job.contains("サビ用フック"));
+        assert!(job.contains("Target bars:"));
+        assert!(job.contains("melody") || job.contains("Melody") || job.contains("single-line"));
+    }
+
+    #[test]
+    fn grok_survey_beat_range_maps_bars() {
+        let mut app = JpoApp::default();
+        app.loop_bars = 8;
+        app.grok_survey.bar_start = 3;
+        app.grok_survey.bar_end = 4;
+        let (a, b) = app.grok_survey_beat_range();
+        assert!((a - 8.0).abs() < 0.001);
+        assert!((b - 16.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn default_pitch_span_is_two_octaves() {
+        let app = JpoApp::default();
+        assert!(
+            (app.visible_pitch_span - 24.0).abs() < 0.01,
+            "expected ~2 oct default, got {}",
+            app.visible_pitch_span
+        );
+    }
+
+    #[test]
+    fn paste_clipboard_stacks_when_called_twice_without_guard() {
+        // Documents the old double-paste failure mode: two paste_clipboard calls stack notes.
+        let mut app = JpoApp::default();
+        app.selected_ch = 2;
+        let t = app.track_idx();
+        app.proj.tracks[t].notes.push(Note {
+            id: NoteId(1),
+            start: 0.0,
+            pitch: 60,
+            dur: 1.0,
+            vel: 90,
+        });
+        app.selection.notes.insert((t, NoteId(1)));
+        app.selected_note = Some((t, NoteId(1)));
+        assert!(app.copy_selection());
+        app.current_beat = 4.0;
+        let n0 = app.proj.tracks[t].notes.len();
+        assert!(app.paste_clipboard());
+        let n1 = app.proj.tracks[t].notes.len();
+        assert_eq!(n1, n0 + 1);
+        assert!(app.paste_clipboard());
+        let n2 = app.proj.tracks[t].notes.len();
+        assert_eq!(n2, n1 + 1, "unguarded double paste stacks identical notes");
+    }
+
+    #[test]
+    fn edit_clipboard_done_blocks_second_paste_clipboard_via_try_path_flag() {
+        // App path sets edit_clipboard_done after first paste; second attempt must no-op.
+        let mut app = JpoApp::default();
+        app.active_tab = AppTab::Edit;
+        app.selected_ch = 2;
+        let t = app.track_idx();
+        app.proj.tracks[t].notes.push(Note {
+            id: NoteId(1),
+            start: 0.0,
+            pitch: 60,
+            dur: 1.0,
+            vel: 90,
+        });
+        app.selection.notes.insert((t, NoteId(1)));
+        app.selected_note = Some((t, NoteId(1)));
+        assert!(app.copy_selection());
+        app.current_beat = 4.0;
+        app.edit_clipboard_done = false;
+        assert!(app.paste_clipboard());
+        app.edit_clipboard_done = true;
+        let n = app.proj.tracks[t].notes.len();
+        // Mimic try_paste_notes guard without egui Context:
+        if !app.edit_clipboard_done {
+            let _ = app.paste_clipboard();
+        }
+        assert_eq!(
+            app.proj.tracks[t].notes.len(),
+            n,
+            "second paste in same frame must not add notes"
+        );
+    }
+
+    #[test]
     fn paste_uses_playhead_not_draw_len_grid() {
         let mut app = JpoApp::default();
         app.selected_ch = 2;
@@ -5503,10 +6905,64 @@ mod tests {
         ];
         let text = notes_to_clip_text(&notes, 1.5);
         let cb = notes_from_clip_text(&text).expect("parse");
-        assert!((cb.min_start - 1.5).abs() < 0.001);
+        // Relative encoding: min_start stored as 0, offsets preserved.
+        assert!((cb.min_start - 0.0).abs() < 0.001);
         assert_eq!(cb.notes.len(), 2);
+        assert!((cb.notes[0].start - 0.0).abs() < 0.001);
+        assert!((cb.notes[1].start - 0.5).abs() < 0.001);
+        assert!((cb.notes[0].dur - 0.5).abs() < 0.001);
+        assert!((cb.notes[1].dur - 1.0).abs() < 0.001);
         assert_eq!(cb.notes[0].pitch, 64);
         assert_eq!(cb.notes[1].pitch, 67);
+        let pasted = build_pasted_notes(&cb, 10.0, 0, NoteId(10));
+        assert!((pasted[0].start - 10.0).abs() < 0.001);
+        assert!((pasted[1].start - 10.5).abs() < 0.001);
+        assert!((pasted[0].dur - 0.5).abs() < 0.001);
+        assert!((pasted[1].dur - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn paste_preserves_spacing_and_duration_no_chord_clip() {
+        let mut app = JpoApp::default();
+        app.active_tab = AppTab::Edit;
+        app.selected_ch = 4;
+        // Chords that would truncate a long note under the old clip-on-paste rule.
+        app.proj.chord_blocks = vec![
+            sample_chord(0.0, 2.0, 1),
+            sample_chord(2.0, 2.0, 5),
+            sample_chord(4.0, 4.0, 6),
+        ];
+        app.proj.tracks[3].notes = vec![
+            Note {
+                id: NoteId(1),
+                start: 0.0,
+                pitch: 60,
+                dur: 1.5, // crosses into next chord if pasted at 1.0 without clip removal
+                vel: 90,
+            },
+            Note {
+                id: NoteId(2),
+                start: 2.0,
+                pitch: 64,
+                dur: 0.75,
+                vel: 80,
+            },
+        ];
+        app.selection.notes.insert((3, NoteId(1)));
+        app.selection.notes.insert((3, NoteId(2)));
+        assert!(app.copy_selection());
+        app.current_beat = 4.0;
+        assert!(app.paste_clipboard());
+        let t = &app.proj.tracks[3].notes;
+        let a = t.iter().find(|n| n.pitch == 60 && n.start >= 3.9).unwrap();
+        let b = t.iter().find(|n| n.pitch == 64 && n.start >= 5.9).unwrap();
+        assert!(
+            (a.dur - 1.5).abs() < 0.001,
+            "dur must not be chord-clipped on paste, got {}",
+            a.dur
+        );
+        assert!((b.dur - 0.75).abs() < 0.001);
+        assert!(((b.start - a.start) - 2.0).abs() < 0.001, "spacing");
     }
 
     #[test]
@@ -5586,18 +7042,23 @@ impl eframe::App for JpoApp {
                 }
             });
         }
-        // Clipboard: OS events (Event::Copy/Paste) + Ctrl+letter. Run again after UI
-        // because widgets can swallow keys on the first pass (buttons work; keys need retry).
-        let _ = self.handle_os_clipboard_events(ctx);
+        // One clipboard pass per frame (flag). Prefer post-UI for Edit so keys aren't swallowed;
+        // non-Edit still needs Delete / Undo here.
+        self.edit_clipboard_done = false;
         ctx.input_mut(|i| {
-            if i.key_pressed(egui::Key::Delete) {
-                if self.active_tab == AppTab::Chord && !self.selected_chord_indices().is_empty() {
-                    self.delete_selected_chords();
-                } else if self.active_tab == AppTab::Edit {
-                    self.delete_selected_notes();
+            // Never steal keys while typing in Grok survey / text fields (Enter, Delete, etc.).
+            if !wants_kb {
+                if i.key_pressed(egui::Key::Delete) {
+                    if self.active_tab == AppTab::Chord && !self.selected_chord_indices().is_empty()
+                    {
+                        self.delete_selected_chords();
+                    } else if self.active_tab == AppTab::Edit {
+                        self.delete_selected_notes();
+                    }
                 }
             }
             let ctrl = i.modifiers.ctrl || i.modifiers.command;
+            // Undo/Redo OK even in text fields (standard).
             if ctrl && i.key_pressed(egui::Key::Z) && !i.modifiers.shift {
                 self.do_undo();
                 i.consume_key(egui::Modifiers::CTRL, egui::Key::Z);
@@ -5610,7 +7071,10 @@ impl eframe::App for JpoApp {
                 self.do_redo();
                 i.consume_key(egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT), egui::Key::Z);
             }
-            let _ = self.handle_edit_shortcuts(ctx, i);
+            // Edit clipboard/shortcuts run once after CentralPanel (see below).
+            if self.active_tab != AppTab::Edit && !wants_kb {
+                let _ = self.handle_edit_shortcuts(ctx, i);
+            }
         });
 
         if let Some(ref msg) = self.status_toast {
@@ -5628,63 +7092,123 @@ impl eframe::App for JpoApp {
             }
         }
 
-        // Top toolbar — horizontal scroll so Play / |◀ never clip off-screen (click crash risk).
+        // Top toolbar: row A = nav + fixed transport (Play never scrolls away).
+        // Row B = Edit tools only (no Play).
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            let roots = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
-            egui::ScrollArea::horizontal()
-                .id_salt("toolbar_scroll")
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
+            let roots = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+            // --- Row A ---
             ui.horizontal(|ui| {
-                for (tab, label) in [
-                    (AppTab::Chord, "1 Progress"),
-                    (AppTab::Generate, "2 Bed"),
-                    (AppTab::Edit, "3 Edit"),
-                    (AppTab::Arrange, "4 Arrange"),
-                ] {
-                    if ui
-                        .selectable_label(self.active_tab == tab, label)
-                        .clicked()
-                    {
-                        self.switch_tab(ctx, tab);
-                    }
-                }
-
-                ui.separator();
-                ui.label("BPM");
-                ui.add(egui::DragValue::new(&mut self.proj.bpm).speed(1.0).range(40.0..=240.0));
-
-                // Arrange: hide Key (loop-local key is enough; avoids messy global edits).
-                if self.active_tab != AppTab::Arrange {
-                    ui.separator();
-                    ui.label("Key");
-                    egui::ComboBox::from_id_salt("toolbar_key")
-                        .selected_text(roots[self.proj.key_root as usize])
-                        .width(52.0)
-                        .show_ui(ui, |ui| {
-                            for (i, r) in roots.iter().enumerate() {
-                                if ui.selectable_label(self.proj.key_root as usize == i, *r).clicked()
-                                {
-                                    let old = self.proj.key_root as i32;
-                                    let new = i as i32;
-                                    self.proj.key_root = i as u8;
-                                    self.transpose_melodic_notes(new - old);
-                                    self.on_proj_key_changed();
-                                }
+                let transport_reserve = 260.0_f32;
+                let left_w = (ui.available_width() - transport_reserve).max(120.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(left_w, 28.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("toolbar_nav_scroll")
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    for (tab, label) in [
+                                        (AppTab::Chord, "1 Progress"),
+                                        (AppTab::Generate, "2 Bed"),
+                                        (AppTab::Edit, "3 Edit"),
+                                        (AppTab::Arrange, "4 Arrange"),
+                                    ] {
+                                        if ui
+                                            .selectable_label(self.active_tab == tab, label)
+                                            .clicked()
+                                        {
+                                            self.switch_tab(ctx, tab);
+                                        }
+                                    }
+                                    ui.separator();
+                                    ui.label("BPM");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.proj.bpm)
+                                            .speed(1.0)
+                                            .range(40.0..=240.0),
+                                    );
+                                    if self.active_tab != AppTab::Arrange {
+                                        ui.separator();
+                                        ui.label("Key");
+                                        egui::ComboBox::from_id_salt("toolbar_key")
+                                            .selected_text(roots[self.proj.key_root as usize])
+                                            .width(48.0)
+                                            .show_ui(ui, |ui| {
+                                                for (i, r) in roots.iter().enumerate() {
+                                                    if ui
+                                                        .selectable_label(
+                                                            self.proj.key_root as usize == i,
+                                                            *r,
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        let old = self.proj.key_root as i32;
+                                                        let new = i as i32;
+                                                        self.proj.key_root = i as u8;
+                                                        self.transpose_melodic_notes(new - old);
+                                                        self.on_proj_key_changed();
+                                                    }
+                                                }
+                                            });
+                                        let mode_label =
+                                            if self.proj.is_minor { "Min" } else { "Maj" };
+                                        if ui.button(mode_label).clicked() {
+                                            self.proj.is_minor = !self.proj.is_minor;
+                                            self.on_proj_key_changed();
+                                        }
+                                    }
+                                    ui.separator();
+                                    self.show_tools_menu(ui, &roots);
+                                });
+                            });
+                    },
+                );
+                // Fixed transport strip (never in scroll). Order LTR inside a fixed-width box.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(248.0, 28.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            ui.label("Vol");
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(56.0, 20.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(
+                                        egui::Slider::new(&mut self.playback_volume, 0.0..=1.0)
+                                            .step_by(0.05)
+                                            .show_value(false),
+                                    );
+                                },
+                            );
+                            let play_label =
+                                if self.audio_stream.is_some() { "■" } else { "▶" };
+                            if ui
+                                .add_sized(egui::vec2(36.0, 22.0), egui::Button::new(play_label))
+                                .on_hover_text("Play / Stop (Space)")
+                                .clicked()
+                            {
+                                self.toggle_playback();
                             }
-                        });
-                    let mode_label = if self.proj.is_minor { "Minor" } else { "Major" };
-                    if ui.button(mode_label).clicked() {
-                        self.proj.is_minor = !self.proj.is_minor;
-                        self.on_proj_key_changed();
-                    }
-                }
+                            if ui
+                                .add_sized(egui::vec2(28.0, 22.0), egui::Button::new("0"))
+                                .on_hover_text("Seek playhead to start")
+                                .clicked()
+                            {
+                                self.seek_playhead_start();
+                            }
+                            ui.monospace(format!("▸{:.1}", self.current_beat));
+                        },
+                    );
+                });
+            });
 
-                ui.separator();
-                self.show_tools_menu(ui, &roots);
-
-                if self.active_tab == AppTab::Edit {
-                    ui.separator();
+            // --- Row B: Edit tools only ---
+            if self.active_tab == AppTab::Edit {
+                ui.horizontal(|ui| {
                     for (mode, label) in [
                         (EditMode::Select, "Select"),
                         (EditMode::Draw, "Draw"),
@@ -5741,55 +7265,16 @@ impl eframe::App for JpoApp {
                     {
                         self.scale_snap = !self.scale_snap;
                     }
-                    ui.separator();
-                    if ui.button("Copy").on_hover_text("Ctrl+C — also fills OS clipboard").clicked() {
-                        if self.has_note_selection() && self.copy_selection_to(Some(ui.ctx())) {
-                            let n = self.clipboard.as_ref().map(|c| c.notes.len()).unwrap_or(0);
-                            self.show_edit_feedback(ui.ctx(), format!("Copied {n} note(s)"));
-                        } else {
-                            self.show_edit_feedback(ui.ctx(), "Copy — select notes first");
-                        }
-                    }
-                    if ui.button("Paste").on_hover_text("Ctrl+V at playhead").clicked() {
-                        self.try_paste_notes(ui.ctx());
-                    }
                     if !self.edit_status.is_empty() {
+                        ui.separator();
                         ui.label(
                             egui::RichText::new(&self.edit_status)
                                 .size(11.0)
                                 .color(Color32::from_rgb(140, 200, 255)),
                         );
                     }
-                }
-
-                ui.separator();
-                ui.label("Vol");
-                ui.add(
-                    egui::Slider::new(&mut self.playback_volume, 0.0..=1.0)
-                        .step_by(0.05)
-                        .show_value(false),
-                );
-
-                ui.separator();
-                // Keep transport compact and always inside the scroll strip.
-                let play_label = if self.audio_stream.is_some() { "■" } else { "▶" };
-                if ui
-                    .add(egui::Button::new(play_label).min_size(egui::vec2(36.0, 0.0)))
-                    .on_hover_text("Play / Stop (Space)")
-                    .clicked()
-                {
-                    self.toggle_playback();
-                }
-                if ui
-                    .add(egui::Button::new("0").min_size(egui::vec2(28.0, 0.0)))
-                    .on_hover_text("Seek playhead to start")
-                    .clicked()
-                {
-                    self.seek_playhead_start();
-                }
-                ui.monospace(format!("▸{:.1}", self.current_beat));
-            });
-            }); // ScrollArea
+                });
+            }
         });
 
         // Bottom: transport-only (compact). Tab tools live next to content.
@@ -5889,28 +7374,12 @@ impl eframe::App for JpoApp {
                         if ui.selectable_label(self.snap_enabled, snap_lab).clicked() {
                             self.snap_enabled = !self.snap_enabled;
                         }
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new("Stamp").small().strong());
-                        if ui.button("王道1").on_hover_text("playhead/末尾に貼付・超過切り捨て").clicked() {
-                            self.apply_chord_progression_odori();
-                            self.show_toast(ctx, "王道1 を貼付");
-                        }
-                        if ui.button("王道½").clicked() {
-                            self.apply_chord_stamp_half_odori();
-                            self.show_toast(ctx, "王道½ を貼付");
-                        }
                         ui.separator();
-                        ui.checkbox(&mut self.stamp_paste_at_end, "末尾へ");
-                        if !self.stamp_paste_at_end {
-                            ui.label(
-                                egui::RichText::new(format!("@playhead {:.1}", self.current_beat))
-                                    .small()
-                                    .weak(),
-                            );
-                        }
-                        ui.separator();
-                        if ui.small_button("−1/16").clicked() {
+                        if ui
+                            .small_button("−1/16")
+                            .on_hover_text("選択ブロックを前ノリ")
+                            .clicked()
+                        {
                             self.nudge_selected_chords(-0.25);
                         }
                         if ui.small_button("−1/8").clicked() {
@@ -5920,51 +7389,97 @@ impl eframe::App for JpoApp {
                             self.nudge_selected_chords(0.25);
                         }
                     });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new("Stamps").small().strong());
-                        ui.label(
-                            egui::RichText::new("exe横 stamps/*.jpostamp")
-                                .small()
-                                .weak(),
-                        );
+                    // Stamp = append after last chord (S2). No playhead paste, no quick-button row.
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("スタンプ").small().strong());
+                        if self.user_stamps.is_empty() {
+                            ui.label(
+                                egui::RichText::new("（なし — ↻ または assets/stamps）")
+                                    .small()
+                                    .weak(),
+                            );
+                        } else {
+                            if self.stamp_combo_idx >= self.user_stamps.len() {
+                                self.stamp_combo_idx = 0;
+                            }
+                            let selected_name =
+                                self.user_stamps[self.stamp_combo_idx].name.clone();
+                            egui::ComboBox::from_id_salt("prog_stamp_combo")
+                                .selected_text(selected_name)
+                                .width(220.0)
+                                .show_ui(ui, |ui| {
+                                    for (i, st) in self.user_stamps.iter().enumerate() {
+                                        if ui
+                                            .selectable_label(self.stamp_combo_idx == i, &st.name)
+                                            .on_hover_text(
+                                                st.path
+                                                    .as_ref()
+                                                    .map(|p| p.display().to_string())
+                                                    .unwrap_or_default(),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.stamp_combo_idx = i;
+                                        }
+                                    }
+                                });
+                            if ui
+                                .button("追記")
+                                .on_hover_text(
+                                    "進行の末尾に足す（空なら先頭から）。ループ超過は切り捨て",
+                                )
+                                .clicked()
+                            {
+                                self.append_selected_stamp(ctx);
+                            }
+                        }
+                        if ui
+                            .button("進行クリア")
+                            .on_hover_text("コードブロックを全削除（Undo 可）。比較・やり直し用")
+                            .clicked()
+                        {
+                            if self.proj.chord_blocks.is_empty() {
+                                self.show_toast(ctx, "進行は空です");
+                            } else {
+                                self.clear_chord_progression();
+                                self.show_toast(ctx, "進行をクリア");
+                            }
+                        }
                         if ui
                             .button("現在を保存")
                             .on_hover_text(format!("保存先: {}", user_stamps_dir().display()))
                             .clicked()
                         {
-                            let n = self.user_stamps.len() + 1;
-                            self.save_current_as_user_stamp(format!("Stamp {n}"));
-                            self.show_toast(ctx, "stamps/ に保存");
+                            if self.proj.chord_blocks.is_empty() {
+                                self.show_toast(ctx, "保存する進行がありません");
+                            } else {
+                                let n = self.user_stamps.len() + 1;
+                                self.save_current_as_user_stamp(format!("Stamp {n}"));
+                                self.show_toast(ctx, "stamps/ に保存");
+                            }
                         }
                         if ui.small_button("↻").on_hover_text("stamps/ を再読込").clicked() {
                             self.reload_stamps();
-                        }
-                        let mut del: Option<usize> = None;
-                        let mut apply: Option<usize> = None;
-                        for (i, st) in self.user_stamps.iter().enumerate() {
-                            if ui
-                                .button(&st.name)
-                                .on_hover_text(
-                                    st.path
-                                        .as_ref()
-                                        .map(|p| p.display().to_string())
-                                        .unwrap_or_default(),
-                                )
-                                .clicked()
+                            if self.stamp_combo_idx >= self.user_stamps.len()
+                                && !self.user_stamps.is_empty()
                             {
-                                apply = Some(i);
-                            }
-                            if ui.small_button("✕").on_hover_text("ファイル削除").clicked() {
-                                del = Some(i);
+                                self.stamp_combo_idx = 0;
                             }
                         }
-                        if let Some(i) = apply {
-                            let blocks = self.user_stamps[i].blocks.clone();
-                            self.apply_stamp_blocks(&blocks);
-                            self.show_toast(ctx, "スタンプ貼付");
-                        }
-                        if let Some(i) = del {
-                            self.delete_user_stamp(i);
+                        // Optional: delete selected stamp file
+                        if !self.user_stamps.is_empty()
+                            && ui
+                                .small_button("✕")
+                                .on_hover_text("選択中スタンプのファイルを削除")
+                                .clicked()
+                        {
+                            let idx = self.stamp_combo_idx;
+                            self.delete_user_stamp(idx);
+                            if self.stamp_combo_idx >= self.user_stamps.len()
+                                && !self.user_stamps.is_empty()
+                            {
+                                self.stamp_combo_idx = self.user_stamps.len() - 1;
+                            }
                         }
                     });
                     let _chord_response = self.draw_chord_timeline(ui);
@@ -6150,31 +7665,8 @@ impl eframe::App for JpoApp {
                                                 mix_changed = true;
                                             }
                                         });
-                                        if ch != 1 {
-                                            let t = &mut self.proj.tracks[t_idx];
-                                            let patch_name =
-                                                truncate_ascii(gm_instrument_name(t.patch), 14);
-                                            ui.horizontal(|ui| {
-                                                ui.add_space(4.0);
-                                                if ui
-                                                    .add(
-                                                        egui::DragValue::new(&mut t.patch)
-                                                            .speed(1.0)
-                                                            .range(0..=127)
-                                                            .prefix("P"),
-                                                    )
-                                                    .changed()
-                                                {
-                                                    mix_changed = true;
-                                                }
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        egui::RichText::new(patch_name).size(10.0),
-                                                    )
-                                                    .truncate(),
-                                                );
-                                            });
-                                        }
+                                        // Program Change: not on primary surface (rare).
+                                        // Change patch via Tools if needed later.
                                         if mix_changed {
                                             self.on_track_mix_changed();
                                         }
@@ -6190,34 +7682,69 @@ impl eframe::App for JpoApp {
                         );
                     }
                     let _timeline_response = self.draw_chord_timeline(ui);
-                    let bottom_reserve = if self.edit_bottom_open { 140.0 } else { 28.0 };
-                    let roll_h = (ui.available_height() - bottom_reserve).clamp(200.0, 640.0);
+                    // Poll S2 API background result.
+                    self.poll_grok_api_inbox(ctx);
+
+                    // Bottom lane tools — always on for Edit.
+                    // Grok / Timbre need real height; shrink the roll so the desk is fully usable.
+                    let avail = ui.available_height();
+                    let tool_row = 26.0;
+                    let lane_h = match self.edit_lane_tool {
+                        EditLaneTool::Velocity => 96.0,
+                        EditLaneTool::Timbre => (avail * 0.48).clamp(220.0, 360.0),
+                        EditLaneTool::Grok => (avail * 0.58).clamp(300.0, 440.0),
+                    };
+                    let roll_min = match self.edit_lane_tool {
+                        EditLaneTool::Grok | EditLaneTool::Timbre => 100.0,
+                        EditLaneTool::Velocity => 140.0,
+                    };
+                    let roll_h = (avail - lane_h - tool_row - 4.0).clamp(roll_min, 640.0);
                     let _roll_response = self.draw_piano_roll_with_keyboard(ui, roll_h);
                     ui.horizontal(|ui| {
-                        let lab = if self.edit_bottom_open {
-                            "▾ 下パネル（Grok / Vel）"
-                        } else {
-                            "▸ 下パネル（Grok / Vel）"
-                        };
-                        if ui.selectable_label(self.edit_bottom_open, lab).clicked() {
-                            self.edit_bottom_open = !self.edit_bottom_open;
-                        }
-                    });
-                    if self.edit_bottom_open {
-                        ui.horizontal(|ui| {
-                            ui.label("選択 Vel");
-                            let mut v = self.default_velocity;
+                        ui.label(egui::RichText::new("下レーン").small().strong());
+                        for (tool, lab) in [
+                            (EditLaneTool::Velocity, "Vel"),
+                            (EditLaneTool::Timbre, "音色"),
+                            (EditLaneTool::Grok, "Grok"),
+                        ] {
                             if ui
-                                .add(egui::DragValue::new(&mut v).range(1..=127))
-                                .changed()
+                                .selectable_label(self.edit_lane_tool == tool, lab)
+                                .on_hover_text(match tool {
+                                    EditLaneTool::Velocity => "ベロシティ棒グラフ",
+                                    EditLaneTool::Timbre => "トラック音色（GM表）・途中PCはしない",
+                                    EditLaneTool::Grok => "パート発注デスク（S1コピー / S2 API）",
+                                })
+                                .clicked()
                             {
-                                self.default_velocity = v;
-                                if self.selected_ch != 1 {
-                                    self.apply_velocity_to_selection(v);
+                                self.edit_lane_tool = tool;
+                                if tool != EditLaneTool::Velocity {
+                                    self.vel_drag_note = None;
                                 }
                             }
-                        });
-                        self.show_grok_panel(ui, ctx, false);
+                        }
+                        if self.edit_lane_tool == EditLaneTool::Velocity {
+                            ui.separator();
+                            ui.label("既定Vel");
+                            ui.add(
+                                egui::DragValue::new(&mut self.default_velocity)
+                                    .range(1..=127)
+                                    .speed(1.0),
+                            );
+                            if self.has_note_selection() && self.selected_ch != 1 {
+                                if ui
+                                    .small_button("選択へ適用")
+                                    .on_hover_text("選択ノートに既定Velを一括")
+                                    .clicked()
+                                {
+                                    self.apply_velocity_to_selection(self.default_velocity);
+                                }
+                            }
+                        }
+                    });
+                    match self.edit_lane_tool {
+                        EditLaneTool::Velocity => self.draw_velocity_lane(ui, lane_h),
+                        EditLaneTool::Timbre => self.show_timbre_lane(ui, lane_h),
+                        EditLaneTool::Grok => self.show_edit_grok_lane(ui, ctx, lane_h),
                     }
                 }
                 AppTab::Arrange => {
@@ -6226,12 +7753,22 @@ impl eframe::App for JpoApp {
             }
         });
 
-        // Tab3: retry clipboard after UI (widgets can swallow key_pressed on first pass).
+        // Tab3: single clipboard + shortcut pass after UI (widgets can swallow keys if we run only pre-UI).
+        // Must not run twice: Event::Paste + Ctrl+V would double-paste stacked notes.
+        // Skip Q/W/E and other edit keys while typing in Grok text fields.
         if self.active_tab == AppTab::Edit && self.selected_ch != 1 {
-            let _ = self.handle_os_clipboard_events(ctx);
-            ctx.input_mut(|i| {
-                let _ = self.handle_edit_shortcuts(ctx, i);
-            });
+            let typing = ctx.wants_keyboard_input();
+            if !typing {
+                let _ = self.handle_os_clipboard_events(ctx);
+            } else {
+                // Still allow Ctrl+C/V note clipboard? Prefer not while typing in survey.
+                // OS paste into text field must work — do not steal Event::Paste.
+            }
+            if !typing {
+                ctx.input_mut(|i| {
+                    let _ = self.handle_edit_shortcuts(ctx, i);
+                });
+            }
         }
 
         // Drive playhead from the audio thread while playing.
@@ -6377,9 +7914,11 @@ impl JpoApp {
     fn draw_chord_timeline(&mut self, ui: &mut egui::Ui) -> egui::Response {
         let editable = self.active_tab == AppTab::Chord;
         let playhead_ruler = self.active_tab == AppTab::Edit;
-        // Taller strip so Progress/Bed don't look empty; Edit keeps slightly shorter.
+        // Progress: use spare vertical space. Edit keeps a shorter strip.
         let h = if self.active_tab == AppTab::Edit {
             72.0
+        } else if self.active_tab == AppTab::Chord {
+            (ui.available_height() * 0.42).clamp(140.0, 280.0)
         } else {
             (ui.available_height() * 0.22).clamp(110.0, 160.0)
         };
@@ -6531,18 +8070,18 @@ impl JpoApp {
 
         self.draw_playhead_line(&painter, rect, start_b, px_per_beat);
 
-        // empty hint
-        if self.proj.chord_blocks.is_empty() {
+        // empty hint — modeless Progress (no Draw/Erase tools)
+        if self.proj.chord_blocks.is_empty() && editable {
             painter.text(
                 rect.min + Vec2::new(16.0, 28.0),
                 egui::Align2::LEFT_TOP,
-                "空きクリックで配置（Len）　右端ドラッグで伸長",
+                "空きクリックで配置（Len）　右端ドラッグで伸長　ダブルクリック/Delete で削除",
                 egui::FontId::proportional(12.0),
                 Color32::from_rgb(90, 95, 105),
             );
         }
 
-        // interaction (Chord tab only) — click place, drag move/resize
+        // interaction (Progress only) — modeless: place / select / move / resize / double-click delete
         if editable && (resp.clicked() || resp.dragged() || resp.double_clicked() || resp.drag_started()) {
             if let Some(ptr) = resp.interact_pointer_pos() {
                 let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
@@ -6569,45 +8108,36 @@ impl JpoApp {
                     None
                 };
 
-                if resp.drag_started() {
+                // Double-click deletes (no Erase tool on Progress).
+                if resp.double_clicked() {
+                    if let Some((i, _)) = chord_hit(self, beat, ptr.x) {
+                        self.begin_gesture_undo();
+                        self.proj.chord_blocks.remove(i);
+                        self.selection.blocks.remove(&i);
+                        self.clear_chord_selection();
+                        self.chord_drag_kind = ChordDragKind::None;
+                        self.chord_drag_block_idx = None;
+                        self.end_gesture_undo();
+                    }
+                } else if resp.drag_started() {
                     if let Some((i, hit_kind)) = chord_hit(self, beat, ptr.x) {
-                        let should_delete = self.edit_mode == EditMode::Erase
-                            || (self.edit_mode == EditMode::Draw && resp.double_clicked());
-                        if should_delete {
-                            self.begin_gesture_undo();
-                            self.proj.chord_blocks.remove(i);
-                            self.selection.blocks.remove(&i);
-                            self.clear_chord_selection();
-                            self.chord_drag_kind = ChordDragKind::None;
-                            self.chord_drag_block_idx = None;
-                            self.end_gesture_undo();
-                        } else {
-                            // Stretch/move in Draw *and* Select — Erase only deletes.
-                            self.begin_gesture_undo();
-                            let blk = self.proj.chord_blocks[i].clone();
-                            self.select_chord_block(i, false);
-                            self.block_drag_orig = (blk.start, blk.dur);
-                            self.drag_start_beat = beat;
-                            self.chord_drag_kind = hit_kind;
-                            self.chord_drag_block_idx = Some(i);
-                        }
+                        self.begin_gesture_undo();
+                        let blk = self.proj.chord_blocks[i].clone();
+                        self.select_chord_block(i, false);
+                        self.block_drag_orig = (blk.start, blk.dur);
+                        self.drag_start_beat = beat;
+                        self.chord_drag_kind = hit_kind;
+                        self.chord_drag_block_idx = Some(i);
                     }
                 }
 
-                if resp.clicked() && !resp.dragged() {
+                if resp.clicked() && !resp.dragged() && !resp.double_clicked() {
                     if let Some((i, _)) = chord_hit(self, beat, ptr.x) {
-                        if self.edit_mode == EditMode::Erase {
-                            self.begin_gesture_undo();
-                            self.proj.chord_blocks.remove(i);
-                            self.clear_chord_selection();
-                            self.end_gesture_undo();
-                        } else {
-                            let blk = self.proj.chord_blocks[i].clone();
-                            self.select_chord_block(i, false);
-                            self.set_playhead(beat);
-                            self.preview_chord_block(&blk);
-                        }
-                    } else if self.edit_mode != EditMode::Erase {
+                        let blk = self.proj.chord_blocks[i].clone();
+                        self.select_chord_block(i, false);
+                        self.set_playhead(beat);
+                        self.preview_chord_block(&blk);
+                    } else {
                         self.set_playhead(snapped);
                         self.place_chord_block_at(snapped);
                     }
@@ -6911,7 +8441,7 @@ impl JpoApp {
         }
 
         // notes
-        for (i, n) in notes.iter().enumerate() {
+        for n in notes.iter() {
             if n.end() < start_b || n.start > end_b { continue; }
             let x0 = rect.min.x + ((n.start - start_b) * px_per_beat) as f32;
             let x1 = rect.min.x + ((n.end() - start_b) * px_per_beat) as f32;
