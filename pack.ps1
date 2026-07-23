@@ -51,13 +51,13 @@ if (Test-Path $StampsSrc) {
 }
 
 @'
-JpoProducer — portable pack
-===========================
+JpoProducer — portable pack (SPEC-v2 / 2026-07)
+===============================================
 
 【起動】
-1. このフォルダをどこかへ展開（Desktop / USB など）
-2. jpo.exe をダブルクリック
-   ※ jpo.exe と FluidR3 GM.SF2 は必ず同じフォルダに置く
+1. この zip を USB / クラウドへコピー → 別 PC で展開
+2. 展開したフォルダで jpo.exe をダブルクリック
+   ※ jpo.exe と FluidR3 GM.SF2 は必ず同じフォルダのまま
 3. この PC に Rust / cargo は不要
 
 【起動しないとき】
@@ -66,27 +66,31 @@ JpoProducer — portable pack
   https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist
 
 【タブ】
-1 Progress … コード進行（スタンプは末尾追記・進行クリアあり）
-2 Bed      … Piano/Bass/Drum 単純伴奏
-3 Edit     … ピアノロール / Vel・音色・Grok 下レーン
+1 Progress … コード進行（スタンプ追記・名前付き保存・進行クリア）
+2 Bed      … Piano/Bass/Drum 単純伴奏（Simple Bed）
+3 Edit     … ピアノロール（複数選択してまとめて移動可）
 4 Arrange  … ループ並べ
 
-【Edit 下レーン】
-- Vel  … ベロシティ棒グラフ
-- 音色 … GM 音色表（トラック単位。曲中 PC はしない）
-- Grok … 発注デスク
-  S1: 「ジョブをコピー」→ 外の Grok チャットに貼る
-  S2: 環境変数 XAI_API_KEY または GROK_API_KEY があれば API 送信
-  結果のノート列を「結果を取込」（雑談のみは拒否）
+【Edit】
+- Q / W / E = Select / Draw / Erase
+- Ctrl+C/V = ノートコピー（相対時刻で貼る）
+- 下レーン: Vel / 音色 / Grok 発注デスク
+  S1: ジョブをコピー → 外の Grok に貼る
+  S2: 環境変数 XAI_API_KEY または GROK_API_KEY があれば API
+- Space = 再生
 
-【その他】
-- スケッチ保存: Tools → Save（.jpo）
-- stamps\ … 進行スタンプ（Progress で追記）
-- patterns\ … Bed 用パターン MIDI（exe から相対で読める配置）
-- Space = 再生、Edit の Q/W/E = Select/Draw/Erase
+【フォルダの中身】
+- jpo.exe
+- FluidR3 GM.SF2   … 音源（削除しない）
+- stamps\          … 進行スタンプ（自分で保存したのもここに増える）
+- patterns\        … Bed 用パターン MIDI
+- START.txt        … この説明
 
-開発リポジトリ: https://github.com/OptimalNotes/JpoProducer
-引継ぎ: リポジトリ内 HANDOVER.md
+【スケッチの持ち運び】
+- アプリ内 Tools → Save で .jpo を保存
+- .jpo だけ別 PC にコピーして Open すれば続き可
+
+開発: https://github.com/OptimalNotes/JpoProducer
 '@ | Set-Content -Path (Join-Path $OutDir "START.txt") -Encoding UTF8
 
 Write-Host "==> Packed to: $OutDir"
