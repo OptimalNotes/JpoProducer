@@ -3,38 +3,42 @@
 ## Project
 
 Rust + egui J-Pop/J-Rock MIDI sketch tool.  
-**Spec of truth:** `SPEC-v1.md` (five pillars). Implementation gaps: `HANDOVER.md`.
+**Spec of truth:** `SPEC-v2.md` (five pillars + reshape contracts).  
+**History:** `SPEC-v1.md` (superseded). Gaps: `HANDOVER.md`.
 
 ## Always
 
-1. Read **`SPEC-v1.md`** then `HANDOVER.md` before non-trivial edits.
+1. Read **`SPEC-v2.md`** then `HANDOVER.md` before non-trivial edits.
 2. Follow skill **`jpo-producer`** and its references (`invariants`, Domino lessons, etc.).
-3. Develop on **WSL** `~/JpoProducer`. Windows tree is for release packaging.
+3. Develop on **WSL** `~/JpoProducer` or Windows `C:\Users\user\JpoProducer`. GUI listen: Windows preferred.
 4. After logic changes: `cargo test`.
-5. **Input isolation** (by focus zone, not only tab count):
-   - Chord strip: blocks only (no note Ctrl+C/V)
-   - Piano roll (Edit / Sketch): Select/Draw/Erase, Ctrl+C/X/V/D, Undo
-   - Arrange: no note edit
-6. **Unique `NoteId` always** on generate/import/paste. Selection is id-based.
-7. Generate pipeline ends with **cleanup** (ids, range, same-pitch overlap)—not raw pattern dump.
+5. **Input isolation** via `InputFocus` (SPEC-v2 §4.2), not flag soup:
+   - ChordStrip: blocks only
+   - PianoRoll: Select/Draw/Erase, Ctrl+C/X/V/D, Q/W/E, Undo
+   - GrokText: text only (do not steal roll shortcuts)
+   - Arrange: bank/slots only
+6. **Unique `NoteId` always** on generate/import/paste. Single `NoteSelection` model (SPEC-v2 §5.4).
+7. Generate pipeline ends with **sync coverage + cleanup** (SPEC-v2 §6.3)—not raw pattern dump.
 8. Beat-grid times are **BPM-independent**.
-9. Do not automate Domino GUI; patterns may be hand-edited there.
-10. Spec changes → update `SPEC-v1.md` first; then code; then `HANDOVER.md`.
-11. Do not expand scope past SPEC v1.0 DoD without explicit user approval.
+9. **Loop SoT:** `loop_bank[active]` + flush before switch/save (SPEC-v2 §5.3).
+10. Do not automate Domino GUI; patterns may be hand-edited there.
+11. Spec changes → update **`SPEC-v2.md` first**; then code; then `HANDOVER.md`.
+12. Do not expand scope past SPEC-v2 DoD without explicit user approval.
+13. **Reshape, don't rewrite** (SPEC-v2 D7). No full rewrite / no revive `archive/jpo-v2` as mainline.
+14. Do not mix large module splits with behavior fixes.
 
 ## Five pillars (do not invert priority)
 
-1. Dense J-Pop chord progressions (sub-bar, syncopation)
+1. Dense J-Pop chord progressions (sub-bar, syncopation with **full window coverage**)
 2. Simple accompaniment bed (not full arrange)
-3. Normal MIDI editing
+3. Normal MIDI editing (including multi-select move)
 4. 4/8/16 loops → song skeleton
-5. Grok context → MIDI parts import
+5. Grok co-create: S1 clipboard required, S2 API optional first-class
 
 ## Do not
 
 - Treat Domino feature-parity as a goal.
-- Full rewrite / revive `archive/jpo-v2` as mainline.
+- Full rewrite from empty tree.
 - “Fix” golden files to match a buggy generator without a SPEC change.
-- Mix large refactors with behavior fixes.
-- Ship generated notes with duplicate ids or unchecked bass range / same-pitch overlap.
-- Bury new work in README roadmap tables; use SPEC + HANDOVER.
+- Ship generated notes with duplicate ids, uncovered sync windows, or unchecked bass range / same-pitch overlap.
+- Bury new work in README roadmap tables; use SPEC-v2 + HANDOVER.

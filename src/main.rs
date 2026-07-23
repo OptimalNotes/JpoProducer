@@ -1526,6 +1526,61 @@ fn remove_notes_in_windows(notes: &mut Vec<Note>, windows: &[(f64, f64)]) {
     });
 }
 
+/// SPEC-v2 §6.3: longest run of half-beat bins in `[range_start, range_end)` with no note onset.
+/// Used for sync **continuous coverage** contracts (not just “any note in window”).
+fn max_onset_silence_beats(notes: &[Note], range_start: f64, range_end: f64) -> f64 {
+    const BIN: f64 = 0.5;
+    if range_end <= range_start + 1e-9 {
+        return 0.0;
+    }
+    let mut t = range_start;
+    let mut max_run: f64 = 0.0;
+    let mut run: f64 = 0.0;
+    while t < range_end - 1e-9 {
+        let t1 = (t + BIN).min(range_end);
+        let has = notes
+            .iter()
+            .any(|n| n.start >= t - 0.02 && n.start < t1 - 0.02);
+        if has {
+            max_run = max_run.max(run);
+            run = 0.0;
+        } else {
+            run += t1 - t;
+        }
+        t = t1;
+    }
+    max_run.max(run)
+}
+
+/// SPEC-v2: continuous coverage if no silent run ≥ `max_gap` beats (default 0.75).
+fn notes_cover_range(notes: &[Note], range_start: f64, range_end: f64, max_gap: f64) -> bool {
+    max_onset_silence_beats(notes, range_start, range_end) < max_gap - 1e-9
+}
+
+/// SPEC-v2 §5.5 — Select tool note press (before drag).
+/// Grabbing a note already in the multi-selection **keeps** the set (Ctrl not required).
+fn selection_on_note_press(
+    current: &HashSet<(usize, NoteId)>,
+    track_idx: usize,
+    note_id: NoteId,
+    ctrl: bool,
+) -> HashSet<(usize, NoteId)> {
+    let key = (track_idx, note_id);
+    if !ctrl && current.contains(&key) {
+        return current.clone();
+    }
+    if ctrl {
+        let mut s = current.clone();
+        if !s.insert(key) {
+            s.remove(&key);
+        }
+        return s;
+    }
+    let mut s = HashSet::new();
+    s.insert(key);
+    s
+}
+
 fn apply_melodic_block_range(
     pattern: &LoadedPattern,
     proj: &Project,
@@ -1572,6 +1627,114 @@ fn apply_melodic_block_range(
     notes
 }
 
+/// Pattern notes re-phased so onsets are measured from `origin` (not block.start).
+/// Used when block-phase refill leaves a hole right after a sync window.
+fn apply_melodic_rephased(
+    pattern: &LoadedPattern,
+    proj: &Project,
+    block: &ChordBlock,
+    origin: f64,
+    range_start: f64,
+    range_end: f64,
+) -> Vec<Note> {
+    let mut notes = Vec::new();
+    let dur_scale = pattern_time_scale(pattern, proj);
+    let fill_end = range_end.min(block.end());
+    let fill_start = range_start.max(block.start).max(origin);
+    if fill_start >= fill_end - 0.001 {
+        return notes;
+    }
+    let pat_len = pattern.length_beats.max(0.25);
+    for pn in &pattern.notes {
+        let mut k: i32 = 0;
+        loop {
+            let t = origin + (k as f64) * pat_len + pn.start_beats;
+            if t >= fill_end - 0.001 {
+                break;
+            }
+            if t >= fill_start - 0.001 && t < block.end() {
+                let raw_dur = (pn.dur_beats * dur_scale).max(0.05);
+                let dur = raw_dur.min((fill_end - t).max(0.05));
+                notes.push(Note {
+                    id: NoteId(0),
+                    start: t,
+                    pitch: melodic_mapped_pitch(pattern, pn.pitch, proj, block),
+                    dur,
+                    vel: pn.vel,
+                });
+            }
+            k += 1;
+            if k > 512 {
+                break;
+            }
+        }
+    }
+    notes
+}
+
+/// Map a pattern note's pitch for sync/bed placement.
+fn pattern_note_pitch(
+    pattern: &LoadedPattern,
+    pn_pitch: u8,
+    proj: &Project,
+    block: Option<&ChordBlock>,
+) -> u8 {
+    match (pattern.category, block) {
+        (PatternCategory::Drum, _) => pn_pitch,
+        (_, Some(b)) => melodic_mapped_pitch(pattern, pn_pitch, proj, b),
+        _ => pn_pitch,
+    }
+}
+
+/// SPEC-v2 §6.3: ensure half-beat bins in `[range_start, range_end)` have an onset.
+/// Fills holes using the pattern note whose phase is closest to the bin (tile/wrap).
+fn ensure_onset_coverage(
+    notes: &mut Vec<Note>,
+    pattern: &LoadedPattern,
+    proj: &Project,
+    block: Option<&ChordBlock>,
+    range_start: f64,
+    range_end: f64,
+) {
+    if pattern.notes.is_empty() || range_end <= range_start + 1e-9 {
+        return;
+    }
+    let dur_scale = pattern_time_scale(pattern, proj);
+    let pat_len = pattern.length_beats.max(0.25);
+    let mut bin = range_start;
+    while bin < range_end - 1e-9 {
+        let bin_end = (bin + 0.5).min(range_end);
+        let has = notes
+            .iter()
+            .any(|n| n.start >= bin - 0.02 && n.start < bin_end - 0.02);
+        if !has {
+            let phase = (bin - range_start).rem_euclid(pat_len);
+            let pn = pattern
+                .notes
+                .iter()
+                .min_by(|a, b| {
+                    let da = (a.start_beats.rem_euclid(pat_len) - phase).abs();
+                    let db = (b.start_beats.rem_euclid(pat_len) - phase).abs();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(&pattern.notes[0]);
+            let pitch = pattern_note_pitch(pattern, pn.pitch, proj, block);
+            let dur = (pn.dur_beats * dur_scale)
+                .min(range_end - bin)
+                .min(0.5)
+                .max(0.05);
+            notes.push(Note {
+                id: NoteId(0),
+                start: bin,
+                pitch,
+                dur,
+                vel: pn.vel,
+            });
+        }
+        bin += 0.5;
+    }
+}
+
 /// After syncopation splice, refill the remainder of each chord block so no rest gap follows.
 fn refill_after_sync_windows(
     notes: &mut Vec<Note>,
@@ -1583,7 +1746,7 @@ fn refill_after_sync_windows(
 ) {
     // Collect fills first so later windows do not wipe earlier refill/sync notes mid-loop.
     let mut to_add: Vec<Note> = Vec::new();
-    let mut clear_ranges: Vec<(f64, f64)> = Vec::new();
+    let mut fill_ranges: Vec<(f64, f64)> = Vec::new();
     for &(win_start, win_end) in windows {
         let Some(block) = chord_block_at(&proj.chord_blocks, win_start) else {
             continue;
@@ -1593,19 +1756,73 @@ fn refill_after_sync_windows(
         if fill_start >= fill_end - 0.001 {
             continue;
         }
-        clear_ranges.push((fill_start, fill_end));
-        let added = match pattern.category {
+        fill_ranges.push((fill_start, fill_end));
+        let mut added = match pattern.category {
             PatternCategory::Drum => apply_drum_pattern(pattern, proj, fill_start, fill_end),
             _ => apply_melodic_block_range(pattern, proj, block, fill_start, fill_end),
         };
+        // If block-phase leaves holes, rephase to fill_start then force half-beat coverage.
+        if !notes_cover_range(&added, fill_start, fill_end, 0.75) {
+            let extra = match pattern.category {
+                PatternCategory::Drum => {
+                    let mut forced = apply_drum_pattern(pattern, proj, fill_start, fill_end);
+                    if forced.is_empty() {
+                        let one = apply_drum_pattern(
+                            pattern,
+                            proj,
+                            0.0,
+                            pattern.length_beats.max(0.25),
+                        );
+                        forced = one
+                            .into_iter()
+                            .map(|mut n| {
+                                n.start += fill_start;
+                                n
+                            })
+                            .filter(|n| n.start < fill_end - 0.001)
+                            .collect();
+                    }
+                    forced
+                }
+                _ => apply_melodic_rephased(
+                    pattern,
+                    proj,
+                    block,
+                    fill_start,
+                    fill_start,
+                    fill_end,
+                ),
+            };
+            added.extend(extra);
+        }
+        ensure_onset_coverage(
+            &mut added,
+            pattern,
+            proj,
+            Some(block),
+            fill_start,
+            fill_end,
+        );
         to_add.extend(added);
     }
-    for &(s, e) in &clear_ranges {
-        notes.retain(|n| !note_overlaps_range(n, s, e));
+    // Clip notes that spill from the sync window into the fill (keep sync body, free the tail).
+    for n in notes.iter_mut() {
+        for &(fs, _) in &fill_ranges {
+            if n.start < fs - 0.001 && n.end() > fs + 0.001 {
+                n.dur = (fs - n.start).max(0.05);
+            }
+        }
     }
+    // Replace only notes that *start* in the fill region (do not wipe sync notes ending at fs).
+    notes.retain(|n| {
+        !fill_ranges
+            .iter()
+            .any(|&(fs, fe)| n.start >= fs - 0.001 && n.start < fe - 0.001)
+    });
     notes.extend(to_add);
 }
 
+/// SPEC-v2 §6.3: fill each sync window by tiling the sync pattern, then force continuous coverage.
 fn apply_syncopation_splice(
     notes: &mut Vec<Note>,
     sync_pattern: &LoadedPattern,
@@ -1613,58 +1830,54 @@ fn apply_syncopation_splice(
     windows: &[(f64, f64)],
 ) {
     let dur_scale = pattern_time_scale(sync_pattern, proj);
+    let pat_len = sync_pattern.length_beats.max(0.25);
+
     for &(win_start, win_end) in windows {
-        let win_len = (win_end - win_start).max(0.05);
+        if win_end <= win_start + 1e-9 {
+            continue;
+        }
         let block = chord_block_at(&proj.chord_blocks, win_start);
-        let mut placed = 0usize;
+        let mut window_notes: Vec<Note> = Vec::new();
 
-        for pn in &sync_pattern.notes {
-            // Keep notes whose onset falls inside this (possibly short) window.
-            let t = win_start + pn.start_beats;
-            if t >= win_end - 0.001 {
-                continue;
-            }
-            let pitch = match (sync_pattern.category, block) {
-                (PatternCategory::Drum, _) => pn.pitch,
-                (_, Some(b)) => melodic_mapped_pitch(sync_pattern, pn.pitch, proj, b),
-                _ => pn.pitch,
-            };
-            notes.push(Note {
-                id: NoteId(0),
-                start: t,
-                pitch,
-                dur: (pn.dur_beats * dur_scale).min(win_end - t).max(0.05),
-                vel: pn.vel,
-            });
-            placed += 1;
-        }
-
-        // Short windows: pattern may only have hits after beat 1.0 — wrap onsets into the window
-        // so a second ◆ in the loop is never left empty.
-        if placed == 0 && !sync_pattern.notes.is_empty() {
+        // 1) Tile the full pattern across the window (not only the first cycle).
+        if !sync_pattern.notes.is_empty() {
             for pn in &sync_pattern.notes {
-                let t_rel = pn.start_beats.rem_euclid(win_len);
-                let t = win_start + t_rel;
-                if t >= win_end - 0.001 {
-                    continue;
+                let mut k: i32 = 0;
+                loop {
+                    let t = win_start + (k as f64) * pat_len + pn.start_beats;
+                    if t >= win_end - 0.001 {
+                        break;
+                    }
+                    if t >= win_start - 0.001 {
+                        let pitch =
+                            pattern_note_pitch(sync_pattern, pn.pitch, proj, block);
+                        window_notes.push(Note {
+                            id: NoteId(0),
+                            start: t,
+                            pitch,
+                            dur: (pn.dur_beats * dur_scale).min(win_end - t).max(0.05),
+                            vel: pn.vel,
+                        });
+                    }
+                    k += 1;
+                    if k > 512 {
+                        break;
+                    }
                 }
-                let pitch = match (sync_pattern.category, block) {
-                    (PatternCategory::Drum, _) => pn.pitch,
-                    (_, Some(b)) => melodic_mapped_pitch(sync_pattern, pn.pitch, proj, b),
-                    _ => pn.pitch,
-                };
-                notes.push(Note {
-                    id: NoteId(0),
-                    start: t,
-                    pitch,
-                    dur: (pn.dur_beats * dur_scale)
-                        .min(win_end - t)
-                        .min(win_len)
-                        .max(0.05),
-                    vel: pn.vel,
-                });
             }
         }
+
+        // 2) Continuous coverage: no ≥0.75-beat onset hole inside the window.
+        ensure_onset_coverage(
+            &mut window_notes,
+            sync_pattern,
+            proj,
+            block,
+            win_start,
+            win_end,
+        );
+
+        notes.extend(window_notes);
     }
 }
 
@@ -2071,16 +2284,47 @@ fn default_arrange_repeats() -> u8 {
 
 /// Chord progression stamp (relative beats from 0).
 /// On disk: one file per stamp under `stamps/` next to the exe (or cwd).
+/// SPEC-v2 §6.2 schema.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct UserStamp {
+    /// File format version (1 = SPEC-v2).
+    #[serde(default = "stamp_schema_default")]
+    schema: u32,
     name: String,
+    /// Hint only: 4 / 8 / 16. Apply still clips to loop length.
+    #[serde(default)]
+    bars_hint: Option<u8>,
     blocks: Vec<ChordBlock>,
-    /// Source path (not serialized into the stamp body as authority — set on load).
+    /// Source path (not serialized — set on load).
     #[serde(skip)]
     path: Option<std::path::PathBuf>,
-    /// Bundled preset under assets/stamps — not deletable from UI.
+    /// Reserved; seeded copies under stamps/ are user-owned (deletable).
     #[serde(skip)]
     read_only: bool,
+}
+
+fn stamp_schema_default() -> u32 {
+    1
+}
+
+/// Infer bars_hint from relative block span (ceil to 4/8/16).
+fn infer_bars_hint(blocks: &[ChordBlock]) -> Option<u8> {
+    if blocks.is_empty() {
+        return None;
+    }
+    let end = blocks.iter().map(|b| b.end()).fold(0.0_f64, f64::max);
+    let bars = (end / 4.0).ceil().max(1.0) as u8;
+    Some(match bars {
+        1..=4 => 4,
+        5..=8 => 8,
+        _ => 16,
+    })
+}
+
+/// Path for a stamp display name (sanitized stem + .jpostamp under user stamps dir).
+fn stamp_path_for_name(name: &str) -> std::path::PathBuf {
+    let stem = sanitize_stamp_filename(name);
+    user_stamps_dir().join(format!("{stem}.jpostamp"))
 }
 
 /// Directory for user stamps: next to jpo.exe (portable), else `./stamps`.
@@ -2114,7 +2358,11 @@ fn sanitize_stamp_filename(name: &str) -> String {
 
 fn load_stamp_file(path: &std::path::Path) -> Option<UserStamp> {
     let s = std::fs::read_to_string(path).ok()?;
+    // Broken / non-stamp JSON → skip (app must not crash).
     let mut stamp: UserStamp = serde_json::from_str(&s).ok()?;
+    if stamp.schema == 0 {
+        stamp.schema = 1;
+    }
     if stamp.name.trim().is_empty() {
         stamp.name = path
             .file_stem()
@@ -2126,8 +2374,11 @@ fn load_stamp_file(path: &std::path::Path) -> Option<UserStamp> {
     if stamp.blocks.is_empty() {
         return None;
     }
+    if stamp.bars_hint.is_none() {
+        stamp.bars_hint = infer_bars_hint(&stamp.blocks);
+    }
     stamp.path = Some(path.to_path_buf());
-    // Everything under exe/stamps is user-owned (seeded presets are copies).
+    // Everything under stamps/ is user-owned (seeded presets are copies).
     stamp.read_only = false;
     Some(stamp)
 }
@@ -2241,11 +2492,16 @@ fn load_user_stamps() -> Vec<UserStamp> {
 fn write_stamp_file(path: &std::path::Path, stamp: &UserStamp) -> Result<(), String> {
     #[derive(Serialize)]
     struct StampFile<'a> {
+        schema: u32,
         name: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        bars_hint: Option<u8>,
         blocks: &'a [ChordBlock],
     }
     let body = StampFile {
+        schema: if stamp.schema == 0 { 1 } else { stamp.schema },
         name: &stamp.name,
+        bars_hint: stamp.bars_hint,
         blocks: &stamp.blocks,
     };
     let s = serde_json::to_string_pretty(&body).map_err(|e| e.to_string())?;
@@ -2328,6 +2584,96 @@ enum ChordDragKind { None, Move, Resize }
 
 /// Trackpad taps often register as micro-drags; slop in pixels for tap-vs-drag.
 const POINTER_SLOP_PX: f32 = 8.0;
+
+/// Keyboard gutter width shared by Edit chord ruler, piano roll, and Vel lane.
+const TIMELINE_KEY_WIDTH: f32 = 44.0;
+
+/// SPEC-v2 §4.3 — single owner of beat↔x / pitch↔y for a content strip.
+#[derive(Clone, Copy, Debug)]
+struct TimelineLayout {
+    content_rect: Rect,
+    visible_start: f64,
+    visible_beats: f64,
+    pitch_min: u8,
+    pitch_max: u8,
+}
+
+impl TimelineLayout {
+    fn new(
+        content_rect: Rect,
+        visible_start: f64,
+        visible_beats: f64,
+        pitch_min: u8,
+        pitch_max: u8,
+    ) -> Self {
+        let pitch_max = pitch_max.max(pitch_min.saturating_add(1));
+        Self {
+            content_rect,
+            visible_start,
+            visible_beats: visible_beats.max(0.25),
+            pitch_min,
+            pitch_max,
+        }
+    }
+
+    fn px_per_beat(&self) -> f64 {
+        self.content_rect.width() as f64 / self.visible_beats
+    }
+
+    fn beat_at_x(&self, x: f32) -> f64 {
+        self.visible_start
+            + ((x - self.content_rect.min.x) as f64 / self.px_per_beat().max(1e-6))
+    }
+
+    fn x_at_beat(&self, beat: f64) -> f32 {
+        self.content_rect.min.x
+            + ((beat - self.visible_start) * self.px_per_beat()) as f32
+    }
+
+    fn pitch_row_count(&self) -> f64 {
+        (self.pitch_max.saturating_sub(self.pitch_min) as f64 + 1.0).max(1.0)
+    }
+
+    fn pitch_at_y(&self, y: f32) -> u8 {
+        let h = self.content_rect.height().max(1.0) as f64;
+        let rows = self.pitch_row_count();
+        let norm = ((y - self.content_rect.min.y) as f64 / h).clamp(0.0, 0.999999);
+        let row = (norm * rows).floor() as i32;
+        (self.pitch_max as i32 - row)
+            .clamp(self.pitch_min as i32, self.pitch_max as i32) as u8
+    }
+
+    fn pitch_row_y(&self, pitch: u8) -> (f32, f32) {
+        let rows = self.pitch_row_count();
+        let pitch = pitch.clamp(self.pitch_min, self.pitch_max);
+        let row = (self.pitch_max - pitch) as f64;
+        let h = self.content_rect.height() as f64;
+        let y0 = self.content_rect.min.y + ((row / rows) * h) as f32;
+        let y1 = self.content_rect.min.y + (((row + 1.0) / rows) * h) as f32;
+        (y0, y1)
+    }
+}
+
+/// SPEC-v2 §4.2 — keyboard shortcut domain (not flag soup).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum InputFocus {
+    #[default]
+    None,
+    ChordStrip,
+    PianoRoll,
+    GrokText,
+    Arrange,
+}
+
+impl InputFocus {
+    /// Note clipboard + roll tools when focus is the piano roll (or not in a text field).
+    fn allows_edit_shortcuts(self, wants_keyboard: bool) -> bool {
+        if matches!(self, Self::GrokText) {
+            return false;
+        }
+        !wants_keyboard || matches!(self, Self::PianoRoll)
+    }
+}
 
 /// OS text clipboard magic — Windows often delivers Ctrl+V as `Event::Paste(text)`,
 /// not as `Key::V`. Notes are encoded as text so the system clipboard works.
@@ -2465,6 +2811,15 @@ fn notes_from_clip_text(s: &str) -> Option<ClipboardNotes> {
         min_start: 0.0, // notes[].start are relative
         anchor_pitch,
     })
+}
+
+/// Drop keyboard focus from TextEdit / DragValue so Tab3 shortcuts work again.
+fn clear_keyboard_focus(ctx: &egui::Context) {
+    ctx.memory_mut(|m| {
+        if let Some(id) = m.focused() {
+            m.surrender_focus(id);
+        }
+    });
 }
 
 /// True if Ctrl or Cmd is held (logical match — Windows / IME friendly).
@@ -2625,6 +2980,10 @@ struct JpoApp {
     /// Selected index in the Progress stamp combo (for append).
     stamp_combo_idx: usize,
     user_stamps: Vec<UserStamp>,
+    /// Name field for "save current progression as stamp".
+    stamp_save_name: String,
+    /// Pending overwrite: (path, stamp body) waiting for confirm dialog.
+    stamp_overwrite_pending: Option<(std::path::PathBuf, UserStamp)>,
     tracks_panel_open: bool,
     /// Tab3 bottom lane tool (Vel graph / Grok / …). Always visible on Edit.
     edit_lane_tool: EditLaneTool,
@@ -2740,6 +3099,8 @@ struct JpoApp {
 
     /// True after interacting with the piano roll (Edit tab only).
     piano_roll_focused: bool,
+    /// SPEC-v2 §4.2 input domain (drives shortcut isolation).
+    input_focus: InputFocus,
 
     /// Grok: natural-language progression paste, or MIDI file import.
     #[allow(dead_code)]
@@ -2766,6 +3127,8 @@ impl Default for JpoApp {
                 ensure_user_stamps_seeded();
                 load_user_stamps()
             },
+            stamp_save_name: String::new(),
+            stamp_overwrite_pending: None,
             tracks_panel_open: true,
             edit_lane_tool: EditLaneTool::Velocity,
             vel_drag_note: None,
@@ -2835,6 +3198,7 @@ impl Default for JpoApp {
             status_toast_until: 0.0,
             edit_status: String::new(),
             piano_roll_focused: false,
+            input_focus: InputFocus::None,
             grok_import_mode: GrokImportMode::NaturalLanguage,
             grok_paste_text: String::new(),
         }
@@ -2857,17 +3221,27 @@ impl JpoApp {
         self.drag_sel_offsets.clear();
     }
 
+    fn set_input_focus(&mut self, focus: InputFocus) {
+        self.input_focus = focus;
+        self.piano_roll_focused = matches!(focus, InputFocus::PianoRoll);
+    }
+
     fn switch_tab(&mut self, ctx: &egui::Context, tab: AppTab) {
         self.active_tab = tab;
-        self.piano_roll_focused = false;
         self.clear_interaction_state();
-        if tab == AppTab::Edit {
-            ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("grok_nl_text")));
-            self.edit_mode = EditMode::Select;
-            if self.selected_ch == 1 {
-                self.selected_ch = 2;
+        clear_keyboard_focus(ctx);
+        match tab {
+            AppTab::Edit => {
+                ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("grok_nl_text")));
+                self.edit_mode = EditMode::Select;
+                if self.selected_ch == 1 {
+                    self.selected_ch = 2;
+                }
+                self.set_input_focus(InputFocus::PianoRoll);
             }
-            self.piano_roll_focused = true;
+            AppTab::Chord => self.set_input_focus(InputFocus::ChordStrip),
+            AppTab::Arrange => self.set_input_focus(InputFocus::Arrange),
+            AppTab::Generate => self.set_input_focus(InputFocus::None),
         }
         // Progress (Chord): modeless — no Draw/Erase; gestures only.
         if tab != AppTab::Edit {
@@ -3095,28 +3469,22 @@ impl JpoApp {
         NoteId(max_id + 1)
     }
 
-    fn select_note_toggle(&mut self, track_idx: usize, note_id: NoteId, additive: bool) {
-        if additive {
-            if self.selection.notes.contains(&(track_idx, note_id)) {
-                self.selection.notes.remove(&(track_idx, note_id));
-                if self.selected_note == Some((track_idx, note_id)) {
-                    self.selected_note = self
-                        .selection
-                        .notes
-                        .iter()
-                        .filter(|&&(t, _)| t == track_idx)
-                        .min_by_key(|&(_, id)| id.0)
-                        .copied();
-                }
-            } else {
-                self.selection.notes.insert((track_idx, note_id));
-                self.selected_note = Some((track_idx, note_id));
-            }
-        } else {
-            self.selection.notes.clear();
-            self.selection.notes.insert((track_idx, note_id));
+    /// Apply SPEC-v2 §5.5 note press to selection + primary.
+    fn apply_selection_on_note_press(&mut self, track_idx: usize, note_id: NoteId, ctrl: bool) {
+        self.selection.notes =
+            selection_on_note_press(&self.selection.notes, track_idx, note_id, ctrl);
+        if self.selection.notes.contains(&(track_idx, note_id)) {
             self.selected_note = Some((track_idx, note_id));
+        } else {
+            self.selected_note = self
+                .selection
+                .notes
+                .iter()
+                .copied()
+                .find(|&(t, _)| t == track_idx)
+                .or_else(|| self.selection.notes.iter().copied().next());
         }
+        self.set_input_focus(InputFocus::PianoRoll);
     }
 
     fn select_all_notes_in_track(&mut self, track_idx: usize) {
@@ -5124,37 +5492,66 @@ impl JpoApp {
         }
     }
 
-    fn save_current_as_user_stamp(&mut self, name: String) {
+    /// Build a stamp from the current progression (relative, schema 1).
+    fn stamp_from_current_progression(&self, name: &str) -> Option<UserStamp> {
         let rel = chord_blocks_relative(&self.proj.chord_blocks);
         if rel.is_empty() {
-            return;
+            return None;
         }
         let name = if name.trim().is_empty() {
-            format!("Stamp {}", self.user_stamps.iter().filter(|s| !s.read_only).count() + 1)
+            format!("Stamp {}", self.user_stamps.len() + 1)
         } else {
             name.trim().to_string()
         };
-        let dir = user_stamps_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let file_stem = sanitize_stamp_filename(&name);
-        let mut path = dir.join(format!("{file_stem}.jpostamp"));
-        let mut n = 2;
-        while path.exists() {
-            path = dir.join(format!("{file_stem}_{n}.jpostamp"));
-            n += 1;
-            if n > 999 {
-                break;
-            }
-        }
-        let stamp = UserStamp {
-            name: name.clone(),
+        Some(UserStamp {
+            schema: 1,
+            name,
+            bars_hint: infer_bars_hint(&rel),
             blocks: rel,
-            path: Some(path.clone()),
+            path: None,
             read_only: false,
+        })
+    }
+
+    /// SPEC-v2 §6.2: save current progression. If path exists and `overwrite` is false,
+    /// stages `stamp_overwrite_pending` for UI confirm instead of auto-renaming.
+    fn save_current_as_user_stamp(
+        &mut self,
+        name: String,
+        overwrite: bool,
+    ) -> Result<(), String> {
+        let Some(mut stamp) = self.stamp_from_current_progression(&name) else {
+            return Err("empty progression".into());
         };
-        if write_stamp_file(&path, &stamp).is_ok() {
-            self.reload_stamps();
+        let dir = user_stamps_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = stamp_path_for_name(&stamp.name);
+        if path.exists() && !overwrite {
+            stamp.path = Some(path.clone());
+            self.stamp_overwrite_pending = Some((path, stamp));
+            return Err("confirm_overwrite".into());
         }
+        stamp.path = Some(path.clone());
+        write_stamp_file(&path, &stamp)?;
+        self.stamp_overwrite_pending = None;
+        self.reload_stamps();
+        // Select the saved stamp in the combo if present.
+        if let Some(i) = self.user_stamps.iter().position(|s| s.name == stamp.name) {
+            self.stamp_combo_idx = i;
+        }
+        Ok(())
+    }
+
+    fn confirm_stamp_overwrite(&mut self) -> Result<(), String> {
+        let Some((path, stamp)) = self.stamp_overwrite_pending.take() else {
+            return Ok(());
+        };
+        write_stamp_file(&path, &stamp)?;
+        self.reload_stamps();
+        if let Some(i) = self.user_stamps.iter().position(|s| s.name == stamp.name) {
+            self.stamp_combo_idx = i;
+        }
+        Ok(())
     }
 
     fn delete_user_stamp(&mut self, idx: usize) {
@@ -5449,7 +5846,7 @@ impl JpoApp {
 
     /// Piano-roll-aligned velocity bars (Domino-style graph under the roll).
     fn draw_velocity_lane(&mut self, ui: &mut egui::Ui, height: f32) {
-        let key_w = Self::PIANO_KEY_WIDTH;
+        let key_w = TIMELINE_KEY_WIDTH;
         ui.horizontal(|ui| {
             // Gutter matches keyboard width so bars align with the roll.
             ui.allocate_ui_with_layout(
@@ -5462,7 +5859,8 @@ impl JpoApp {
                     ui.label(egui::RichText::new("1").small().weak());
                 },
             );
-            let avail_w = ui.available_width().min(1100.0);
+            // Match piano-roll width (full remaining after key gutter).
+            let avail_w = ui.available_width().max(80.0);
             let desired = Vec2::new(avail_w, height);
             let (resp, painter) = ui.allocate_painter(desired, Sense::click_and_drag());
             let rect = resp.rect;
@@ -7216,6 +7614,8 @@ impl eframe::App for JpoApp {
                     ] {
                         if ui.selectable_label(self.edit_mode == mode, label).clicked() {
                             self.edit_mode = mode;
+                            clear_keyboard_focus(ui.ctx());
+                            self.set_input_focus(InputFocus::PianoRoll);
                         }
                     }
                     ui.label(egui::RichText::new("Q/W/E").small().weak());
@@ -7445,17 +7845,37 @@ impl eframe::App for JpoApp {
                                 self.show_toast(ctx, "進行をクリア");
                             }
                         }
+                        ui.label(egui::RichText::new("名前").small().weak());
+                        let name_w = 100.0_f32;
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.stamp_save_name)
+                                .desired_width(name_w)
+                                .hint_text("Stamp名"),
+                        );
                         if ui
                             .button("現在を保存")
-                            .on_hover_text(format!("保存先: {}", user_stamps_dir().display()))
+                            .on_hover_text(format!(
+                                "進行を相対時刻で保存 → {}\n同名は確認のうえ上書き（SPEC-v2）",
+                                user_stamps_dir().display()
+                            ))
                             .clicked()
                         {
                             if self.proj.chord_blocks.is_empty() {
                                 self.show_toast(ctx, "保存する進行がありません");
                             } else {
-                                let n = self.user_stamps.len() + 1;
-                                self.save_current_as_user_stamp(format!("Stamp {n}"));
-                                self.show_toast(ctx, "stamps/ に保存");
+                                let name = if self.stamp_save_name.trim().is_empty() {
+                                    format!("Stamp {}", self.user_stamps.len() + 1)
+                                } else {
+                                    self.stamp_save_name.trim().to_string()
+                                };
+                                self.stamp_save_name = name.clone();
+                                match self.save_current_as_user_stamp(name, false) {
+                                    Ok(()) => self.show_toast(ctx, "stamps/ に保存しました"),
+                                    Err(e) if e == "confirm_overwrite" => {
+                                        // Modal below.
+                                    }
+                                    Err(e) => self.show_toast(ctx, format!("保存失敗: {e}")),
+                                }
                             }
                         }
                         if ui.small_button("↻").on_hover_text("stamps/ を再読込").clicked() {
@@ -7470,7 +7890,7 @@ impl eframe::App for JpoApp {
                         if !self.user_stamps.is_empty()
                             && ui
                                 .small_button("✕")
-                                .on_hover_text("選択中スタンプのファイルを削除")
+                                .on_hover_text("選択中スタンプのファイルを削除（stamps/ 内）")
                                 .clicked()
                         {
                             let idx = self.stamp_combo_idx;
@@ -7604,7 +8024,9 @@ impl eframe::App for JpoApp {
                                             {
                                                 self.selected_ch = ch;
                                                 self.selected_note = None;
-                                                self.piano_roll_focused = ch != 1;
+                                                if ch != 1 {
+                                                    self.set_input_focus(InputFocus::PianoRoll);
+                                                }
                                             }
                                         }
                                         return;
@@ -7626,8 +8048,8 @@ impl eframe::App for JpoApp {
                                                     {
                                                         self.selected_ch = ch;
                                                         self.selected_note = None;
-                                                        self.piano_roll_focused = ch != 1;
                                                         if ch != 1 {
+                                                            self.set_input_focus(InputFocus::PianoRoll);
                                                             self.clear_chord_selection();
                                                         }
                                                     }
@@ -7753,18 +8175,69 @@ impl eframe::App for JpoApp {
             }
         });
 
+        // SPEC-v2 §6.2: confirm overwrite when saving a stamp with an existing file name.
+        if self.stamp_overwrite_pending.is_some() {
+            let name = self
+                .stamp_overwrite_pending
+                .as_ref()
+                .map(|(_, s)| s.name.clone())
+                .unwrap_or_default();
+            let path_disp = self
+                .stamp_overwrite_pending
+                .as_ref()
+                .map(|(p, _)| p.display().to_string())
+                .unwrap_or_default();
+            let mut confirmed = false;
+            let mut cancelled = false;
+            egui::Window::new("スタンプを上書きしますか？")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("同名のファイルがあります:\n{name}"));
+                    ui.label(
+                        egui::RichText::new(path_disp)
+                            .small()
+                            .weak(),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("上書き").clicked() {
+                            confirmed = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+            if confirmed {
+                match self.confirm_stamp_overwrite() {
+                    Ok(()) => self.show_toast(ctx, "上書き保存しました"),
+                    Err(e) => self.show_toast(ctx, format!("上書き失敗: {e}")),
+                }
+            } else if cancelled {
+                self.stamp_overwrite_pending = None;
+                self.show_toast(ctx, "保存をキャンセル");
+            }
+        }
+
         // Tab3: single clipboard + shortcut pass after UI (widgets can swallow keys if we run only pre-UI).
         // Must not run twice: Event::Paste + Ctrl+V would double-paste stacked notes.
-        // Skip Q/W/E and other edit keys while typing in Grok text fields.
-        if self.active_tab == AppTab::Edit && self.selected_ch != 1 {
+        // Skip while truly typing in Grok/survey TextEdit — but if the piano roll is focused
+        // (note selected / roll clicked), prefer note shortcuts (sticky TextEdit focus was
+        // killing Ctrl+C/V and Q/W/E).
+        if self.active_tab == AppTab::Edit {
+            // If a TextEdit has focus, treat as GrokText for isolation.
             let typing = ctx.wants_keyboard_input();
-            if !typing {
-                let _ = self.handle_os_clipboard_events(ctx);
-            } else {
-                // Still allow Ctrl+C/V note clipboard? Prefer not while typing in survey.
-                // OS paste into text field must work — do not steal Event::Paste.
+            if typing && !matches!(self.input_focus, InputFocus::PianoRoll) {
+                self.input_focus = InputFocus::GrokText;
             }
-            if !typing {
+            let edit_keys_ok = self.input_focus.allows_edit_shortcuts(typing);
+            if edit_keys_ok && self.selected_ch != 1 {
+                let _ = self.handle_os_clipboard_events(ctx);
+            }
+            if edit_keys_ok {
+                // Q/W/E also when Ch1 (mode prep); note clipboard gated inside the handler.
                 ctx.input_mut(|i| {
                     let _ = self.handle_edit_shortcuts(ctx, i);
                 });
@@ -7922,7 +8395,12 @@ impl JpoApp {
         } else {
             (ui.available_height() * 0.22).clamp(110.0, 160.0)
         };
-        let desired = Vec2::new(ui.available_width().min(1100.0), h);
+        // Edit: left gutter = TimelineLayout key width so ruler matches roll / Vel.
+        let gutter = if playhead_ruler {
+            TIMELINE_KEY_WIDTH
+        } else {
+            0.0
+        };
         let sense = if editable {
             Sense::click_and_drag()
         } else if playhead_ruler {
@@ -7930,21 +8408,41 @@ impl JpoApp {
         } else {
             Sense::hover()
         };
-        let (resp, painter) = ui.allocate_painter(desired, sense);
+
+        // Optional keyboard gutter + full-width strip (align Edit ruler with piano roll / Vel).
+        let (resp, painter) = if gutter > 0.0 {
+            let mut out: Option<(egui::Response, egui::Painter)> = None;
+            ui.horizontal(|ui| {
+                let (g_resp, g_painter) =
+                    ui.allocate_painter(Vec2::new(gutter, h), Sense::hover());
+                g_painter.rect_filled(g_resp.rect, 0.0, Color32::from_rgb(28, 28, 34));
+                let desired = Vec2::new(ui.available_width().max(80.0), h);
+                out = Some(ui.allocate_painter(desired, sense));
+            });
+            out.expect("chord timeline strip")
+        } else {
+            let desired = Vec2::new(ui.available_width().max(80.0), h);
+            ui.allocate_painter(desired, sense)
+        };
         if editable && (resp.clicked() || resp.dragged() || resp.drag_started()) {
-            self.piano_roll_focused = false;
+            self.set_input_focus(InputFocus::ChordStrip);
         }
 
         let rect = resp.rect;
-        let w = rect.width();
-        let _h = rect.height();
-        let px_per_beat = w as f64 / self.visible_beats;
+        let layout = TimelineLayout::new(
+            rect,
+            self.visible_start,
+            self.visible_beats,
+            0,
+            1,
+        );
+        let px_per_beat = layout.px_per_beat();
 
         // bg
         painter.rect_filled(rect, 4.0, Color32::from_rgb(28, 28, 34));
 
-        let start_b = self.visible_start;
-        let end_b = start_b + self.visible_beats;
+        let start_b = layout.visible_start;
+        let end_b = start_b + layout.visible_beats;
 
         // grid: bar / beat / half / 16th — dense Progress readability (SPEC P1)
         let mut b = (start_b * 4.0).floor() / 4.0;
@@ -8210,36 +8708,45 @@ impl JpoApp {
         // Tab3: chord timeline acts as a playhead ruler (no chord editing here).
         if playhead_ruler && resp.clicked() {
             if let Some(ptr) = resp.interact_pointer_pos() {
-                let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
+                let beat = layout.beat_at_x(ptr.x);
                 self.set_playhead(beat);
-                self.piano_roll_focused = false;
+                clear_keyboard_focus(ui.ctx());
+                // Keep roll shortcuts available after setting playhead.
+                self.set_input_focus(InputFocus::PianoRoll);
             }
         }
 
         resp
     }
 
-    const PIANO_KEY_WIDTH: f32 = 44.0;
-
+    /// Y band for one pitch row — delegates to `TimelineLayout` (SPEC-v2 §4.3).
     fn pitch_row_y(min_p: u8, max_p: u8, pitch: u8, h: f64, rect: Rect) -> (f32, f32) {
-        let norm_top = (max_p as f64 - pitch as f64 - 0.5) / (max_p - min_p) as f64;
-        let norm_bot = (max_p as f64 - pitch as f64 + 0.5) / (max_p - min_p) as f64;
-        let y0 = rect.min.y + (norm_top * h) as f32;
-        let y1 = rect.min.y + (norm_bot * h) as f32;
-        (y0, y1)
+        let layout = TimelineLayout::new(
+            Rect::from_min_size(rect.min, Vec2::new(rect.width(), h as f32)),
+            0.0,
+            1.0,
+            min_p,
+            max_p,
+        );
+        layout.pitch_row_y(pitch)
+    }
+
+    /// Pointer Y → MIDI pitch (same mapping as `pitch_row_y`).
+    fn pitch_at_y(min_p: u8, max_p: u8, y: f32, rect: Rect) -> u8 {
+        TimelineLayout::new(rect, 0.0, 1.0, min_p, max_p).pitch_at_y(y)
     }
 
     /// Vertical piano keyboard strip (rotated / "sideways" piano) aligned to roll rows.
     fn draw_piano_keyboard(&self, ui: &mut egui::Ui, height: f32) {
-        let desired = Vec2::new(Self::PIANO_KEY_WIDTH, height);
+        let desired = Vec2::new(TIMELINE_KEY_WIDTH, height);
         let (_resp, painter) = ui.allocate_painter(desired, Sense::hover());
 
         let rect = _resp.rect;
-        let h = rect.height() as f64;
         painter.rect_filled(rect, 0.0, Color32::from_rgb(32, 32, 38));
 
         let min_p = self.visible_pitch_min();
         let max_p = self.visible_pitch_max().max(min_p.saturating_add(1));
+        let key_layout = TimelineLayout::new(rect, 0.0, 1.0, min_p, max_p);
 
         for p in min_p..=max_p {
             let pc = p % 12;
@@ -8247,7 +8754,7 @@ impl JpoApp {
             if is_black {
                 continue;
             }
-            let (y0, y1) = Self::pitch_row_y(min_p, max_p, p, h, rect);
+            let (y0, y1) = key_layout.pitch_row_y(p);
             painter.rect_filled(
                 Rect::from_min_max(Pos2::new(rect.min.x, y0), Pos2::new(rect.max.x, y1)),
                 0.0,
@@ -8275,7 +8782,7 @@ impl JpoApp {
             if ![1, 3, 6, 8, 10].contains(&pc) {
                 continue;
             }
-            let (y0, y1) = Self::pitch_row_y(min_p, max_p, p, h, rect);
+            let (y0, y1) = key_layout.pitch_row_y(p);
             let key_h = (y1 - y0).max(2.0);
             let black_w = rect.width() * 0.62;
             painter.rect_filled(
@@ -8302,7 +8809,8 @@ impl JpoApp {
         let mut roll_response = ui.allocate_response(Vec2::ZERO, Sense::click_and_drag());
         ui.horizontal(|ui| {
             self.draw_piano_keyboard(ui, height);
-            roll_response = self.draw_piano_roll_grid(ui, ui.available_width().min(940.0), height);
+            // Same width rule as chord ruler / Vel lane (full remaining width — no 940 cap).
+            roll_response = self.draw_piano_roll_grid(ui, ui.available_width().max(80.0), height);
         });
         roll_response
     }
@@ -8311,19 +8819,30 @@ impl JpoApp {
     fn draw_piano_roll_grid(&mut self, ui: &mut egui::Ui, width: f32, height: f32) -> egui::Response {
         let desired = Vec2::new(width, height);
         let (resp, painter) = ui.allocate_painter(desired, Sense::click_and_drag());
-        if self.active_tab == AppTab::Edit && (resp.clicked() || resp.drag_started() || resp.dragged()) {
+        if self.active_tab == AppTab::Edit
+            && (resp.clicked() || resp.drag_started() || resp.dragged())
+        {
+            clear_keyboard_focus(ui.ctx());
             resp.request_focus();
-        }
-        if resp.clicked() || resp.dragged() || resp.drag_started() || resp.hovered() {
-            self.piano_roll_focused = true;
+            self.set_input_focus(InputFocus::PianoRoll);
+        } else if resp.hovered() && self.active_tab == AppTab::Edit {
+            self.set_input_focus(InputFocus::PianoRoll);
         }
 
         let rect = resp.rect;
-        let w = rect.width() as f64;
+        let min_p = self.visible_pitch_min();
+        let max_p = self.visible_pitch_max().max(min_p.saturating_add(1));
+        let layout = TimelineLayout::new(
+            rect,
+            self.visible_start,
+            self.visible_beats,
+            min_p,
+            max_p,
+        );
+        let px_per_beat = layout.px_per_beat();
+        let start_b = layout.visible_start;
+        let end_b = start_b + layout.visible_beats;
         let h = rect.height() as f64;
-        let px_per_beat = w / self.visible_beats;
-        let start_b = self.visible_start;
-        let end_b = start_b + self.visible_beats;
 
         let track_idx = self.track_idx();
         let is_ch1 = self.selected_ch == 1;
@@ -8337,9 +8856,6 @@ impl JpoApp {
             let scroll = ui.ctx().input(|i| i.raw_scroll_delta.y + i.smooth_scroll_delta.y);
             self.scroll_pitch_view(scroll);
         }
-
-        let min_p = self.visible_pitch_min();
-        let max_p = self.visible_pitch_max().max(min_p.saturating_add(1));
 
         // time grid — uses snap_grid (not Len).
         let main_step = self.snap_grid.max(0.25);
@@ -8399,10 +8915,7 @@ impl JpoApp {
                     if !scale_pcs.contains(&(p % 12)) {
                         continue;
                     }
-                    let norm_top = (max_p as f64 - p as f64 - 0.5) / (max_p - min_p) as f64;
-                    let norm_bot = (max_p as f64 - p as f64 + 0.5) / (max_p - min_p) as f64;
-                    let y0 = rect.min.y + (norm_top * h) as f32;
-                    let y1 = rect.min.y + (norm_bot * h) as f32;
+                    let (y0, y1) = Self::pitch_row_y(min_p, max_p, p, h, rect);
                     painter.rect_filled(
                         Rect::from_min_max(Pos2::new(rect.min.x, y0), Pos2::new(rect.max.x, y1)),
                         0.0,
@@ -8426,10 +8939,7 @@ impl JpoApp {
                         if !chord_pcs.contains(&(p % 12)) {
                             continue;
                         }
-                        let norm_top = (max_p as f64 - p as f64 - 0.5) / (max_p - min_p) as f64;
-                        let norm_bot = (max_p as f64 - p as f64 + 0.5) / (max_p - min_p) as f64;
-                        let y0 = rect.min.y + (norm_top * h) as f32;
-                        let y1 = rect.min.y + (norm_bot * h) as f32;
+                        let (y0, y1) = Self::pitch_row_y(min_p, max_p, p, h, rect);
                         painter.rect_filled(
                             Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)),
                             0.0,
@@ -8445,10 +8955,7 @@ impl JpoApp {
             if n.end() < start_b || n.start > end_b { continue; }
             let x0 = rect.min.x + ((n.start - start_b) * px_per_beat) as f32;
             let x1 = rect.min.x + ((n.end() - start_b) * px_per_beat) as f32;
-            let norm_top = (max_p as f64 - n.pitch as f64 - 0.5) / (max_p - min_p) as f64;
-            let norm_bot = (max_p as f64 - n.pitch as f64 + 0.5) / (max_p - min_p) as f64;
-            let y0 = rect.min.y + (norm_top * h) as f32;
-            let y1 = rect.min.y + (norm_bot * h) as f32;
+            let (y0, y1) = Self::pitch_row_y(min_p, max_p, n.pitch.clamp(min_p, max_p), h, rect);
 
             // Must match track+id (id alone is wrong if ids were ever non-unique).
             let is_single_sel = self.selected_note == Some((track_idx, n.id));
@@ -8479,7 +8986,7 @@ impl JpoApp {
         // Ch1 roll: click sets playhead only (chords edited in timeline).
         if is_ch1 && resp.clicked() && !resp.dragged() {
             if let Some(ptr) = resp.interact_pointer_pos() {
-                let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
+                let beat = layout.beat_at_x(ptr.x);
                 self.set_playhead(beat);
             }
         }
@@ -8488,9 +8995,8 @@ impl JpoApp {
         let std_edit = self.active_tab == AppTab::Edit && !is_ch1;
         if std_edit && (resp.clicked() || resp.dragged() || resp.drag_started()) {
             if let Some(ptr) = resp.interact_pointer_pos() {
-                let beat = start_b + ((ptr.x - rect.min.x) as f64 / px_per_beat);
-                let norm = ((ptr.y - rect.min.y) as f64 / h).clamp(0.0, 1.0);
-                let pitch = (max_p as f64 - norm * (max_p - min_p) as f64).round() as u8;
+                let beat = layout.beat_at_x(ptr.x);
+                let pitch = layout.pitch_at_y(ptr.y);
                 let ctrl = ui.ctx().input(|i| i.modifiers.ctrl);
                 let beat_slop = (POINTER_SLOP_PX as f64 / px_per_beat).max(0.05);
 
@@ -8503,10 +9009,8 @@ impl JpoApp {
                         let p_hi = sp.max(pitch);
                         let x0 = rect.min.x + ((sb.min(beat) - start_b) * px_per_beat) as f32;
                         let x1 = rect.min.x + ((sb.max(beat) - start_b) * px_per_beat) as f32;
-                        let norm_lo = (max_p as f64 - p_hi as f64 - 0.5) / (max_p - min_p) as f64;
-                        let norm_hi = (max_p as f64 - p_lo as f64 + 0.5) / (max_p - min_p) as f64;
-                        let y0 = rect.min.y + (norm_lo * h) as f32;
-                        let y1 = rect.min.y + (norm_hi * h) as f32;
+                        let (y0, _) = Self::pitch_row_y(min_p, max_p, p_hi, h, rect);
+                        let (_, y1) = Self::pitch_row_y(min_p, max_p, p_lo, h, rect);
                         painter.rect_filled(
                             Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1)),
                             0.0,
@@ -8546,33 +9050,47 @@ impl JpoApp {
                                     let n = &self.proj.tracks[track_idx].notes[i];
                                     (n.id, n.start, n.pitch, n.dur)
                                 };
-                                if !(ctrl && self.selection.notes.contains(&(track_idx, nid))) {
-                                    if !ctrl {
-                                        self.selection.notes.clear();
-                                    }
-                                    self.select_note_toggle(track_idx, nid, ctrl);
-                                }
-                                self.drag_orig = (nstart, npitch, ndur);
-                                self.drag_start_beat = beat;
-                                self.drag_start_pitch = pitch;
-                                let nx0 = rect.min.x + ((nstart - start_b) * px_per_beat) as f32;
-                                let nx1 = rect.min.x + ((nstart + ndur - start_b) * px_per_beat) as f32;
-                                self.note_drag_kind = if Self::note_resize_at_ptr(ptr.x, nx0, nx1) {
-                                    NoteDragKind::Resize
+                                // SPEC-v2 §5.5: keep multi-set when grabbing a selected member.
+                                self.apply_selection_on_note_press(track_idx, nid, ctrl);
+                                // Ctrl-toggle removed the note → no move/resize of empty grab.
+                                if !self.selection.notes.contains(&(track_idx, nid)) {
+                                    self.note_drag_kind = NoteDragKind::None;
+                                    self.drag_sel_offsets.clear();
+                                    self.gesture_undo_saved = false;
                                 } else {
-                                    NoteDragKind::Move
-                                };
-                                self.drag_sel_offsets = self
-                                    .selection
-                                    .notes
-                                    .iter()
-                                    .filter(|&&(t, _)| t == track_idx)
-                                    .filter_map(|&(_, id)| {
-                                        self.proj.tracks[track_idx].notes.iter().find(|nn| nn.id == id).map(
-                                            |nn| (id, nn.start - nstart, nn.pitch as i32 - npitch as i32),
-                                        )
-                                    })
-                                    .collect();
+                                    self.drag_orig = (nstart, npitch, ndur);
+                                    self.drag_start_beat = beat;
+                                    self.drag_start_pitch = pitch;
+                                    let nx0 =
+                                        rect.min.x + ((nstart - start_b) * px_per_beat) as f32;
+                                    let nx1 = rect.min.x
+                                        + ((nstart + ndur - start_b) * px_per_beat) as f32;
+                                    self.note_drag_kind =
+                                        if Self::note_resize_at_ptr(ptr.x, nx0, nx1) {
+                                            NoteDragKind::Resize
+                                        } else {
+                                            NoteDragKind::Move
+                                        };
+                                    self.drag_sel_offsets = self
+                                        .selection
+                                        .notes
+                                        .iter()
+                                        .filter(|&&(t, _)| t == track_idx)
+                                        .filter_map(|&(_, id)| {
+                                            self.proj.tracks[track_idx]
+                                                .notes
+                                                .iter()
+                                                .find(|nn| nn.id == id)
+                                                .map(|nn| {
+                                                    (
+                                                        id,
+                                                        nn.start - nstart,
+                                                        nn.pitch as i32 - npitch as i32,
+                                                    )
+                                                })
+                                        })
+                                        .collect();
+                                }
                             } else {
                                 self.set_playhead(beat);
                                 self.box_select_start_beat = Some(beat);
@@ -8653,8 +9171,12 @@ impl JpoApp {
                         }
                         EditMode::Select => {
                             if let Some(i) = hit {
-                                let id = self.proj.tracks[track_idx].notes[i].id;
-                                self.select_note_toggle(track_idx, id, ctrl);
+                                // drag_started already applied selection_on_note_press for this note.
+                                // Do not re-toggle here (would clear multi-select after a pure click).
+                                if self.note_drag_kind == NoteDragKind::None {
+                                    let id = self.proj.tracks[track_idx].notes[i].id;
+                                    self.apply_selection_on_note_press(track_idx, id, ctrl);
+                                }
                             } else if !ctrl {
                                 self.set_playhead(beat);
                                 self.selection.notes.clear();
@@ -8662,8 +9184,12 @@ impl JpoApp {
                             }
                         }
                         EditMode::Draw => {
-                            if hit.is_none() {
+                            // Primary place is on drag_started (Create). Only place here if
+                            // that path did not run (avoids double-stack on click+drag sense).
+                            if hit.is_none() && self.note_drag_kind != NoteDragKind::Create {
                                 self.place_piano_note_at(track_idx, beat, pitch);
+                            }
+                            if hit.is_none() {
                                 self.set_playhead(beat);
                             }
                         }
@@ -9511,7 +10037,7 @@ mod generate_tests {
 
     #[test]
     fn bpm_does_not_rescale_beat_grid_durations() {
-        let mut pattern = LoadedPattern {
+        let pattern = LoadedPattern {
             id: "test".into(),
             category: PatternCategory::Piano,
             length_beats: 4.0,
@@ -10008,5 +10534,494 @@ mod golden_tests {
             .map(|n| n.pitch)
             .collect();
         assert_eq!(bass_at_0, bass_folded, "bass fold should match sync-off at beat 0");
+    }
+
+    #[test]
+    fn pitch_row_and_pointer_y_roundtrip() {
+        let rect = Rect::from_min_max(Pos2::new(0.0, 100.0), Pos2::new(400.0, 340.0));
+        let min_p = 48u8;
+        let max_p = 72u8;
+        let h = rect.height() as f64;
+        for p in min_p..=max_p {
+            let (y0, y1) = JpoApp::pitch_row_y(min_p, max_p, p, h, rect);
+            let mid_y = (y0 + y1) * 0.5;
+            let hit = JpoApp::pitch_at_y(min_p, max_p, mid_y, rect);
+            assert_eq!(hit, p, "pitch {p} mid-row y={mid_y} mapped to {hit}");
+        }
+    }
+
+    #[test]
+    fn sync_refill_has_no_leading_beat_silence() {
+        // After a 2-beat sync window on a 4-beat block, the next beat must have material.
+        let lib = PatternLibrary::load();
+        let mut proj = Project::default();
+        proj.chord_blocks = vec![ChordBlock {
+            start: 0.0,
+            dur: 4.0,
+            degree: 1,
+            quality: "".into(),
+            octave: 4,
+            syncopation_fill: true,
+        }];
+        let (piano, bass, drums) = generate_from_patterns(
+            &lib,
+            &proj,
+            0.0,
+            4.0,
+            "Piano01",
+            "Bass8beat01",
+            "Drum8beat_01",
+            true,
+        );
+        let wins = syncopation_windows(&proj, 0.0, 4.0);
+        assert_eq!(wins.len(), 1);
+        let (ws, we) = wins[0];
+        assert!((we - ws - 2.0).abs() < 0.01, "expected 2-beat sync window");
+        // First beat after window: [we, we+1)
+        let head_s = we;
+        let head_e = we + 1.0;
+        let hits = piano
+            .iter()
+            .chain(bass.iter())
+            .chain(drums.iter())
+            .filter(|n| n.start >= head_s - 0.02 && n.start < head_e - 0.02)
+            .count();
+        assert!(
+            hits > 0,
+            "1-beat silence after sync: no onsets in [{head_s}, {head_e}); p={} b={} d={}",
+            piano.iter().filter(|n| n.start >= head_s - 0.02 && n.start < head_e).count(),
+            bass.iter().filter(|n| n.start >= head_s - 0.02 && n.start < head_e).count(),
+            drums.iter().filter(|n| n.start >= head_s - 0.02 && n.start < head_e).count(),
+        );
+    }
+}
+
+/// SPEC-v2 product contracts (Phases 1–4).
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const COVERAGE_MAX_GAP: f64 = 0.75;
+
+    fn sample_chord(start: f64, dur: f64, degree: u8) -> ChordBlock {
+        ChordBlock {
+            start,
+            dur,
+            degree,
+            quality: String::new(),
+            octave: 4,
+            syncopation_fill: false,
+        }
+    }
+
+    /// H1 / SPEC-v2 §6.3: Am◆ style block must not have ≥0.75 beat onset holes
+    /// inside the sync window (repro of 0723test empty 8.0–9.5).
+    #[test]
+    fn contract_sync_window_continuous_coverage_am_style() {
+        let lib = PatternLibrary::load();
+        let mut proj = Project::default();
+        // Same shape as 0723test Am◆: late start, long block, sync on.
+        proj.chord_blocks = vec![
+            ChordBlock {
+                start: 0.0,
+                dur: 4.0,
+                degree: 1,
+                quality: "".into(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+            ChordBlock {
+                start: 4.0,
+                dur: 3.5,
+                degree: 5,
+                quality: "".into(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+            ChordBlock {
+                start: 7.5,
+                dur: 4.5,
+                degree: 6,
+                quality: "m".into(),
+                octave: 4,
+                syncopation_fill: true,
+            },
+            ChordBlock {
+                start: 12.0,
+                dur: 4.0,
+                degree: 3,
+                quality: "m".into(),
+                octave: 4,
+                syncopation_fill: false,
+            },
+        ];
+        let piano_id = if lib.get("Piano03").is_some() {
+            "Piano03"
+        } else {
+            "Piano01"
+        };
+        let (piano, bass, drums) = generate_from_patterns(
+            &lib,
+            &proj,
+            0.0,
+            16.0,
+            piano_id,
+            "Bass8beat01",
+            "Drum8beat_01",
+            true,
+        );
+        let wins = syncopation_windows(&proj, 0.0, 16.0);
+        assert_eq!(wins.len(), 1, "one ◆ block → one window");
+        let (ws, we) = wins[0];
+        assert!(
+            (ws - 7.5).abs() < 0.01 && we > ws + 0.5,
+            "unexpected window [{ws}, {we})"
+        );
+
+        for (label, notes) in [("piano", &piano), ("bass", &bass), ("drums", &drums)] {
+            let gap = max_onset_silence_beats(notes, ws, we);
+            assert!(
+                notes_cover_range(notes, ws, we, COVERAGE_MAX_GAP),
+                "SPEC-v2 sync coverage FAIL on {label}: max onset silence {gap:.2} beats \
+                 in window [{ws}, {we}) (need < {COVERAGE_MAX_GAP}). Phase 3 to fix."
+            );
+            // Tail of the ◆ block must also be covered.
+            let block_end = 12.0;
+            if we + 0.25 < block_end {
+                let tail_gap = max_onset_silence_beats(notes, we, block_end);
+                assert!(
+                    notes_cover_range(notes, we, block_end, COVERAGE_MAX_GAP),
+                    "SPEC-v2 sync tail FAIL on {label}: max silence {tail_gap:.2} in [{we}, {block_end})"
+                );
+            }
+        }
+    }
+
+    /// Same coverage rule on a simple 4-beat ◆ block (window = 2 beats).
+    #[test]
+    fn contract_sync_window_coverage_simple_four_beat() {
+        let lib = PatternLibrary::load();
+        let mut proj = Project::default();
+        proj.chord_blocks = vec![ChordBlock {
+            start: 0.0,
+            dur: 4.0,
+            degree: 1,
+            quality: "".into(),
+            octave: 4,
+            syncopation_fill: true,
+        }];
+        let (piano, bass, drums) = generate_from_patterns(
+            &lib,
+            &proj,
+            0.0,
+            4.0,
+            "Piano01",
+            "Bass8beat01",
+            "Drum8beat_01",
+            true,
+        );
+        let wins = syncopation_windows(&proj, 0.0, 4.0);
+        let (ws, we) = wins[0];
+        for (label, notes) in [("piano", &piano), ("bass", &bass), ("drums", &drums)] {
+            let gap = max_onset_silence_beats(notes, ws, we);
+            assert!(
+                gap < COVERAGE_MAX_GAP,
+                "{label} window silence {gap:.2} (SPEC-v2 continuous coverage)"
+            );
+            let tail_gap = max_onset_silence_beats(notes, we, 4.0);
+            assert!(
+                tail_gap < COVERAGE_MAX_GAP,
+                "{label} tail silence {tail_gap:.2}"
+            );
+        }
+    }
+
+    /// SPEC helper is the target behavior (Phase 2 wires UI to this).
+    #[test]
+    fn contract_selection_on_note_press_keeps_multiselect() {
+        let mut sel = HashSet::new();
+        sel.insert((3, NoteId(1)));
+        sel.insert((3, NoteId(2)));
+        sel.insert((3, NoteId(3)));
+        let after = selection_on_note_press(&sel, 3, NoteId(2), false);
+        assert_eq!(after.len(), 3, "grabbing a selected note must keep multi-set");
+        assert!(after.contains(&(3, NoteId(1))));
+        assert!(after.contains(&(3, NoteId(2))));
+        assert!(after.contains(&(3, NoteId(3))));
+    }
+
+    #[test]
+    fn contract_selection_on_note_press_replaces_when_outside() {
+        let mut sel = HashSet::new();
+        sel.insert((3, NoteId(1)));
+        sel.insert((3, NoteId(2)));
+        let after = selection_on_note_press(&sel, 3, NoteId(9), false);
+        assert_eq!(after.len(), 1);
+        assert!(after.contains(&(3, NoteId(9))));
+    }
+
+    #[test]
+    fn contract_selection_on_note_press_ctrl_toggles() {
+        let mut sel = HashSet::new();
+        sel.insert((3, NoteId(1)));
+        let after = selection_on_note_press(&sel, 3, NoteId(2), true);
+        assert_eq!(after.len(), 2);
+        let after2 = selection_on_note_press(&after, 3, NoteId(2), true);
+        assert_eq!(after2.len(), 1);
+        assert!(after2.contains(&(3, NoteId(1))));
+    }
+
+    /// After press on a multi-selected member, drag offsets should cover the whole set
+    /// (simulates what roll builds from selection_on_note_press + drag_sel_offsets).
+    #[test]
+    fn contract_multiselect_press_builds_offsets_for_all() {
+        let mut sel = HashSet::new();
+        sel.insert((3, NoteId(1)));
+        sel.insert((3, NoteId(2)));
+        sel.insert((3, NoteId(3)));
+        let notes = [
+            Note {
+                id: NoteId(1),
+                start: 0.0,
+                pitch: 60,
+                dur: 0.5,
+                vel: 90,
+            },
+            Note {
+                id: NoteId(2),
+                start: 1.0,
+                pitch: 64,
+                dur: 0.5,
+                vel: 90,
+            },
+            Note {
+                id: NoteId(3),
+                start: 2.0,
+                pitch: 67,
+                dur: 0.5,
+                vel: 90,
+            },
+        ];
+        let after = selection_on_note_press(&sel, 3, NoteId(2), false);
+        assert_eq!(after.len(), 3);
+        let anchor = notes.iter().find(|n| n.id == NoteId(2)).unwrap();
+        let offsets: Vec<_> = after
+            .iter()
+            .filter(|&&(t, _)| t == 3)
+            .filter_map(|&(_, id)| {
+                notes.iter().find(|n| n.id == id).map(|n| {
+                    (
+                        id,
+                        n.start - anchor.start,
+                        n.pitch as i32 - anchor.pitch as i32,
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(offsets.len(), 3, "all selected notes get drag offsets");
+        assert!(offsets.iter().any(|(id, ds, _)| *id == NoteId(1) && (*ds - -1.0).abs() < 0.001));
+        assert!(offsets.iter().any(|(id, ds, _)| *id == NoteId(2) && ds.abs() < 0.001));
+        assert!(offsets.iter().any(|(id, ds, _)| *id == NoteId(3) && (*ds - 1.0).abs() < 0.001));
+    }
+
+    /// Loop SoT: edit → switch → return must keep notes (flush on switch).
+    #[test]
+    fn contract_loop_bank_switch_preserves_active_edits() {
+        let mut app = JpoApp::default();
+        app.loop_bank = vec![
+            LoopSketch::new_empty("A", 8),
+            LoopSketch::new_empty("B", 8),
+        ];
+        app.active_bank_idx = 0;
+        app.loop_bars = 8;
+        app.proj = Project::default();
+        // Note on Ch4 (track index 3)
+        app.proj.tracks[3].notes.push(Note {
+            id: NoteId(42),
+            start: 1.0,
+            pitch: 60,
+            dur: 1.0,
+            vel: 100,
+        });
+        app.switch_loop_bank(1);
+        assert!(
+            app.proj.tracks[3].notes.is_empty(),
+            "slot B should start empty"
+        );
+        app.switch_loop_bank(0);
+        assert_eq!(
+            app.proj.tracks[3].notes.len(),
+            1,
+            "slot A edits must survive switch (snapshot/flush)"
+        );
+        assert_eq!(app.proj.tracks[3].notes[0].id, NoteId(42));
+        assert!((app.proj.tracks[3].notes[0].start - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn contract_coverage_helper_detects_gap() {
+        let notes = vec![
+            Note {
+                id: NoteId(1),
+                start: 0.0,
+                pitch: 60,
+                dur: 0.25,
+                vel: 90,
+            },
+            Note {
+                id: NoteId(2),
+                start: 2.0,
+                pitch: 60,
+                dur: 0.25,
+                vel: 90,
+            },
+        ];
+        // Gap 0.5–2.0 = 1.5 beats of silence in bins
+        let gap = max_onset_silence_beats(&notes, 0.0, 3.0);
+        assert!(
+            gap >= 1.0,
+            "helper should see the hole, got {gap}"
+        );
+        assert!(!notes_cover_range(&notes, 0.0, 3.0, 0.75));
+    }
+
+    // --- SPEC-v2 §6.2 stamps (H3 / Phase 4) ---
+
+    #[test]
+    fn contract_stamp_relative_normalize() {
+        let blocks = vec![
+            sample_chord(4.0, 2.0, 1),
+            sample_chord(6.0, 2.0, 5),
+        ];
+        let rel = chord_blocks_relative(&blocks);
+        assert!((rel[0].start - 0.0).abs() < 0.001);
+        assert!((rel[1].start - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn contract_infer_bars_hint() {
+        let four = vec![sample_chord(0.0, 4.0, 1); 4]
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut b)| {
+                b.start = i as f64 * 4.0;
+                b
+            })
+            .collect::<Vec<_>>();
+        // 4 blocks × 4 beats = 16 beats → 4 bars → hint 4
+        assert_eq!(infer_bars_hint(&four[..1]), Some(4));
+        assert_eq!(infer_bars_hint(&four[..2]), Some(4));
+        let eight: Vec<_> = (0..8)
+            .map(|i| {
+                let mut b = sample_chord(0.0, 4.0, 1);
+                b.start = i as f64 * 4.0;
+                b
+            })
+            .collect();
+        assert_eq!(infer_bars_hint(&eight), Some(8));
+    }
+
+    #[test]
+    fn contract_stamp_roundtrip_schema_v1() {
+        let dir = std::env::temp_dir().join(format!(
+            "jpo_stamp_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_prog.jpostamp");
+        let stamp = UserStamp {
+            schema: 1,
+            name: "Test Prog".into(),
+            bars_hint: Some(4),
+            blocks: chord_blocks_relative(&[
+                sample_chord(0.0, 4.0, 1),
+                sample_chord(4.0, 4.0, 5),
+            ]),
+            path: Some(path.clone()),
+            read_only: false,
+        };
+        write_stamp_file(&path, &stamp).expect("write");
+        let loaded = load_stamp_file(&path).expect("load");
+        assert_eq!(loaded.schema, 1);
+        assert_eq!(loaded.name, "Test Prog");
+        assert_eq!(loaded.bars_hint, Some(4));
+        assert_eq!(loaded.blocks.len(), 2);
+        assert!((loaded.blocks[0].start - 0.0).abs() < 0.001);
+        // Legacy file without schema still loads.
+        let legacy_path = dir.join("legacy.jpostamp");
+        std::fs::write(
+            &legacy_path,
+            r#"{ "name": "Old", "blocks": [
+              { "start": 0.0, "dur": 4.0, "degree": 1, "quality": "", "octave": 4, "syncopation_fill": false }
+            ] }"#,
+        )
+        .unwrap();
+        let leg = load_stamp_file(&legacy_path).expect("legacy load");
+        assert_eq!(leg.name, "Old");
+        assert_eq!(leg.blocks.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contract_stamp_save_stages_overwrite_when_exists() {
+        let mut app = JpoApp::default();
+        app.proj.chord_blocks = vec![sample_chord(0.0, 4.0, 1), sample_chord(4.0, 4.0, 5)];
+        // Write into a unique temp name under real stamps dir is risky — use path via save with
+        // a random name that we clean up.
+        let name = format!("__jpo_test_{}", std::process::id());
+        let path = stamp_path_for_name(&name);
+        let _ = std::fs::remove_file(&path);
+        // First save OK
+        app.save_current_as_user_stamp(name.clone(), false)
+            .expect("first save");
+        assert!(path.exists());
+        assert!(app.stamp_overwrite_pending.is_none());
+        // Second save without overwrite → pending confirm
+        let err = app
+            .save_current_as_user_stamp(name.clone(), false)
+            .expect_err("should ask overwrite");
+        assert_eq!(err, "confirm_overwrite");
+        assert!(app.stamp_overwrite_pending.is_some());
+        // Confirm
+        app.confirm_stamp_overwrite().expect("overwrite");
+        assert!(app.stamp_overwrite_pending.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn contract_sanitize_stamp_filename() {
+        assert_eq!(sanitize_stamp_filename("a/b:c*"), "a_b_c_");
+        assert!(!sanitize_stamp_filename("   ").is_empty());
+    }
+
+    #[test]
+    fn contract_timeline_layout_beat_and_pitch_roundtrip() {
+        let rect = Rect::from_min_max(Pos2::new(100.0, 50.0), Pos2::new(500.0, 290.0));
+        let layout = TimelineLayout::new(rect, 0.0, 16.0, 48, 72);
+        for beat in [0.0, 4.0, 8.0, 15.5] {
+            let x = layout.x_at_beat(beat);
+            let back = layout.beat_at_x(x);
+            assert!(
+                (back - beat).abs() < 0.02,
+                "beat {beat} → x {x} → {back}"
+            );
+        }
+        for p in 48u8..=72 {
+            let (y0, y1) = layout.pitch_row_y(p);
+            let mid = (y0 + y1) * 0.5;
+            assert_eq!(layout.pitch_at_y(mid), p);
+        }
+        assert_eq!(TIMELINE_KEY_WIDTH, 44.0);
+    }
+
+    #[test]
+    fn contract_input_focus_allows_edit_shortcuts() {
+        assert!(InputFocus::PianoRoll.allows_edit_shortcuts(true));
+        assert!(InputFocus::PianoRoll.allows_edit_shortcuts(false));
+        assert!(!InputFocus::GrokText.allows_edit_shortcuts(true));
+        assert!(InputFocus::None.allows_edit_shortcuts(false));
+        assert!(!InputFocus::None.allows_edit_shortcuts(true));
     }
 }

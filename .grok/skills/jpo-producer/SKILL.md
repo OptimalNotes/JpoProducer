@@ -13,15 +13,16 @@ metadata:
 
 ## 必読（優先順）
 
-1. **`SPEC-v1.md`** — 仕様の真実（五本柱・DoD・UI）  
+1. **`SPEC-v2.md`** — 仕様の真実（五本柱・契約・Reshape・DoD）  
 2. **`HANDOVER.md`** — 実装ギャップ  
 3. このスキル + 参照:
-   - `references/invariants.md`
+   - `references/invariants.md`（v2 と矛盾時は SPEC-v2 が勝つ）
    - `references/domino-lessons.md`
    - `references/midi-industry.md`
-   - `references/bug-reduction-plan.md`（履歴・分割案。優先は SPEC）
+   - `references/bug-reduction-plan.md`（分割手順の参考。優先は SPEC-v2）
 4. `ENV.md` — WSL メイン / Windows 配布  
 5. `tests/golden/ACCEPTANCE.md` + `case*/scenario.md`
+6. `SPEC-v1.md` — 履歴のみ
 
 ローカル Domino: `C:\Users\user\OneDrive\Desktop\Domino\`（**自動操作しない**）。
 
@@ -99,28 +100,31 @@ pattern → time map → pitch map → cleanup(ids, range, overlap) → replace_
 ## 変更プロセス
 
 ```
-1. SPEC に反しないか確認（反するなら先に SPEC 更新 + ユーザー合意）
+1. SPEC-v2 に反しないか確認（反するなら先に SPEC-v2 更新 + ユーザー合意）
 2. HANDOVER のギャップ ID or 新ケース名
-3. 再現 / 失敗テスト
-4. 最小修正（隔離・不変条件）
+3. 再現 / 失敗テスト（契約を先に赤で固定）
+4. 最小修正（隔離・不変条件・Reshape）
 5. cargo test
 6. HANDOVER 更新
 ```
 
 ### 禁止
 
-- テストなしの generate / pitch / trim 変更  
+- テストなしの generate / pitch / sync / trim 変更  
 - バグに合わせて golden を改ざん  
 - 挙動修正と大きな分割の同時実施  
 - フルリライト / archive/jpo-v2 のメイン化  
-- SPEC DoD 外のスコープ追加（明示依頼なし）
+- SPEC-v2 DoD 外のスコープ追加（明示依頼なし）  
+- シンコの「窓に何かあれば OK」への後退（**連続被覆**が契約）
 
-### 残ギャップの目安（HANDOVER と同期）
+### 残ギャップの目安（HANDOVER / SPEC-v2 Phase と同期）
 
-- P1 密グリッド・スタンプ  
-- P5 Grok context / ドック格上げ  
-- P2 Simple Bed 主ボタン + テンプレ Gate  
-- 受け入れ ❌ のみの P3 修正  
+- H1 シンコ連続被覆  
+- H2 複数選択一括移動  
+- H3 スタンプ規約どおりの保存 UX  
+- Loop flush / TimelineLayout / InputFocus  
+- gen pipeline 切り出し  
+
 
 ---
 
@@ -150,7 +154,7 @@ cd ~/JpoProducer && cargo test
 
 ## セッション開始
 
-- [ ] cwd = `~/JpoProducer`  
-- [ ] SPEC 五本柱 + HANDOVER ギャップ  
-- [ ] 触る領域の隔離ルール  
-- [ ] 終了時 `cargo test` + HANDOVER（SPEC 変更時は SPEC も）  
+- [ ] cwd = project root  
+- [ ] SPEC-v2 五本柱 + 契約（sync 被覆 / selection / loop flush）+ HANDOVER  
+- [ ] 触る領域の InputFocus  
+- [ ] 終了時 `cargo test` + HANDOVER（仕様変更時は SPEC-v2 も）  
